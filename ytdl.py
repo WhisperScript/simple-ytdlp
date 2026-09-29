@@ -1,25 +1,25 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["imageio-ffmpeg", "certifi"]
+# dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect"]
 # ///
 """
-ytdl.py - plattformuebergreifendes Frontend fuer yt-dlp (macOS, Linux, Windows).
+ytdl.py - cross-platform frontend for yt-dlp (macOS, Linux, Windows).
 
-yt-dlp und deno (JS-Engine fuer YouTube) werden beim ersten Start automatisch in den
-Nutzerordner geladen und lassen sich per Knopfdruck aktualisieren. ffmpeg kommt
-mitgeliefert (imageio-ffmpeg), falls kein System-ffmpeg da ist.
+yt-dlp and deno (the JS engine YouTube needs) are downloaded into the user's data folder
+on first start and can be updated with one click. ffmpeg is bundled (imageio-ffmpeg)
+if no system ffmpeg is installed.
 
-Einfachster Weg (nur uv noetig):
+Easiest way (only uv needed):
     uv run ytdl.py
-    ./ytdl.py                      (macOS/Linux, nach chmod +x)
+    ./ytdl.py                      (macOS/Linux, after chmod +x)
 
-Ohne uv, mit vorhandenem Python (dann: pip install imageio-ffmpeg certifi):
+Without uv, using an existing Python (then: pip install imageio-ffmpeg certifi sv-ttk darkdetect):
     python3 ytdl.py "https://youtube.com/watch?v=XXXX"
     python3 ytdl.py -a urls.txt --mode mp3
     python3 ytdl.py --gui
 
-Als fertige Programme (Windows/macOS/Linux): siehe README, Abschnitt "Fertige Programme".
+Ready-made programs (Windows/macOS/Linux): see the README, section "Ready-made programs".
 """
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -43,7 +44,7 @@ APP_NAME = "ytdl"
 DEFAULT_OUT = Path.home() / "Downloads" / "yt-dlp"
 
 MODES = {
-    "video":      "Video - beste Qualitaet",
+    "video":      "Video - best quality",
     "video1080":  "Video - max. 1080p",
     "video720":   "Video - max. 720p",
     "mp3":        "Audio - mp3",
@@ -55,7 +56,7 @@ AUDIO_MODES = ("mp3", "m4a", "opus")
 BROWSERS = ["", "chrome", "firefox", "safari", "edge", "brave", "chromium", "vivaldi", "opera"]
 
 
-# ---------------------------------------------------------------- Ordner & Einstellungen
+# ---------------------------------------------------------------- Folders & settings
 
 def data_dir() -> Path:
     if os.name == "nt":
@@ -79,9 +80,11 @@ def load_settings() -> dict:
 
 
 def save_settings(data: dict) -> None:
+    """Merge data into the stored settings (unknown keys are kept)."""
     try:
+        merged = {**load_settings(), **data}
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        SETTINGS_FILE.write_text(json.dumps(merged, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -91,13 +94,13 @@ def _exe(name: str) -> str:
 
 
 def _no_window() -> dict:
-    """Unter Windows kein Konsolenfenster aufblitzen lassen."""
+    """On Windows, keep console windows from flashing up."""
     if os.name == "nt":
         return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
     return {}
 
 
-# ---------------------------------------------------------------- Tools laden
+# ---------------------------------------------------------------- Fetching tools
 
 def _machine() -> str:
     m = platform.machine().lower()
@@ -123,7 +126,7 @@ def _deno_triple() -> str:
 
 
 def _ssl_context() -> ssl.SSLContext:
-    try:                                   # gepackte Pythons haben oft keine CA-Zertifikate
+    try:                                   # packaged Pythons often lack CA certificates
         import certifi
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
@@ -156,25 +159,25 @@ _tools_lock = threading.Lock()
 
 
 def install_ytdlp(log=print) -> bool:
-    """Laedt die aktuelle yt-dlp-Standalone-Binary in den Nutzerordner."""
+    """Download the latest yt-dlp standalone binary into the user data folder."""
     with _tools_lock:
         url = f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/{_ytdlp_asset()}"
-        log("Lade yt-dlp ...")
+        log("Downloading yt-dlp ...")
         try:
             _fetch(url, managed_ytdlp(), log)
             _make_executable(managed_ytdlp())
         except Exception as e:
-            log(f"FEHLER beim Laden von yt-dlp: {e}")
+            log(f"ERROR downloading yt-dlp: {e}")
             return False
-        log("yt-dlp bereit.")
+        log("yt-dlp ready.")
         return True
 
 
 def update_ytdlp(log=print) -> bool:
-    """Aktualisiert yt-dlp (laedt es, falls noch nicht vorhanden)."""
+    """Update yt-dlp (downloads it if it is not there yet)."""
     if not managed_ytdlp().exists():
         return install_ytdlp(log)
-    log("Pruefe auf yt-dlp-Update ...")
+    log("Checking for yt-dlp update ...")
     return _stream([str(managed_ytdlp()), "-U"], log) == 0
 
 
@@ -182,7 +185,7 @@ def install_deno(log=print) -> bool:
     with _tools_lock:
         url = f"https://github.com/denoland/deno/releases/latest/download/deno-{_deno_triple()}.zip"
         zpath = BIN_DIR / "deno.zip"
-        log("Lade deno (JS-Engine fuer YouTube) ...")
+        log("Downloading deno (JS engine for YouTube) ...")
         try:
             _fetch(url, zpath, log)
             with zipfile.ZipFile(zpath) as zf:
@@ -190,25 +193,25 @@ def install_deno(log=print) -> bool:
             zpath.unlink(missing_ok=True)
             _make_executable(managed_deno())
         except Exception as e:
-            log(f"FEHLER beim Laden von deno: {e}")
+            log(f"ERROR downloading deno: {e}")
             return False
-        log("deno bereit.")
+        log("deno ready.")
         return True
 
 
 def ensure_tools(log=print) -> bool:
-    """Stellt sicher, dass yt-dlp und eine JS-Engine da sind. False = yt-dlp fehlt."""
+    """Make sure yt-dlp and a JS engine are present. False = yt-dlp is missing."""
     if find_ytdlp() is None and not install_ytdlp(log):
         return False
     if find_js_runtime() is None:
-        install_deno(log)                  # nicht kritisch: nur hochaufloesende Formate
+        install_deno(log)                  # not critical: only affects high-resolution formats
     return True
 
 
-# ---------------------------------------------------------------- Tools finden
+# ---------------------------------------------------------------- Locating tools
 
 def find_ytdlp() -> list[str] | None:
-    """Liefert das Kommando-Prefix fuer yt-dlp oder None."""
+    """Return the command prefix for yt-dlp, or None."""
     if managed_ytdlp().exists():
         return [str(managed_ytdlp())]
     candidates = []
@@ -229,7 +232,7 @@ def find_ytdlp() -> list[str] | None:
 
 
 def find_ffmpeg() -> tuple[str | None, str]:
-    """(Pfad, Quelle) des zu nutzenden ffmpeg. Quelle: system | bundled | none."""
+    """(path, source) of the ffmpeg to use. source: system | bundled | none."""
     exe = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if exe:
         return exe, "system"
@@ -241,7 +244,7 @@ def find_ffmpeg() -> tuple[str | None, str]:
 
 
 def find_js_runtime() -> list[str] | None:
-    """yt-dlp-Argumente fuer die JS-Engine (YouTube braucht sie fuer alle Formate)."""
+    """yt-dlp arguments for the JS engine (YouTube needs one for all formats)."""
     if managed_deno().exists():
         return ["--js-runtimes", f"deno:{managed_deno()}"]
     for name in ("deno", "node", "bun"):
@@ -253,13 +256,13 @@ def find_js_runtime() -> list[str] | None:
 
 def ffmpeg_hint() -> str:
     if sys.platform == "darwin":
-        return "ffmpeg fehlt - installieren mit:  brew install ffmpeg"
+        return "ffmpeg missing - install with:  brew install ffmpeg"
     if os.name == "nt":
-        return "ffmpeg fehlt - installieren mit:  winget install Gyan.FFmpeg"
-    return "ffmpeg fehlt - installieren mit:  sudo apt install ffmpeg  (bzw. dnf/pacman)"
+        return "ffmpeg missing - install with:  winget install Gyan.FFmpeg"
+    return "ffmpeg missing - install with:  sudo apt install ffmpeg  (or dnf/pacman)"
 
 
-# ---------------------------------------------------------------- Argumentbau
+# ---------------------------------------------------------------- Building arguments
 
 def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
                archive=False, cookies_browser="", sort_by_uploader=False,
@@ -272,7 +275,7 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
         "--no-overwrites",
         "--retries", "3",
         "--embed-metadata",
-        "--newline",              # Fortschritt zeilenweise -> gut fuers Log
+        "--newline",              # one progress line per update -> works well in the log
         "--progress",
     ]
 
@@ -285,8 +288,8 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
     else:
         args += ["-f", "bv*+ba/b"]
 
-    if subs and mode not in AUDIO_MODES:      # Untertitel lassen sich nicht in Audio einbetten
-        args += ["--write-subs", "--write-auto-subs", "--sub-langs", "de,en", "--embed-subs"]
+    if subs and mode not in AUDIO_MODES:      # subtitles cannot be embedded in audio files
+        args += ["--write-subs", "--write-auto-subs", "--sub-langs", "en,de", "--embed-subs"]
     if thumb:
         args += ["--embed-thumbnail"]
     if archive:
@@ -300,10 +303,10 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
     return args
 
 
-# ---------------------------------------------------------------- Ausfuehrung
+# ---------------------------------------------------------------- Running
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """Beendet den Prozess samt Kindern (yt-dlp startet ffmpeg)."""
+    """Kill the process and its children (yt-dlp spawns ffmpeg)."""
     if os.name == "nt":
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                        capture_output=True, **_no_window())
@@ -315,25 +318,25 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 def _stream(cmd: list[str], log, stop_flag=None) -> int:
-    """Startet cmd und schiebt jede Ausgabezeile an log(). Liefert Returncode."""
+    """Run cmd and pass every output line to log(). Returns the return code."""
     extra = _no_window()
     if os.name != "nt":
-        extra["start_new_session"] = True     # eigene Prozessgruppe -> sauber abbrechbar
+        extra["start_new_session"] = True     # own process group -> can be cancelled cleanly
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, encoding="utf-8", errors="replace", **extra
         )
     except OSError as e:
-        log(f"FEHLER: {e}")
+        log(f"ERROR: {e}")
         return 127
 
     if stop_flag is not None:
-        def watch():                          # greift auch, wenn gerade keine Ausgabe kommt
+        def watch():                          # works even while no output is coming in
             while proc.poll() is None:
                 if stop_flag.wait(0.3):
                     _kill_tree(proc)
-                    log("-- abgebrochen --")
+                    log("-- cancelled --")
                     return
         threading.Thread(target=watch, daemon=True).start()
 
@@ -349,7 +352,7 @@ def _stream(cmd: list[str], log, stop_flag=None) -> int:
 
 def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_flag=None) -> tuple[int, int]:
     if not ensure_tools(log):
-        log("Konnte yt-dlp nicht laden. Internetverbindung pruefen und erneut versuchen.")
+        log("Could not download yt-dlp. Check your internet connection and try again.")
         return (0, len(urls))
     base = find_ytdlp()
     assert base is not None
@@ -358,13 +361,13 @@ def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_fl
     if source == "bundled":
         args = args + ["--ffmpeg-location", ffmpeg]
     elif source == "none":
-        log("WARNUNG: " + ffmpeg_hint())
+        log("WARNING: " + ffmpeg_hint())
 
     js = find_js_runtime()
     if js:
         args = args + js
     else:
-        log("Hinweis: keine JS-Engine gefunden - evtl. fehlen hochaufloesende Formate.")
+        log("Note: no JS engine found - high-resolution formats may be missing.")
 
     out_dir = Path(out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -373,7 +376,7 @@ def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_fl
     ok = bad = 0
     for i, url in enumerate(urls, 1):
         if stop_flag is not None and stop_flag.is_set():
-            log("-- abgebrochen --")
+            log("-- cancelled --")
             break
         log(f"\n[{i}/{len(urls)}] {url}")
         rc = _stream(base + args + ["--", url], log, stop_flag)
@@ -383,13 +386,13 @@ def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_fl
             ok += 1
         else:
             bad += 1
-            log(f"FEHLGESCHLAGEN ({rc}): {url}")
+            log(f"FAILED ({rc}): {url}")
             with failed_log.open("a", encoding="utf-8") as fh:
                 fh.write(url + "\n")
 
-    log(f"\nFertig. {ok} erfolgreich, {bad} fehlgeschlagen.")
+    log(f"\nDone. {ok} succeeded, {bad} failed.")
     if bad:
-        log(f"Liste der Fehlschlaege: {failed_log}")
+        log(f"List of failures: {failed_log}")
     return (ok, bad)
 
 
@@ -415,6 +418,44 @@ def open_folder(path: Path) -> None:
 
 # ---------------------------------------------------------------- GUI
 
+UPDATE_INTERVAL = 24 * 3600      # how often (seconds) to silently check for yt-dlp updates at startup
+
+
+def notify(title: str, message: str, root=None) -> None:
+    """Announce the end of a run without extra dependencies."""
+    try:
+        if sys.platform == "darwin":
+            script = f'display notification "{message}" with title "{title}"'
+            subprocess.Popen(["osascript", "-e", script])
+        elif os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND),
+                            ("dwFlags", wintypes.DWORD), ("uCount", wintypes.UINT),
+                            ("dwTimeout", wintypes.DWORD)]
+
+            if root is not None:              # taskbar icon flashes until the window is focused
+                hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+                info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 0x0000000F | 0x0000000C, 3, 0)
+                ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        elif shutil.which("notify-send"):
+            subprocess.Popen(["notify-send", title, message])
+    except Exception:
+        pass
+    if root is not None:
+        try:
+            root.bell()
+        except Exception:
+            pass
+
+
+def looks_like_url(text: str) -> bool:
+    text = text.strip()
+    return bool(text) and "\n" not in text and re.match(r"https?://\S+$", text) is not None
+
+
 PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 ITEM_RE = re.compile(r"^\s*\[(\d+)/(\d+)\]\s")
 
@@ -424,37 +465,98 @@ def run_gui() -> int:
         import tkinter as tk
         from tkinter import ttk, filedialog, messagebox
     except ImportError:
-        print("Tkinter ist nicht installiert.")
-        print("Linux:  sudo apt install python3-tk   (bzw. python3-tkinter)")
+        print("Tkinter is not installed.")
+        print("Linux:  sudo apt install python3-tk   (or python3-tkinter)")
         return 1
 
     cfg = load_settings()
 
     root = tk.Tk()
     root.title("yt-dlp Downloader")
-    root.geometry("780x680")
-    root.minsize(660, 560)
+    root.geometry("820x740")
+    root.minsize(700, 600)
 
-    pad = {"padx": 8, "pady": 4}
-    main = ttk.Frame(root, padding=10)
+    try:                                       # modern theme; without sv-ttk the default Tk look stays
+        import sv_ttk
+    except ImportError:
+        sv_ttk = None
+
+    def system_theme() -> str:
+        try:
+            import darkdetect
+            return "dark" if darkdetect.isDark() else "light"
+        except Exception:
+            return "light"
+
+    theme = (cfg.get("theme") or system_theme()) if sv_ttk is not None else "light"
+    text_widgets: list = []
+
+    def apply_theme(name: str) -> None:
+        nonlocal theme
+        theme = name
+        if sv_ttk is not None:
+            sv_ttk.set_theme(name)
+        dark = name == "dark"
+        for w in text_widgets:                 # ttk themes do not cover tk.Text
+            w.configure(background="#2b2b2b" if dark else "#ffffff",
+                        foreground="#e6e6e6" if dark else "#1a1a1a",
+                        insertbackground="#e6e6e6" if dark else "#1a1a1a",
+                        highlightbackground="#4a4a4a" if dark else "#c8c8c8",
+                        highlightcolor="#60cdff" if dark else "#0067c0")
+
+    pad = {"padx": 8, "pady": 5}
+    main = ttk.Frame(root, padding=14)
     main.pack(fill="both", expand=True)
     main.columnconfigure(0, weight=1)
 
-    ttk.Label(main, text="URLs (eine pro Zeile):").grid(row=0, column=0, sticky="w")
-    url_box = tk.Text(main, height=7, wrap="none")
-    url_box.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+    head = ttk.Frame(main)
+    head.grid(row=0, column=0, columnspan=2, sticky="ew")
+    ttk.Label(head, text="URLs (one per line):").pack(side="left")
+    def toggle_theme() -> None:
+        apply_theme("light" if theme == "dark" else "dark")
+        save_settings({"theme": theme})
+
+    if sv_ttk is not None:                     # without sv-ttk, toggling would only recolor the text boxes
+        ttk.Button(head, text="Light/Dark", command=toggle_theme).pack(side="right")
+    ttk.Button(head, text="From clipboard",
+               command=lambda: paste_clipboard(force=True)).pack(side="right", padx=6)
+
+    url_box = tk.Text(main, height=7, wrap="none", relief="flat", borderwidth=0,
+                      highlightthickness=1, padx=6, pady=6)
+    text_widgets.append(url_box)
+    url_box.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 10))
     main.rowconfigure(1, weight=1)
+
+    last_clip = {"text": ""}
+
+    def paste_clipboard(force: bool = False) -> None:
+        """Insert a URL from the clipboard (automatically only when the box is empty)."""
+        try:
+            clip = root.clipboard_get().strip()
+        except tk.TclError:
+            return
+        if not looks_like_url(clip):
+            if force:
+                messagebox.showinfo("Clipboard", "There is no URL in the clipboard.")
+            return
+        current = url_box.get("1.0", "end")
+        if clip in current or (not force and (current.strip() or clip == last_clip["text"])):
+            return
+        last_clip["text"] = clip
+        url_box.insert("end", ("\n" if current.strip() else "") + clip)
+
+    root.bind("<FocusIn>", lambda e: paste_clipboard() if e.widget is root else None)
 
     opts = ttk.Frame(main)
     opts.grid(row=2, column=0, columnspan=2, sticky="ew")
     opts.columnconfigure(1, weight=1)
 
-    ttk.Label(opts, text="Modus:").grid(row=0, column=0, sticky="w", **pad)
+    ttk.Label(opts, text="Mode:").grid(row=0, column=0, sticky="w", **pad)
     mode_var = tk.StringVar(value=MODES.get(cfg.get("mode", ""), MODES["video"]))
     ttk.Combobox(opts, textvariable=mode_var, values=list(MODES.values()),
                  state="readonly").grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
 
-    ttk.Label(opts, text="Zielordner:").grid(row=1, column=0, sticky="w", **pad)
+    ttk.Label(opts, text="Output folder:").grid(row=1, column=0, sticky="w", **pad)
     out_var = tk.StringVar(value=cfg.get("out") or str(DEFAULT_OUT))
     ttk.Entry(opts, textvariable=out_var).grid(row=1, column=1, sticky="ew", **pad)
 
@@ -463,9 +565,9 @@ def run_gui() -> int:
         if d:
             out_var.set(d)
 
-    ttk.Button(opts, text="Waehlen ...", command=pick_dir).grid(row=1, column=2, **pad)
+    ttk.Button(opts, text="Browse ...", command=pick_dir).grid(row=1, column=2, **pad)
 
-    ttk.Label(opts, text="Cookies aus Browser:").grid(row=2, column=0, sticky="w", **pad)
+    ttk.Label(opts, text="Cookies from browser:").grid(row=2, column=0, sticky="w", **pad)
     cookie_var = tk.StringVar(value=cfg.get("cookies", ""))
     ttk.Combobox(opts, textvariable=cookie_var, values=BROWSERS,
                  state="readonly", width=14).grid(row=2, column=1, sticky="w", **pad)
@@ -477,21 +579,23 @@ def run_gui() -> int:
     arch_var = tk.BooleanVar(value=cfg.get("archive", True))
     uploader_var = tk.BooleanVar(value=cfg.get("uploader", False))
     single_var = tk.BooleanVar(value=cfg.get("single", True))
-    for text, var in (("Untertitel (de/en)", subs_var), ("Thumbnail einbetten", thumb_var),
-                      ("Archiv (kein Doppel-Download)", arch_var),
-                      ("Nach Kanal sortieren", uploader_var),
-                      ("Nur einzelnes Video (keine Playlist)", single_var)):
-        ttk.Checkbutton(checks, text=text, variable=var).pack(side="left", padx=6)
+    for i, (text, var) in enumerate((("Subtitles (en/de)", subs_var),
+                                     ("Embed thumbnail", thumb_var),
+                                     ("Archive (skip already downloaded)", arch_var),
+                                     ("Sort into folders by channel", uploader_var),
+                                     ("Single video only (no playlist)", single_var))):
+        ttk.Checkbutton(checks, text=text, variable=var).grid(
+            row=i // 3, column=i % 3, sticky="w", padx=6, pady=3)
 
     btns = ttk.Frame(main)
     btns.grid(row=4, column=0, columnspan=2, sticky="ew")
-    start_btn = ttk.Button(btns, text="Download starten")
+    start_btn = ttk.Button(btns, text="Start download")
     start_btn.pack(side="left")
-    stop_btn = ttk.Button(btns, text="Abbrechen", state="disabled")
+    stop_btn = ttk.Button(btns, text="Cancel", state="disabled")
     stop_btn.pack(side="left", padx=6)
-    ttk.Button(btns, text="Ordner oeffnen",
+    ttk.Button(btns, text="Open folder",
                command=lambda: open_folder(Path(out_var.get() or DEFAULT_OUT))).pack(side="left")
-    update_btn = ttk.Button(btns, text="yt-dlp aktualisieren")
+    update_btn = ttk.Button(btns, text="Update yt-dlp")
     update_btn.pack(side="right")
 
     status_var = tk.StringVar(value="")
@@ -499,8 +603,10 @@ def run_gui() -> int:
     bar = ttk.Progressbar(main, maximum=100)
     bar.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
-    log_box = tk.Text(main, height=14, wrap="none", state="disabled",
-                      background="#111", foreground="#ddd", insertbackground="#ddd")
+    log_box = tk.Text(main, height=14, wrap="none", state="disabled", relief="flat",
+                      borderwidth=0, highlightthickness=1, padx=6, pady=6)
+    text_widgets.append(log_box)
+    apply_theme(theme)
     log_box.grid(row=7, column=0, sticky="nsew", pady=(8, 0))
     main.rowconfigure(7, weight=2)
     sb = ttk.Scrollbar(main, command=log_box.yview)
@@ -514,7 +620,7 @@ def run_gui() -> int:
                 bar["value"] = float(m.group(1))
             m = ITEM_RE.match(str(msg))
             if m:
-                status_var.set(f"Download {m.group(1)} von {m.group(2)}")
+                status_var.set(f"Download {m.group(1)} of {m.group(2)}")
                 bar["value"] = 0
             log_box.configure(state="normal")
             log_box.insert("end", str(msg) + "\n")
@@ -539,11 +645,12 @@ def run_gui() -> int:
         urls = [l.strip() for l in url_box.get("1.0", "end").splitlines() if l.strip()]
         urls = [u for u in urls if not u.startswith("#")]
         if not urls:
-            messagebox.showwarning("Keine URLs", "Bitte mindestens eine URL eintragen.")
+            messagebox.showwarning("No URLs", "Please enter at least one URL.")
             return
         save_settings({"mode": mode_key(), "out": out_var.get(), "cookies": cookie_var.get(),
                        "subs": subs_var.get(), "thumb": thumb_var.get(), "archive": arch_var.get(),
-                       "uploader": uploader_var.get(), "single": single_var.get()})
+                       "uploader": uploader_var.get(), "single": single_var.get(),
+                       "theme": theme})
         stop_flag.clear()
         set_busy(True)
         bar["value"] = 0
@@ -556,7 +663,10 @@ def run_gui() -> int:
         def work():
             try:
                 ok, bad = download(urls, args, out_dir, gui_log, stop_flag)
-                root.after(0, lambda: status_var.set(f"Fertig: {ok} erfolgreich, {bad} fehlgeschlagen"))
+                summary = f"{ok} succeeded, {bad} failed"
+                root.after(0, lambda: status_var.set("Done: " + summary))
+                if not stop_flag.is_set():
+                    root.after(0, lambda: notify("ytdl", "Done: " + summary, root))
             finally:
                 root.after(0, lambda: set_busy(False))
 
@@ -568,7 +678,8 @@ def run_gui() -> int:
 
         def work():
             try:
-                update_ytdlp(gui_log)
+                if update_ytdlp(gui_log):
+                    save_settings({"last_update": time.time()})
                 if find_js_runtime() is None:
                     install_deno(gui_log)
             finally:
@@ -578,24 +689,36 @@ def run_gui() -> int:
 
     start_btn.configure(command=on_start)
     update_btn.configure(command=on_update)
-    stop_btn.configure(command=lambda: (stop_flag.set(), gui_log("Abbruch angefordert ...")))
+    stop_btn.configure(command=lambda: (stop_flag.set(), gui_log("Cancelling ...")))
 
-    gui_log(f"Bereit. Zielordner: {out_var.get()}")
+    gui_log(f"Ready. Output folder: {out_var.get()}")
     _, _src = find_ffmpeg()
     if _src == "none":
-        gui_log("Hinweis: " + ffmpeg_hint())
+        gui_log("Note: " + ffmpeg_hint())
 
-    if find_ytdlp() is None or find_js_runtime() is None:      # Erststart: Tools im Hintergrund holen
+    # At startup, in the background: fetch missing tools, otherwise check for yt-dlp updates once a day
+    # (YouTube changes often; an outdated yt-dlp is the most common reason downloads fail).
+    missing = find_ytdlp() is None or find_js_runtime() is None
+    update_due = (managed_ytdlp().exists()
+                  and time.time() - float(cfg.get("last_update", 0)) > UPDATE_INTERVAL)
+    if missing or update_due:
         set_busy(True)
         stop_btn.configure(state="disabled")
+        status_var.set("Checking for updates ..." if not missing else "First start: downloading tools ...")
 
-        def first_run():
+        def startup():
             try:
-                ensure_tools(gui_log)
+                if missing:
+                    ensure_tools(gui_log)
+                    ok = find_ytdlp() is not None
+                else:
+                    ok = update_ytdlp(gui_log)
+                if ok:
+                    save_settings({"last_update": time.time()})
             finally:
-                root.after(0, lambda: set_busy(False))
+                root.after(0, lambda: (set_busy(False), status_var.set("")))
 
-        threading.Thread(target=first_run, daemon=True).start()
+        threading.Thread(target=startup, daemon=True).start()
 
     root.mainloop()
     return 0
@@ -606,26 +729,26 @@ def run_gui() -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog=APP_NAME,
-        description="Plattformuebergreifender yt-dlp-Wrapper (CLI + GUI).",
+        description="Cross-platform yt-dlp wrapper (CLI + GUI).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Beispiele:\n"
+        epilog="Examples:\n"
                "  python3 ytdl.py URL1 URL2\n"
                "  python3 ytdl.py -a urls.txt -m mp3 -o ~/Music\n"
                "  python3 ytdl.py --gui\n",
     )
-    p.add_argument("urls", nargs="*", help="Eine oder mehrere URLs")
-    p.add_argument("-a", "--batch-file", help="Textdatei mit einer URL pro Zeile (# = Kommentar)")
+    p.add_argument("urls", nargs="*", help="One or more URLs")
+    p.add_argument("-a", "--batch-file", help="Text file with one URL per line (# = comment)")
     p.add_argument("-m", "--mode", choices=list(MODES), default="video",
-                   help="Download-Modus (Standard: video)")
-    p.add_argument("-o", "--out", default=str(DEFAULT_OUT), help="Zielordner")
-    p.add_argument("--subs", action="store_true", help="Untertitel de/en mitziehen")
-    p.add_argument("--thumb", action="store_true", help="Thumbnail einbetten")
-    p.add_argument("--archive", action="store_true", help="archive.txt fuehren (kein Doppel-Download)")
-    p.add_argument("--by-uploader", action="store_true", help="In Unterordner je Kanal sortieren")
+                   help="Download mode (default: video)")
+    p.add_argument("-o", "--out", default=str(DEFAULT_OUT), help="Output folder")
+    p.add_argument("--subs", action="store_true", help="Download subtitles (en/de)")
+    p.add_argument("--thumb", action="store_true", help="Embed thumbnail")
+    p.add_argument("--archive", action="store_true", help="Keep an archive.txt (skip already downloaded videos)")
+    p.add_argument("--by-uploader", action="store_true", help="Sort into one subfolder per channel")
     p.add_argument("--cookies-from-browser", default="", metavar="BROWSER",
-                   help="z.B. chrome, firefox, safari - fuer private/altersbeschraenkte Videos")
-    p.add_argument("--gui", action="store_true", help="Grafische Oberflaeche starten")
-    p.add_argument("--update", action="store_true", help="yt-dlp installieren/aktualisieren und beenden")
+                   help="e.g. chrome, firefox, safari - for private/age-restricted videos")
+    p.add_argument("--gui", action="store_true", help="Start the graphical interface")
+    p.add_argument("--update", action="store_true", help="Install/update yt-dlp and exit")
 
     args, unknown = p.parse_known_args(argv)
 
@@ -638,7 +761,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.batch_file:
         urls += read_url_file(args.batch_file)
     if not urls:
-        p.error("Keine URLs angegeben.")
+        p.error("No URLs given.")
 
     out_dir = Path(args.out).expanduser()
     ytdlp_args = build_args(args.mode, out_dir, subs=args.subs, thumb=args.thumb,
@@ -652,5 +775,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\nAbgebrochen.")
+        print("\nCancelled.")
         sys.exit(130)

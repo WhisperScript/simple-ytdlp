@@ -1,46 +1,54 @@
-# ytdl — yt-dlp Frontend (macOS / Linux / Windows)
+# ytdl — yt-dlp frontend (macOS / Linux / Windows)
 
-## Fertige Programme (für Freunde)
+## Ready-made programs
 
-Unter **Releases** gibt es je ein Programm pro System — nichts installieren, entpacken, starten:
+Under **Releases** there is one program per system — nothing to install, just unpack and start:
 
-| System | Datei | Start |
+| System | File | Start |
 |---|---|---|
-| Windows | `ytdl-windows.zip` | `ytdl.exe` doppelklicken. Bei der SmartScreen-Warnung „Weitere Informationen → Trotzdem ausführen". |
-| macOS (Apple Silicon) | `ytdl-macos.zip` | Entpacken, **Rechtsklick auf ytdl.app → Öffnen**. Falls es blockiert wird: `xattr -dr com.apple.quarantine ytdl.app` |
+| Windows | `ytdl-windows.zip` | Double-click `ytdl.exe`. On the SmartScreen warning: "More info → Run anyway". |
+| macOS (Apple Silicon) | `ytdl-macos.zip` | Unpack, then **right-click ytdl.app → Open**. If it is blocked: `xattr -dr com.apple.quarantine ytdl.app` |
 | Linux | `ytdl-linux.tar.gz` | `tar xzf ytdl-linux.tar.gz && ./ytdl` |
 
-Beim ersten Start lädt das Programm yt-dlp und deno automatisch herunter (Internet nötig,
-wenige Sekunden). ffmpeg ist eingebaut. Mit dem Knopf **„yt-dlp aktualisieren"** bleibt es
-aktuell — das hilft, wenn YouTube mal etwas ändert und Downloads plötzlich fehlschlagen.
-Einstellungen und die Tools liegen im Nutzerordner (Windows `%LOCALAPPDATA%\ytdl`,
+On first start the program downloads yt-dlp and deno automatically (internet required,
+takes a few seconds). ffmpeg is built in. The **"Update yt-dlp"** button keeps it current —
+this helps when YouTube changes something and downloads suddenly fail. Once a day the
+program also checks silently for a yt-dlp update at startup and installs it.
+
+The interface follows the system theme (light/dark) and can be switched with a button.
+A URL in the clipboard is inserted automatically when you switch back to the window (if the
+URL box is empty), and you get a notification when a run finishes.
+
+Settings and the downloaded tools live in the user data folder (Windows `%LOCALAPPDATA%\ytdl`,
 macOS `~/Library/Application Support/ytdl`, Linux `~/.local/share/ytdl`).
 
-Die Programme sind nicht signiert, daher die Warnungen beim ersten Start. Intel-Macs nutzen
-den `uv`-Weg unten.
+The programs are not code-signed, hence the warnings on first start. Intel Macs use the
+`uv` route below.
 
-### Selbst bauen / Release veröffentlichen
+### Building it yourself / publishing a release
 
-Der Workflow [.github/workflows/build.yml](.github/workflows/build.yml) baut alle drei
-Systeme automatisch. Repo auf GitHub hochladen, dann:
+The workflow [.github/workflows/build.yml](.github/workflows/build.yml) builds all three
+systems automatically. Push the repo to GitHub, then:
 
     git tag v1.0 && git push --tags
 
-Nach wenigen Minuten steht unter **Releases** alles zum Download bereit. Manuell startbar
-über **Actions → Build → Run workflow** (Ergebnis als Artifact). Lokal, z. B. unter Windows:
+After a few minutes everything is available under **Releases**. It can also be started
+manually via **Actions → Build → Run workflow** (result is a downloadable artifact, nothing is
+published). Locally, e.g. on Windows:
 
-    pip install pyinstaller imageio-ffmpeg certifi
-    pyinstaller --onefile --windowed --name ytdl --collect-all imageio_ffmpeg ytdl.py
+    pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect
+    pyinstaller --onefile --windowed --name ytdl --collect-all imageio_ffmpeg --collect-all sv_ttk ytdl.py
 
-## Als Skript
+## As a script
 
-Ein einzelnes Skript. Mit [uv](https://docs.astral.sh/uv/) braucht der Zielrechner
-**nichts** außer uv selbst — Python, yt-dlp, ffmpeg und die JS-Engine holt es sich beim
-ersten Start und legt sie in einen Cache, nicht ins System.
+A single script. With [uv](https://docs.astral.sh/uv/) the target machine needs
+**nothing** except uv itself — Python, the packages and ffmpeg are fetched on first start
+and stored in a cache, not in the system. yt-dlp and deno are downloaded into the
+user data folder.
 
-## Aufsetzen auf einem neuen Rechner
+## Setting up a new machine
 
-1. uv installieren:
+1. Install uv:
 
    macOS / Linux:
 
@@ -50,53 +58,55 @@ ersten Start und legt sie in einen Cache, nicht ins System.
 
        powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-2. `ytdl.py` rüberkopieren.
-3. Starten:
+   Then open a new terminal so `uv` is on the PATH.
+
+2. Copy `ytdl.py` over.
+3. Start it:
 
        uv run ytdl.py
 
-Das war's. Ohne Argumente öffnet sich die Oberfläche. Auf macOS/Linux geht nach
-`chmod +x ytdl.py` auch der Direktstart `./ytdl.py` — die Shebang-Zeile ruft uv auf.
+That's it. Without arguments the graphical interface opens. On macOS/Linux, after
+`chmod +x ytdl.py` you can also start it directly with `./ytdl.py` — the shebang line calls uv.
 
-## Benutzung
+## Usage
 
-Oberfläche: URLs untereinander einfügen, Modus wählen, Start. Läuft im Hintergrund,
-Abbrechen jederzeit möglich, Log im Fenster.
+Interface: paste URLs one per line, choose a mode, press Start. It runs in the background,
+can be cancelled at any time, and shows a log and progress bar in the window.
 
-Kommandozeile:
+Command line:
 
     uv run ytdl.py "https://youtube.com/watch?v=XXXX"
     uv run ytdl.py -a urls.txt -m mp3 -o ~/Music --archive
     uv run ytdl.py URL --mode video1080 --subs --thumb --by-uploader
 
-Modi: `video` (beste Qualität), `video1080`, `video720`, `mp3`, `m4a`, `opus`.
+Modes: `video` (best quality), `video1080`, `video720`, `mp3`, `m4a`, `opus`.
 
-Unbekannte Flags gehen unverändert an yt-dlp weiter:
+Unknown flags are passed on to yt-dlp unchanged:
 
     uv run ytdl.py URL --playlist-items 1-5
-    uv run ytdl.py URL --simulate          # nur prüfen, nichts laden
+    uv run ytdl.py URL --simulate          # only check, download nothing
 
-Standard-Zielordner ist `~/Downloads/yt-dlp`. Fehlgeschlagene URLs landen dort in
-`failed.log`; mit `--archive` merkt sich `archive.txt` bereits geladene Videos, ein
-erneuter Lauf derselben Liste holt dann nur Neues nach (gut für Cron).
+The default output folder is `~/Downloads/yt-dlp`. Failed URLs end up there in
+`failed.log`; with `--archive`, `archive.txt` remembers videos that were already downloaded,
+so running the same list again only fetches what is new (handy for cron).
 
-Für private oder altersbeschränkte Videos: `--cookies-from-browser chrome` bzw. im
-Fenster das Browser-Dropdown.
+For private or age-restricted videos use `--cookies-from-browser chrome`, or the browser
+dropdown in the window.
 
-## Ohne uv
+## Without uv
 
-Läuft mit vorhandenem Python: `pip install imageio-ffmpeg certifi`, dann `python3 ytdl.py`.
-yt-dlp und deno lädt das Skript beim ersten Start selbst (`--update` aktualisiert yt-dlp).
-Ein bereits installiertes ffmpeg wird bevorzugt, sonst greift das mitgelieferte.
-Unter Linux ggf. `sudo apt install python3-tk` für die Oberfläche.
+Works with an existing Python: `pip install imageio-ffmpeg certifi sv-ttk darkdetect`, then
+`python3 ytdl.py`. The script downloads yt-dlp and deno itself on first start
+(`--update` updates yt-dlp). An already installed ffmpeg is preferred, otherwise the bundled
+one is used. On Linux you may need `sudo apt install python3-tk` for the interface.
 
-## Was automatisch passiert
+## What happens automatically
 
-- **ffmpeg**: System-ffmpeg wird bevorzugt; fehlt es, greift ein mitgeliefertes Binary
-  (`imageio-ffmpeg`). Dem fehlt ffprobe — für Standardfälle wie mp3-Extraktion und
-  Video-Merging reicht es, getestet.
-- **JS-Engine**: YouTube braucht inzwischen eine, sonst fehlen hochauflösende Formate.
-  Das Skript lädt deno beim ersten Start selbst; ein vorhandenes deno/node/bun wird sonst genutzt.
-- **Playlists**: In der Oberfläche ist „Nur einzelnes Video" standardmäßig an, damit eine
-  Video-URL mit `&list=…` nicht die ganze Playlist zieht. Abschalten für echte Playlists.
-- **Windows**: keine aufblitzenden Konsolenfenster der Unterprozesse.
+- **ffmpeg**: A system ffmpeg is preferred; if there is none, a bundled binary
+  (`imageio-ffmpeg`) is used. It lacks ffprobe — standard cases such as mp3 extraction and
+  video merging work fine (tested).
+- **JS engine**: YouTube now needs one, otherwise high-resolution formats are missing.
+  The script downloads deno on first start; an existing deno/node/bun is used otherwise.
+- **Playlists**: In the interface "Single video only" is on by default, so a video URL with
+  `&list=…` does not pull in the whole playlist. Turn it off for real playlists.
+- **Windows**: no flashing console windows from subprocesses.

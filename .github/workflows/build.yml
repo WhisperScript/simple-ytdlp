@@ -18,7 +18,7 @@ jobs:
             name: windows
           - os: macos-latest          # Apple Silicon (M1/M2/M3/...)
             name: macos
-          - os: ubuntu-22.04          # aelteres glibc -> laeuft auch auf aelteren Distros
+          - os: ubuntu-22.04          # older glibc -> also runs on older distros
             name: linux
     runs-on: ${{ matrix.os }}
     steps:
@@ -28,31 +28,31 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Tk unter Linux
+      - name: Tk on Linux
         if: matrix.name == 'linux'
         run: sudo apt-get update && sudo apt-get install -y python3-tk
 
-      - name: Abhaengigkeiten
-        run: python -m pip install pyinstaller imageio-ffmpeg certifi
+      - name: Dependencies
+        run: python -m pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect
 
-      - name: Bauen (Windows/Linux - eine einzelne Datei)
+      - name: Build (Windows/Linux - single file)
         if: matrix.name != 'macos'
-        run: pyinstaller --onefile --windowed --name ytdl --collect-all imageio_ffmpeg ytdl.py
+        run: pyinstaller --onefile --windowed --name ytdl --collect-all imageio_ffmpeg --collect-all sv_ttk ytdl.py
 
-      - name: Bauen (macOS - .app-Bundle)
+      - name: Build (macOS - .app bundle)
         if: matrix.name == 'macos'
-        run: pyinstaller --windowed --name ytdl --collect-all imageio_ffmpeg ytdl.py
+        run: pyinstaller --windowed --name ytdl --collect-all imageio_ffmpeg --collect-all sv_ttk ytdl.py
 
-      - name: Verpacken (Windows)
+      - name: Package (Windows)
         if: matrix.name == 'windows'
         shell: pwsh
         run: Compress-Archive -Path dist/ytdl.exe -DestinationPath ytdl-windows.zip
 
-      - name: Verpacken (macOS)
+      - name: Package (macOS)
         if: matrix.name == 'macos'
         run: cd dist && zip -ry ../ytdl-macos.zip ytdl.app
 
-      - name: Verpacken (Linux)
+      - name: Package (Linux)
         if: matrix.name == 'linux'
         run: cd dist && tar czf ../ytdl-linux.tar.gz ytdl
 
