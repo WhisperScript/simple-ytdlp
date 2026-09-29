@@ -607,8 +607,9 @@ def run_gui() -> int:
 
     ttk.Label(opts, text="Mode:").grid(row=0, column=0, sticky="w", **pad)
     mode_var = tk.StringVar(value=MODES.get(cfg.get("mode", ""), MODES["video"]))
-    ttk.Combobox(opts, textvariable=mode_var, values=list(MODES.values()),
-                 state="readonly").grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+    mode_combo = ttk.Combobox(opts, textvariable=mode_var, values=list(MODES.values()),
+                              state="readonly")
+    mode_combo.grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
 
     ttk.Label(opts, text="Output folder:").grid(row=1, column=0, sticky="w", **pad)
     out_var = tk.StringVar(value=cfg.get("out") or str(DEFAULT_OUT))
@@ -630,8 +631,9 @@ def run_gui() -> int:
     also_var = tk.StringVar(value=cfg.get("also_audio") or ALSO_AUDIO_NONE)
     also_row = ttk.Frame(opts)
     also_row.grid(row=3, column=1, columnspan=2, sticky="w", **pad)
-    ttk.Combobox(also_row, textvariable=also_var, values=[ALSO_AUDIO_NONE, *AUDIO_MODES],
-                 state="readonly", width=14).pack(side="left")
+    also_combo = ttk.Combobox(also_row, textvariable=also_var, values=[ALSO_AUDIO_NONE, *AUDIO_MODES],
+                              state="readonly", width=14)
+    also_combo.pack(side="left")
     ttk.Label(also_row, text="  (video modes: keeps the video and adds a separate audio file)",
               foreground="gray").pack(side="left")
 
@@ -642,13 +644,24 @@ def run_gui() -> int:
     arch_var = tk.BooleanVar(value=cfg.get("archive", True))
     uploader_var = tk.BooleanVar(value=cfg.get("uploader", False))
     single_var = tk.BooleanVar(value=cfg.get("single", True))
+    subs_check = None
     for i, (text, var) in enumerate((("Subtitles (en/de)", subs_var),
                                      ("Embed thumbnail", thumb_var),
                                      ("Archive (skip already downloaded)", arch_var),
                                      ("Sort into folders by channel", uploader_var),
                                      ("Single video only (no playlist)", single_var))):
-        ttk.Checkbutton(checks, text=text, variable=var).grid(
-            row=i // 3, column=i % 3, sticky="w", padx=6, pady=3)
+        check = ttk.Checkbutton(checks, text=text, variable=var)
+        check.grid(row=i // 3, column=i % 3, sticky="w", padx=6, pady=3)
+        if var is subs_var:
+            subs_check = check
+
+    def sync_mode_options(*_) -> None:
+        """Grey out options that have no effect in the selected mode."""
+        audio_only = mode_key() in AUDIO_MODES
+        also_combo.configure(state="disabled" if audio_only else "readonly")   # audio already is the output
+        subs_check.configure(state="disabled" if audio_only else "normal")     # cannot embed subs in audio
+
+    mode_combo.bind("<<ComboboxSelected>>", sync_mode_options)
 
     btns = ttk.Frame(main)
     btns.grid(row=4, column=0, columnspan=2, sticky="ew")
@@ -712,6 +725,8 @@ def run_gui() -> int:
             if v == mode_var.get():
                 return k
         return "video"
+
+    sync_mode_options()                        # apply the stored mode right at startup
 
     def set_busy(busy: bool) -> None:
         start_btn.configure(state="disabled" if busy else "normal")
