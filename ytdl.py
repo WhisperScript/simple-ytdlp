@@ -787,7 +787,7 @@ def run_gui() -> int:
     start_btn.pack(side="left")
     stop_btn = ttk.Button(btns, text="Cancel", state="disabled")
     stop_btn.pack(side="left", padx=6)
-    ttk.Button(btns, text="Open folder",
+    ttk.Button(btns, text="Open download folder",
                command=lambda: open_folder(Path(out_var.get() or DEFAULT_OUT))).pack(side="left")
     update_btn = ttk.Button(btns, text="Update yt-dlp")
     update_btn.pack(side="right")
@@ -938,7 +938,8 @@ def run_gui() -> int:
     update_btn.configure(command=on_update)
     stop_btn.configure(command=lambda: (stop_flag.set(), gui_log("Cancelling ...")))
 
-    gui_log(f"Ready. Output folder: {out_var.get()}")
+    gui_log(("ytdl " + ("(dev)" if __version__ == "dev" else f"v{__version__}"))
+            + f" ready. Output folder: {out_var.get()}")
     _, _src = find_ffmpeg()
     if _src == "none":
         gui_log("Note: " + ffmpeg_hint())
