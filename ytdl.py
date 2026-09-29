@@ -208,10 +208,21 @@ def _version_tuple(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", v))
 
 
-def check_app_update() -> tuple[str, str] | None:
-    """(latest version, release page URL) if a newer ytdl release exists, else None.
+def _release_asset_name() -> str | None:
+    """Name of this platform's file in a release (None = no self-update for this platform)."""
+    if os.name == "nt":
+        return "ytdl-windows.zip"
+    if sys.platform == "darwin":
+        return "ytdl-macos.zip" if _machine() == "arm64" else None   # only Apple Silicon is built
+    return "ytdl-linux.tar.gz"
 
-    Silent on any failure (offline, private repo, rate limit) - it is only a hint.
+
+def check_app_update() -> dict | None:
+    """Info about a newer ytdl release, or None.
+
+    Returns {"version", "page", "asset_url", "asset_name", "digest"}; asset_url is None when
+    the release has no file for this platform. Silent on any failure (offline, private repo,
+    rate limit) - it is only a hint.
     """
     if __version__ == "dev":
         return None
@@ -222,11 +233,117 @@ def check_app_update() -> tuple[str, str] | None:
         with urllib.request.urlopen(req, timeout=10, context=_ssl_context()) as r:
             data = json.load(r)
         latest = str(data["tag_name"])
-        if _version_tuple(latest) > _version_tuple(__version__):
-            return latest.lstrip("v"), str(data.get("html_url") or f"https://github.com/{REPO}/releases")
+        if _version_tuple(latest) <= _version_tuple(__version__):
+            return None
+        wanted = _release_asset_name()
+        asset = next((a for a in data.get("assets", []) if a.get("name") == wanted), None)
+        url = str(asset["browser_download_url"]) if asset else None
+        if url and not url.startswith(f"https://github.com/{REPO}/releases/download/"):
+            url = None                          # only ever fetch from our own releases
+        return {"version": latest.lstrip("v"), "asset_name": wanted, "asset_url": url,
+                "digest": str(asset.get("digest") or "") if asset else "",
+                "page": str(data.get("html_url") or f"https://github.com/{REPO}/releases")}
     except Exception:
-        pass
-    return None
+        return None
+
+
+def can_self_update() -> bool:
+    """Self-update only makes sense for the packaged program, not for `uv run ytdl.py`."""
+    return bool(getattr(sys, "frozen", False)) and _release_asset_name() is not None
+
+
+def _relaunch_env() -> dict:
+    env = dict(os.environ)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"   # the new process must not reuse this one's temp folder
+    return env
+
+
+def cleanup_old_versions() -> None:
+    """Remove the leftovers of a previous self-update (the renamed old program)."""
+    if not getattr(sys, "frozen", False):
+        return
+    exe = Path(sys.executable)
+    target = exe.parents[2] if sys.platform == "darwin" else exe
+    old = target.with_name(target.name + ".old")
+    try:
+        if old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass                                   # still locked -> next start
+
+
+def install_app_update(update: dict, log=print, *, exe: Path | None = None, start_new: bool = True) -> bool:
+    """Download the new release, swap it in for the running program and start it.
+
+    Returns True when the new version has been started (the caller should then quit).
+    The running program is renamed to '<name>.old' first - Windows locks a running .exe against
+    overwriting but allows renaming it - and removed by the new version on its next start.
+    """
+    if not update.get("asset_url"):
+        log("No download for this platform in the release.")
+        return False
+    exe = Path(exe or sys.executable)
+    work = data_dir() / "update"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    archive = work / update["asset_name"]
+    try:
+        log(f"Downloading ytdl v{update['version']} ...")
+        _fetch(update["asset_url"], archive, log)
+        digest = update.get("digest", "")
+        if digest.startswith("sha256:"):
+            import hashlib
+            if hashlib.sha256(archive.read_bytes()).hexdigest() != digest.split(":", 1)[1]:
+                log("ERROR: the downloaded file does not match its checksum - update aborted.")
+                return False
+
+        if os.name == "nt":
+            with zipfile.ZipFile(archive) as zf:
+                zf.extract("ytdl.exe", work)
+            new, target = work / "ytdl.exe", exe
+            launch = [str(target)]
+        elif sys.platform == "darwin":
+            subprocess.run(["ditto", "-x", "-k", str(archive), str(work)], check=True)   # keeps permissions
+            new, target = work / "ytdl.app", exe.parents[2]                              # .../ytdl.app
+            launch = ["open", "-n", str(target)]
+        else:
+            import tarfile
+            new = work / "ytdl"
+            with tarfile.open(archive) as tf, tf.extractfile("ytdl") as src, new.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            new.chmod(0o755)
+            target = exe
+            launch = [str(target)]
+
+        old = target.with_name(target.name + ".old")
+        if old.is_dir():
+            shutil.rmtree(old, ignore_errors=True)
+        else:
+            old.unlink(missing_ok=True)
+        target.rename(old)
+        try:
+            shutil.move(str(new), str(target))
+        except Exception:
+            old.rename(target)                 # put the working version back
+            raise
+        if os.name != "nt":
+            try:
+                target.chmod(target.stat().st_mode | stat.S_IXUSR)
+            except OSError:
+                pass
+        shutil.rmtree(work, ignore_errors=True)
+    except Exception as e:
+        log(f"ERROR: update failed: {e}")
+        return False
+
+    if start_new:
+        extra = ({"creationflags": 0x00000008 | 0x00000200} if os.name == "nt"      # DETACHED | NEW_GROUP
+                 else {"start_new_session": True})
+        subprocess.Popen(launch, env=_relaunch_env(), close_fds=True, **extra)
+    log("Update installed - restarting ...")
+    return True
 
 
 def ensure_tools(log=print) -> bool:
@@ -524,6 +641,7 @@ def run_gui() -> int:
         return 1
 
     cfg = load_settings()
+    cleanup_old_versions()                     # leftovers of a previous self-update
 
     root = tk.Tk()
     root.title("yt-dlp Downloader" + ("" if __version__ == "dev" else f"  v{__version__}"))
@@ -693,15 +811,48 @@ def run_gui() -> int:
     news.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
     news_label = ttk.Label(news, text="")
     news_label.pack(side="left")
-    news_btn = ttk.Button(news, text="Download")
-    news_btn.pack(side="right")
+    news_page_btn = ttk.Button(news, text="Release page")
+    news_page_btn.pack(side="right")
+    news_now_btn = ttk.Button(news, text="Update now")
+    news_now_btn.pack(side="right", padx=6)
     news.grid_remove()
 
-    def show_app_update(version: str, url: str) -> None:
-        news_label.configure(text=f"A new version of ytdl is available: v{version}")
-        news_btn.configure(command=lambda: webbrowser.open(url))
+    def show_app_update(update: dict) -> None:
+        news_label.configure(text=f"A new version of ytdl is available: v{update['version']}")
+        news_page_btn.configure(command=lambda: webbrowser.open(update["page"]))
+        if can_self_update() and update["asset_url"]:
+            news_now_btn.configure(command=lambda: run_self_update(update))
+        else:                                  # running as a script, or no file for this platform
+            news_now_btn.pack_forget()
         news.grid()
-        gui_log(f"New version available: v{version}  ->  {url}")
+        gui_log(f"New version available: v{update['version']}  ->  {update['page']}")
+
+    def run_self_update(update: dict) -> None:
+        if str(start_btn.cget("state")) == "disabled":
+            messagebox.showinfo("Update", "Please wait until the current job has finished "
+                                          "(or cancel it), then click 'Update now' again.")
+            return
+        news_now_btn.configure(state="disabled")
+        set_busy(True)
+        stop_btn.configure(state="disabled")
+        status_var.set("Updating ytdl ...")
+
+        def work():
+            done = install_app_update(update, gui_log)
+            def finish():
+                if done:
+                    root.destroy()             # the new version has already been started
+                else:
+                    set_busy(False)
+                    status_var.set("")
+                    news_now_btn.configure(state="normal")
+                    messagebox.showwarning(
+                        "Update failed",
+                        "The automatic update did not work (see the log).\n"
+                        "Use 'Release page' to download the new version manually.")
+            root.after(0, finish)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def gui_log(msg: str) -> None:
         def _append():
@@ -819,7 +970,7 @@ def run_gui() -> int:
     def app_update_check():                    # newer ytdl release on GitHub? (silent if not)
         found = check_app_update()
         if found:
-            root.after(0, lambda: show_app_update(*found))
+            root.after(0, lambda: show_app_update(found))
 
     threading.Thread(target=app_update_check, daemon=True).start()
 

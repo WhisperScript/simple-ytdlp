@@ -28,10 +28,16 @@ The programs are not code-signed, hence the warnings on first start. Intel Macs 
 ### Updates
 
 - **yt-dlp** updates itself (daily check at startup, or the "Update yt-dlp" button).
-- **The app itself** shows a banner ("A new version of ytdl is available") with a
-  Download button when a newer release exists on GitHub. Download it from **Releases** and
-  replace the old file; your settings are kept. (The check is silent if you are offline, and it
-  needs a public repo.)
+- **The app itself** shows a banner ("A new version of ytdl is available") when a newer
+  release exists on GitHub. **"Update now"** downloads it (checksum-verified), replaces the
+  running program and restarts it; your settings are kept. "Release page" opens the download
+  page instead. The check is silent if you are offline, and it needs a public repo.
+  - Windows/Linux: the program file is replaced in place. It must be in a folder you can
+    write to (Downloads, Desktop, … but not `C:\Program Files`).
+  - macOS: `ytdl.app` is replaced; move it out of the Downloads folder first (e.g. to
+    Applications), otherwise macOS runs it from a read-only location and the automatic update
+    falls back to the manual download.
+  - If anything goes wrong the old version stays in place and you get the release page link.
 
 ### Publishing an update (for the maintainer)
 
