@@ -25,6 +25,24 @@ macOS `~/Library/Application Support/ytdl`, Linux `~/.local/share/ytdl`).
 The programs are not code-signed, hence the warnings on first start. Intel Macs use the
 `uv` route below.
 
+### Updates
+
+- **yt-dlp** updates itself (daily check at startup, or the "Update yt-dlp" button).
+- **The app itself** shows a banner ("A new version of ytdl is available") with a
+  Download button when a newer release exists on GitHub. Download it from **Releases** and
+  replace the old file; your settings are kept. (The check is silent if you are offline, and it
+  needs a public repo.)
+
+### Publishing an update (for the maintainer)
+
+Commit and push your changes, then tag a new version. The workflow writes the tag into the
+app as its version number (`v1.1` → `1.1`), builds all three systems and creates the release:
+
+    git tag v1.1 && git push origin v1.1
+
+Use a higher number every time (`v1.1`, `v1.2`, `v1.10`, …) — that is how running apps
+recognize that something newer exists.
+
 ### Building it yourself / publishing a release
 
 The workflow [.github/workflows/build.yml](.github/workflows/build.yml) builds all three
@@ -80,6 +98,12 @@ Command line:
     uv run ytdl.py URL --mode video1080 --subs --thumb --by-uploader
 
 Modes: `video` (best quality), `video1080`, `video720`, `mp3`, `m4a`, `opus`.
+
+Video **and** audio in one go: with a video mode, `--also-audio mp3` (or `m4a` / `opus`)
+keeps the video and additionally saves a separate audio file with the same name. In the
+interface this is the "Also save audio as" dropdown.
+
+    uv run ytdl.py URL -m video1080 --also-audio mp3
 
 Unknown flags are passed on to yt-dlp unchanged:
 

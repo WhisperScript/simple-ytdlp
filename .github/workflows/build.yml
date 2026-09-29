@@ -28,6 +28,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set version from tag (v1.2 -> 1.2)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          sed -i.bak "s/^__version__ = .*/__version__ = \"${GITHUB_REF_NAME#v}\"/" ytdl.py
+          grep '^__version__' ytdl.py
+
       - name: Tk on Linux
         if: matrix.name == 'linux'
         run: sudo apt-get update && sudo apt-get install -y python3-tk

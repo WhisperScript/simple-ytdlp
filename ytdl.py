@@ -37,8 +37,12 @@ import sys
 import threading
 import time
 import urllib.request
+import webbrowser
 import zipfile
 from pathlib import Path
+
+__version__ = "dev"          # the release workflow replaces this with the git tag (v1.2 -> "1.2")
+REPO = "WhisperScript/ytdl"  # GitHub repo that hosts the releases (used for the update hint)
 
 APP_NAME = "ytdl"
 DEFAULT_OUT = Path.home() / "Downloads" / "yt-dlp"
@@ -52,6 +56,7 @@ MODES = {
     "opus":       "Audio - opus",
 }
 AUDIO_MODES = ("mp3", "m4a", "opus")
+ALSO_AUDIO_NONE = "None"
 
 BROWSERS = ["", "chrome", "firefox", "safari", "edge", "brave", "chromium", "vivaldi", "opera"]
 
@@ -199,6 +204,31 @@ def install_deno(log=print) -> bool:
         return True
 
 
+def _version_tuple(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def check_app_update() -> tuple[str, str] | None:
+    """(latest version, release page URL) if a newer ytdl release exists, else None.
+
+    Silent on any failure (offline, private repo, rate limit) - it is only a hint.
+    """
+    if __version__ == "dev":
+        return None
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{REPO}/releases/latest",
+            headers={"User-Agent": APP_NAME, "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10, context=_ssl_context()) as r:
+            data = json.load(r)
+        latest = str(data["tag_name"])
+        if _version_tuple(latest) > _version_tuple(__version__):
+            return latest.lstrip("v"), str(data.get("html_url") or f"https://github.com/{REPO}/releases")
+    except Exception:
+        pass
+    return None
+
+
 def ensure_tools(log=print) -> bool:
     """Make sure yt-dlp and a JS engine are present. False = yt-dlp is missing."""
     if find_ytdlp() is None and not install_ytdlp(log):
@@ -266,7 +296,8 @@ def ffmpeg_hint() -> str:
 
 def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
                archive=False, cookies_browser="", sort_by_uploader=False,
-               no_playlist=False, extra: list[str] | None = None) -> list[str]:
+               no_playlist=False, also_audio="",
+               extra: list[str] | None = None) -> list[str]:
     out_dir = Path(out_dir).expanduser()
     tmpl = "%(uploader)s/%(title)s.%(ext)s" if sort_by_uploader else "%(title)s.%(ext)s"
 
@@ -288,8 +319,13 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
     else:
         args += ["-f", "bv*+ba/b"]
 
+    if also_audio and mode not in AUDIO_MODES:   # keep the video AND save a separate audio file
+        args += ["-x", "--audio-format", also_audio, "--audio-quality", "0", "-k"]
+
     if subs and mode not in AUDIO_MODES:      # subtitles cannot be embedded in audio files
-        args += ["--write-subs", "--write-auto-subs", "--sub-langs", "en,de", "--embed-subs"]
+        args += ["--write-subs", "--write-auto-subs", "--sub-langs", "en,de", "--embed-subs",
+                 "--sleep-subtitles", "3",         # YouTube answers quick subtitle requests with HTTP 429
+                 "--ignore-errors"]                # ...so a failed subtitle track must not fail the video
     if thumb:
         args += ["--embed-thumbnail"]
     if archive:
@@ -350,7 +386,18 @@ def _stream(cmd: list[str], log, stop_flag=None) -> int:
     return proc.wait()
 
 
-def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_flag=None) -> tuple[int, int]:
+INTERMEDIATE_RE = re.compile(r"\.f\d[0-9A-Za-z_-]*\.[A-Za-z0-9]+$")   # e.g. "Title.f251.webm"
+
+
+def _intermediates(folder: Path) -> set[Path]:
+    """Per-stream files yt-dlp leaves behind when told to keep the video (-k)."""
+    return {p for p in folder.rglob("*") if p.is_file() and INTERMEDIATE_RE.search(p.name)}
+
+
+def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_flag=None,
+             clean_intermediates: bool = False) -> tuple[int, int]:
+    """Download every URL. clean_intermediates removes the raw stream files that -k leaves
+    behind (only files created by this run, so nothing that was already there is touched)."""
     if not ensure_tools(log):
         log("Could not download yt-dlp. Check your internet connection and try again.")
         return (0, len(urls))
@@ -379,7 +426,14 @@ def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_fl
             log("-- cancelled --")
             break
         log(f"\n[{i}/{len(urls)}] {url}")
+        before = _intermediates(out_dir) if clean_intermediates else set()
         rc = _stream(base + args + ["--", url], log, stop_flag)
+        if clean_intermediates:
+            for leftover in _intermediates(out_dir) - before:
+                try:
+                    leftover.unlink()
+                except OSError:
+                    pass
         if stop_flag is not None and stop_flag.is_set():
             break
         if rc == 0:
@@ -472,7 +526,7 @@ def run_gui() -> int:
     cfg = load_settings()
 
     root = tk.Tk()
-    root.title("yt-dlp Downloader")
+    root.title("yt-dlp Downloader" + ("" if __version__ == "dev" else f"  v{__version__}"))
     root.geometry("820x740")
     root.minsize(700, 600)
 
@@ -572,6 +626,15 @@ def run_gui() -> int:
     ttk.Combobox(opts, textvariable=cookie_var, values=BROWSERS,
                  state="readonly", width=14).grid(row=2, column=1, sticky="w", **pad)
 
+    ttk.Label(opts, text="Also save audio as:").grid(row=3, column=0, sticky="w", **pad)
+    also_var = tk.StringVar(value=cfg.get("also_audio") or ALSO_AUDIO_NONE)
+    also_row = ttk.Frame(opts)
+    also_row.grid(row=3, column=1, columnspan=2, sticky="w", **pad)
+    ttk.Combobox(also_row, textvariable=also_var, values=[ALSO_AUDIO_NONE, *AUDIO_MODES],
+                 state="readonly", width=14).pack(side="left")
+    ttk.Label(also_row, text="  (video modes: keeps the video and adds a separate audio file)",
+              foreground="gray").pack(side="left")
+
     checks = ttk.Frame(main)
     checks.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 8))
     subs_var = tk.BooleanVar(value=cfg.get("subs", False))
@@ -613,6 +676,20 @@ def run_gui() -> int:
     sb.grid(row=7, column=1, sticky="ns", pady=(8, 0))
     log_box.configure(yscrollcommand=sb.set)
 
+    news = ttk.Frame(main)                     # update hint, only shown when a newer release exists
+    news.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    news_label = ttk.Label(news, text="")
+    news_label.pack(side="left")
+    news_btn = ttk.Button(news, text="Download")
+    news_btn.pack(side="right")
+    news.grid_remove()
+
+    def show_app_update(version: str, url: str) -> None:
+        news_label.configure(text=f"A new version of ytdl is available: v{version}")
+        news_btn.configure(command=lambda: webbrowser.open(url))
+        news.grid()
+        gui_log(f"New version available: v{version}  ->  {url}")
+
     def gui_log(msg: str) -> None:
         def _append():
             m = PROGRESS_RE.search(str(msg))
@@ -650,19 +727,23 @@ def run_gui() -> int:
         save_settings({"mode": mode_key(), "out": out_var.get(), "cookies": cookie_var.get(),
                        "subs": subs_var.get(), "thumb": thumb_var.get(), "archive": arch_var.get(),
                        "uploader": uploader_var.get(), "single": single_var.get(),
-                       "theme": theme})
+                       "also_audio": also_var.get(), "theme": theme})
         stop_flag.clear()
         set_busy(True)
         bar["value"] = 0
         status_var.set("")
         out_dir = Path(out_var.get() or DEFAULT_OUT)
-        args = build_args(mode_key(), out_dir, subs=subs_var.get(), thumb=thumb_var.get(),
+        mode = mode_key()
+        also_audio = "" if also_var.get() == ALSO_AUDIO_NONE else also_var.get()
+        args = build_args(mode, out_dir, subs=subs_var.get(), thumb=thumb_var.get(),
                           archive=arch_var.get(), cookies_browser=cookie_var.get(),
-                          sort_by_uploader=uploader_var.get(), no_playlist=single_var.get())
+                          sort_by_uploader=uploader_var.get(), no_playlist=single_var.get(),
+                          also_audio=also_audio)
 
         def work():
             try:
-                ok, bad = download(urls, args, out_dir, gui_log, stop_flag)
+                ok, bad = download(urls, args, out_dir, gui_log, stop_flag,
+                                   clean_intermediates=also_audio and mode not in AUDIO_MODES)
                 summary = f"{ok} succeeded, {bad} failed"
                 root.after(0, lambda: status_var.set("Done: " + summary))
                 if not stop_flag.is_set():
@@ -720,6 +801,13 @@ def run_gui() -> int:
 
         threading.Thread(target=startup, daemon=True).start()
 
+    def app_update_check():                    # newer ytdl release on GitHub? (silent if not)
+        found = check_app_update()
+        if found:
+            root.after(0, lambda: show_app_update(*found))
+
+    threading.Thread(target=app_update_check, daemon=True).start()
+
     root.mainloop()
     return 0
 
@@ -741,6 +829,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-m", "--mode", choices=list(MODES), default="video",
                    help="Download mode (default: video)")
     p.add_argument("-o", "--out", default=str(DEFAULT_OUT), help="Output folder")
+    p.add_argument("--also-audio", choices=AUDIO_MODES, default="", metavar="FORMAT",
+                   help="with a video mode: also save a separate audio file (mp3, m4a or opus)")
     p.add_argument("--subs", action="store_true", help="Download subtitles (en/de)")
     p.add_argument("--thumb", action="store_true", help="Embed thumbnail")
     p.add_argument("--archive", action="store_true", help="Keep an archive.txt (skip already downloaded videos)")
@@ -766,8 +856,10 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out).expanduser()
     ytdlp_args = build_args(args.mode, out_dir, subs=args.subs, thumb=args.thumb,
                             archive=args.archive, cookies_browser=args.cookies_from_browser,
-                            sort_by_uploader=args.by_uploader, extra=unknown)
-    ok, bad = download(urls, ytdlp_args, out_dir)
+                            sort_by_uploader=args.by_uploader, also_audio=args.also_audio,
+                            extra=unknown)
+    ok, bad = download(urls, ytdlp_args, out_dir,
+                       clean_intermediates=bool(args.also_audio) and args.mode not in AUDIO_MODES)
     return 0 if bad == 0 else 1
 
 
