@@ -1,0 +1,74 @@
+name: Build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+          - os: macos-latest          # Apple Silicon (M1/M2/M3/...)
+            name: macos
+          - os: ubuntu-22.04          # aelteres glibc -> laeuft auch auf aelteren Distros
+            name: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tk unter Linux
+        if: matrix.name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Abhaengigkeiten
+        run: python -m pip install pyinstaller imageio-ffmpeg certifi
+
+      - name: Bauen (Windows/Linux - eine einzelne Datei)
+        if: matrix.name != 'macos'
+        run: pyinstaller --onefile --windowed --name ytdl --collect-all imageio_ffmpeg ytdl.py
+
+      - name: Bauen (macOS - .app-Bundle)
+        if: matrix.name == 'macos'
+        run: pyinstaller --windowed --name ytdl --collect-all imageio_ffmpeg ytdl.py
+
+      - name: Verpacken (Windows)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/ytdl.exe -DestinationPath ytdl-windows.zip
+
+      - name: Verpacken (macOS)
+        if: matrix.name == 'macos'
+        run: cd dist && zip -ry ../ytdl-macos.zip ytdl.app
+
+      - name: Verpacken (Linux)
+        if: matrix.name == 'linux'
+        run: cd dist && tar czf ../ytdl-linux.tar.gz ytdl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ytdl-${{ matrix.name }}
+          path: ytdl-*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ytdl-*
