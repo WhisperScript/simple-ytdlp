@@ -451,6 +451,28 @@ class Feedback(GuiCase):
         self.assertEqual(app.toast_lbl.cget("text"), "Already in the queue")
         self.assertEqual(len(app.items), 1)
 
+    def test_another_link_to_the_same_video_jumps_to_its_card(self):
+        app.add_urls(["https://www.youtube.com/watch?v=dupVID00001"])
+        app.items[0].status = "done"
+        app.add_urls(["https://youtu.be/dupVID00001?si=abc", "https://x.test/other"])
+        pump(30)
+        self.assertEqual(len(app.items), 2, "the same video must not get a second card")
+        self.assertEqual(app.selected, {app.items[0].id})
+        app.add_urls(["https://youtu.be/dupVID00001"])
+        self.assertEqual(app.toast_lbl.cget("text"), "Already downloaded")
+
+    def test_a_failed_video_added_again_is_retried_and_download_again_replaces_a_finished_one(self):
+        app.add_urls([U("again1")])
+        failed = app.items[0]
+        failed.status = "failed"
+        with mock.patch.object(app, "retry_items") as retry:
+            app.add_urls([U("again1")])
+        retry.assert_called_once_with([failed])
+        failed.status = "done"
+        app.add_urls([U("again1")], again=True)
+        self.assertEqual(len(app.items), 1)
+        self.assertIsNot(app.items[0], failed)
+
     def test_notices_by_priority(self):
         app.set_notice("update", "New version", actions=[("Release page", lambda: None)])
         pump(30)

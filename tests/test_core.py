@@ -362,6 +362,22 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class SameVideo(unittest.TestCase):
+    def test_youtube_links_to_one_video_share_a_key(self):
+        same = ["https://www.youtube.com/watch?v=abc123XYZ_-", "https://youtu.be/abc123XYZ_-?si=tracking",
+                "https://m.youtube.com/watch?v=abc123XYZ_-&t=90s&list=PL1", "https://youtube.com/shorts/abc123XYZ_-",
+                "https://www.youtube.com/embed/abc123XYZ_-"]
+        self.assertEqual({app.url_key(u) for u in same}, {"youtube:abc123XYZ_-"})
+
+    def test_different_videos_and_playlists_differ(self):
+        self.assertNotEqual(app.url_key("https://youtu.be/aaa"), app.url_key("https://youtu.be/bbb"))
+        self.assertEqual(app.url_key("https://www.youtube.com/playlist?list=PL9"), "youtube-list:PL9")
+
+    def test_other_sites_ignore_noise_but_not_content(self):
+        self.assertEqual(app.url_key("https://www.example.com/v/1/?utm_source=x#top"), app.url_key("https://example.com/v/1"))
+        self.assertNotEqual(app.url_key("https://example.com/watch?id=1"), app.url_key("https://example.com/watch?id=2"))
+
+
 class QueueSummary(unittest.TestCase):
     COUNTS = {"downloading": 2, "paused": 1, "queued": 4, "fetching": 1, "done": 3, "skipped": 1, "failed": 2}
 

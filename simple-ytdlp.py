@@ -771,6 +771,36 @@ def extract_urls(text: str) -> list[str]:
     return list(seen)
 
 
+_TRACKING = re.compile(r"^(utm_.*|fbclid|gclid|igshid|si|feature|pp|ref|ref_src|source)$", re.I)
+_YT_HOSTS = {"youtube.com", "youtube-nocookie.com", "music.youtube.com", "youtu.be"}
+
+
+def url_key(url: str) -> str:
+    """What makes two links the same download: youtu.be/ID, youtube.com/watch?v=ID&t=30s and /shorts/ID are one
+    video; for other sites www., the fragment, a trailing slash and tracking parameters do not count."""
+    import urllib.parse as up
+    try:
+        u = up.urlsplit(url.strip())
+    except ValueError:
+        return url.strip()
+    host = (u.hostname or "").lower()
+    host = re.sub(r"^(www|m)\.", "", host)
+    query = up.parse_qs(u.query)
+    if host in _YT_HOSTS:
+        parts = [p for p in u.path.split("/") if p]
+        vid = (query.get("v") or [""])[0]
+        if not vid and host == "youtu.be" and parts:
+            vid = parts[0]
+        if not vid and len(parts) >= 2 and parts[0] in ("shorts", "embed", "live", "v"):
+            vid = parts[1]
+        if vid:
+            return "youtube:" + vid
+        if query.get("list"):
+            return "youtube-list:" + query["list"][0]
+    kept = sorted((k, v) for k, vals in query.items() if not _TRACKING.match(k) for v in vals)
+    return f"{host}{u.path.rstrip('/')}" + (("?" + up.urlencode(kept)) if kept else "")
+
+
 def fmt_duration(seconds) -> str:
     try:
         s = int(seconds)
@@ -1377,6 +1407,7 @@ class Item:
         Item._counter += 1
         self.id = Item._counter
         self.url = url
+        self.key = url_key(url)                # the same video behind different links has the same key
         self.title = url
         self.uploader = ""
         self.duration = None
@@ -2927,28 +2958,50 @@ class App:
 
     # ------------------------------------------------------------ queue
 
-    def add_urls(self, urls: list[str]) -> None:
+    def add_urls(self, urls: list[str], again: bool = False) -> None:
+        """Queue links. A video is in the list once: adding it again jumps to its card instead (a failed or
+        cancelled one is retried). again=True (History > Download again) replaces a finished card."""
         self.select_tab(0)
-        known = {it.url for it in self.items if it.active or it.status == "paused"}
+        known = {it.key: it for it in self.items}
         no_playlist, cookies = self.single_var.get(), self.cookies()   # Tk variables: main thread only
-        added, dup, first = 0, 0, None
+        added, seen, first = 0, [], None
         for url in urls:
-            if url in known:
-                dup += 1
+            old = known.get(url_key(url))
+            if old is not None and again and old.finished:
+                self._drop([old])
+                old = None
+            if old is not None:
+                if old not in seen:
+                    seen.append(old)
                 continue
-            known.add(url)
             item = Item(url)
+            known[item.key] = item
             self.items.append(item)
             first = first or item
             self.jobs.submit(0, self._info_job, item, no_playlist, cookies)
             added += 1
+        retry = [it for it in seen if it.status in ("failed", "cancelled")]
         self._items_changed()
-        if first is not None:
-            self.view.scroll_to(self.items[-1] if added == 1 else first)
-        if dup and not added:
-            self.toast("Already in the queue" if dup == 1 else f"{dup} links are already in the queue")
-        elif added > 1 or dup:
-            self.toast(f"Added {added} links" + (f" ({dup} already in the queue)" if dup else ""))
+        if retry:
+            self.retry_items(retry)
+        if seen:                                                       # show what is already there
+            self.selected = {seen[-1].id}
+            self.anchor = self.cursor = seen[-1].id
+            self.view.refresh_rows()
+        target = seen[-1] if seen and not added else (self.items[-1] if added == 1 else first)
+        if target is not None:
+            self.view.scroll_to(target)
+        if seen and not added:
+            if len(seen) > 1:
+                self.toast(f"{len(seen)} links are already in the queue")
+            elif retry:
+                self.toast("Already in the queue - trying again")
+            elif seen[0].status in ("done", "skipped"):
+                self.toast("Already downloaded")
+            else:
+                self.toast("Already in the queue")
+        elif added > 1 or seen:
+            self.toast(f"Added {added} links" + (f" ({len(seen)} already in the queue)" if seen else ""))
 
     def _items_changed(self) -> None:
         """The list of items changed (added, removed, moved): drop stale selection, redraw, update counters."""
@@ -3728,7 +3781,7 @@ class App:
             self.toast("Link copied" if len(urls) == 1 else f"{len(urls)} links copied")
 
     def hist_again(self) -> None:
-        self.add_urls([h["url"] for h in self._selected_history() if h.get("url")])
+        self.add_urls([h["url"] for h in self._selected_history() if h.get("url")], again=True)
 
     def hist_remove(self) -> None:
         drop = {int(i) for i in self.hist.selection()}
