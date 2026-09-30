@@ -64,6 +64,10 @@ app as its version number (`v1.1` → `1.1`), builds all three systems and creat
 Use a higher number every time (`v1.1`, `v1.2`, `v1.10`, …) — that is how running apps
 recognize that something newer exists.
 
+Without a local checkout: **Actions → Build → Run workflow**, enter the tag (e.g. `v2.0`) and
+optional release notes. The workflow then builds everything and publishes the release itself,
+creating the tag on the selected branch. Leave the tag empty to only build artifacts.
+
 ### Building it yourself / publishing a release
 
 The workflow [.github/workflows/build.yml](.github/workflows/build.yml) builds all three

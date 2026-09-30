@@ -1229,13 +1229,22 @@ class App:
         self.quality_combo = ttk.Combobox(bar, textvariable=self.quality_var, state="readonly", width=19)
         self.quality_combo.grid(row=0, column=1, padx=8)
         self.quality_combo.bind("<<ComboboxSelected>>", lambda e: self.sync_mode_options())
-        ttk.Label(bar, text="Save to").grid(row=0, column=2, padx=(10, 6))
+        also = ttk.Frame(bar)                  # video modes: keep the video AND save a separate audio file
+        also.grid(row=0, column=2)
+        self.also_lbl = ttk.Label(also, text="+ Audio")
+        self.also_lbl.pack(side="left", padx=(0, 6))
+        self.also_var = tk.StringVar(value=cfg.get("also_audio") or ALSO_AUDIO_NONE)
+        self.also_combo = ttk.Combobox(also, textvariable=self.also_var, values=[ALSO_AUDIO_NONE, *AUDIO_MODES],
+                                       state="readonly", width=6)
+        self.also_combo.pack(side="left")
         self.out_var = tk.StringVar(value=cfg.get("out") or str(DEFAULT_OUT))
-        ttk.Entry(bar, textvariable=self.out_var).grid(row=0, column=3, sticky="ew")
-        ttk.Button(bar, text="Browse …", command=self.pick_dir).grid(row=0, column=4, padx=(6, 0))
+        ttk.Label(bar, text="Save to").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(bar, textvariable=self.out_var).grid(row=1, column=1, columnspan=3, sticky="ew",
+                                                       padx=(8, 0), pady=(8, 0))
+        ttk.Button(bar, text="Browse …", command=self.pick_dir).grid(row=1, column=4, padx=(8, 0), pady=(8, 0))
         self.opts_open = tk.BooleanVar(value=cfg.get("options_open", False))
         self.opts_btn = ttk.Button(bar, command=self._toggle_options, width=11)
-        self.opts_btn.grid(row=0, column=5, padx=(8, 0))
+        self.opts_btn.grid(row=0, column=4, padx=(8, 0))
 
         # collapsible options
         self.opts = ttk.Frame(main, padding=(0, 10, 0, 0))
@@ -1261,22 +1270,17 @@ class App:
         extra = ttk.Frame(self.opts)
         extra.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
         self.cookie_var = tk.StringVar(value=cfg.get("cookies") or NO_BROWSER)
-        self.also_var = tk.StringVar(value=cfg.get("also_audio") or ALSO_AUDIO_NONE)
         self.limit_var = tk.StringVar(value=cfg.get("limit", ""))
         self.parallel_var = tk.StringVar(value=str(cfg.get("parallel", 2)))
         ttk.Label(extra, text="Cookies from").grid(row=0, column=0, sticky="w")
         ttk.Combobox(extra, textvariable=self.cookie_var, values=[NO_BROWSER, *BROWSERS[1:]],
                      state="readonly", width=10).grid(row=0, column=1, padx=(6, 18))
-        ttk.Label(extra, text="Also save audio as").grid(row=0, column=2, sticky="w")
-        self.also_combo = ttk.Combobox(extra, textvariable=self.also_var, values=[ALSO_AUDIO_NONE, *AUDIO_MODES],
-                                       state="readonly", width=8)
-        self.also_combo.grid(row=0, column=3, padx=(6, 18))
-        ttk.Label(extra, text="Speed limit").grid(row=0, column=4, sticky="w")
-        ttk.Entry(extra, textvariable=self.limit_var, width=7).grid(row=0, column=5, padx=(6, 2))
-        ttk.Label(extra, text="(e.g. 2M)", style="Muted.TLabel").grid(row=0, column=6, padx=(0, 18))
-        ttk.Label(extra, text="Parallel").grid(row=0, column=7, sticky="w")
+        ttk.Label(extra, text="Speed limit").grid(row=0, column=2, sticky="w")
+        ttk.Entry(extra, textvariable=self.limit_var, width=7).grid(row=0, column=3, padx=(6, 2))
+        ttk.Label(extra, text="(e.g. 2M)", style="Muted.TLabel").grid(row=0, column=4, padx=(0, 18))
+        ttk.Label(extra, text="Parallel").grid(row=0, column=5, sticky="w")
         ttk.Spinbox(extra, textvariable=self.parallel_var, from_=1, to=4, width=3,
-                    state="readonly").grid(row=0, column=8, padx=(6, 0))
+                    state="readonly").grid(row=0, column=6, padx=(6, 0))
         self._apply_options_visibility()
 
         # tabs
@@ -1435,6 +1439,7 @@ class App:
         audio_only = self.mode_key() in AUDIO_MODES
         self.kind_var.set(mode_kind(self.mode_key()))
         self.also_combo.configure(state="disabled" if audio_only else "readonly")
+        self.also_lbl.configure(foreground=COLORS[self.theme]["muted"] if audio_only else "")
         self.subs_check.configure(state="disabled" if audio_only else "normal")
 
     def pick_dir(self) -> None:
