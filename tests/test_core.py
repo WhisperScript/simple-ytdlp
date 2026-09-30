@@ -3,6 +3,7 @@ import importlib.util
 import json
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -360,6 +361,28 @@ class QueueStorageV2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TimeAndPower(unittest.TestCase):
+    def test_clock_times(self):
+        now = time.mktime((2026, 9, 30, 12, 0, 0, 0, 0, -1))
+        self.assertEqual(time.localtime(app.parse_clock_time("14:30", now))[2:5], (30, 14, 30))
+        later = app.parse_clock_time("02:30", now)
+        self.assertEqual(time.localtime(later)[2:5], (1, 2, 30), "already past today: tomorrow")
+        self.assertEqual(app.parse_clock_time(" 9.05 ", now), app.parse_clock_time("9:05", now))
+        for bad in ("", "25:00", "12:60", "noon", "1230"):
+            self.assertIsNone(app.parse_clock_time(bad, now))
+
+    def test_power_commands(self):
+        self.assertIsNone(app.power_command("hibernate"))
+        self.assertTrue(app.power_command("sleep") and app.power_command("shutdown"))
+
+    def test_free_space_of_a_folder_that_does_not_exist_yet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertGreater(app.free_space(Path(tmp) / "a" / "b"), 0)
+
+    def test_full_disk_error_is_explained(self):
+        self.assertIn("disk is full", app.friendly_error("OSError: [Errno 28] No space left on device"))
 
 
 class CompatAndCookies(unittest.TestCase):

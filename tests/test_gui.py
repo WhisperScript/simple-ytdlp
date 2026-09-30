@@ -671,6 +671,63 @@ class Feedback(GuiCase):
         self.assertEqual(root.title(), app.base_title)
 
 
+class QueueExtras(GuiCase):
+    def test_low_disk_space_shows_a_notice_and_a_full_disk_fails_the_download_clearly(self):
+        with mock.patch.object(mod, "free_space", lambda path: 200 << 20):
+            app.check_disk()
+        self.assertIn("disk", app.notices)
+        with mock.patch.object(mod, "free_space", lambda path: 10 << 20):
+            it = add(U("nospace"))
+            app.start_item(it)
+        self.assertEqual(it.status, "failed")
+        self.assertIn("disk is full", mod.friendly_error(it.error))
+        with mock.patch.object(mod, "free_space", lambda path: 500 << 30):
+            app.check_disk()
+        self.assertNotIn("disk", app.notices)
+
+    def test_the_queue_can_be_started_at_a_set_time(self):
+        it = add(U("later"))
+        with mock.patch.object(mod.simpledialog, "askstring", return_value="03:15"):
+            app.schedule_start()
+        self.assertIn("03:15", " ".join(w.cget("text") for w in app.notice.winfo_children()
+                                        if isinstance(w, mod.ttk.Label)))
+        self.assertEqual(it.status, "queued")
+        app.start_at = time.time() - 1                       # the time has come
+        app._schedule_tick()
+        self.assertIsNone(app.start_at)
+        self.assertTrue(wait(lambda: it.status == "done", 30), it.status)
+
+    def test_a_bad_time_is_refused(self):
+        with mock.patch.object(mod.simpledialog, "askstring", return_value="25:99"):
+            app.schedule_start()
+        self.assertIsNone(app.start_at)
+
+    def test_sleep_or_shutdown_follows_the_queue_after_a_countdown(self):
+        it = add(U("power1"))
+        app.after_var.set("shutdown")
+        started = []
+        with mock.patch.object(app, "_run_power", lambda kind: started.append(kind)):
+            app.start_all()
+            self.assertTrue(wait(lambda: it.status == "done" and app._power_win is not None, 30))
+            self.assertEqual(app.after_var.get(), "none", "the choice is used up")
+            self.assertEqual(started, [], "there is a countdown first")
+            app._power_win.destroy()                         # Cancel
+            pump(1300)
+            self.assertEqual(started, [])
+            app.power_countdown("sleep", seconds=1)          # left alone, it goes through
+            self.assertTrue(wait(lambda: started == ["sleep"], 6))
+
+    def test_nothing_happens_when_the_queue_only_failed(self):
+        it = add(U("fail_power"))
+        app.after_var.set("shutdown")
+        app._power_win = None
+        app.start_all()
+        self.assertTrue(wait(lambda: it.status == "failed", 20))
+        pump(200)
+        self.assertIsNone(app._power_win)
+        app.after_var.set("none")
+
+
 class HistoryAndLog(GuiCase):
     def test_history_list_and_search(self):
         t = time.localtime()

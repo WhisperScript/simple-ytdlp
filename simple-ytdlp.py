@@ -618,6 +618,8 @@ FRIENDLY_ERRORS = [
      "Not available in your country"),
     (r"video unavailable|has been removed|no longer available|does not exist",
      "Video unavailable (removed, private or blocked)"),
+    (r"no space left|not enough (?:disk )?space|disk full|errno 28",
+     "The disk is full - free some space, then Retry"),
     (r"unsupported url", "This link is not supported by yt-dlp"),
     (r"requested format is not available", "That format is not offered for this video - choose another"),
     (r"ffprobe.*(not found|not installed)", "ffprobe is missing - Tools > Get ffmpeg tools, then Retry"),
@@ -1271,6 +1273,43 @@ def shorten(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
+LOW_DISK = 1 << 30                          # below this much free space the window warns
+MIN_DISK = 50 << 20                         # below this a download is not even started
+
+
+def free_space(path) -> int | None:
+    """Free bytes on the disk that holds path (or its nearest existing parent), None if unknown."""
+    p = Path(path).expanduser()
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
+def parse_clock_time(text: str, now: float | None = None) -> float | None:
+    """The next moment it is HH:MM (today, or tomorrow if that has passed) as a timestamp; None if not a time."""
+    m = re.fullmatch(r"\s*(\d{1,2})[:.](\d{2})\s*", text or "")
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    now = time.time() if now is None else now
+    t = time.localtime(now)
+    target = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, int(m.group(1)), int(m.group(2)), 0, 0, 0, -1))
+    return target if target > now else target + 86400
+
+
+def power_command(kind: str) -> list[str] | None:
+    """The command that puts the computer to sleep or shuts it down (kind: sleep | shutdown), None if unknown."""
+    if os.name == "nt":
+        return {"sleep": ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+                "shutdown": ["shutdown", "/s", "/t", "0"]}.get(kind)
+    if sys.platform == "darwin":
+        event = {"sleep": "sleep", "shutdown": "shut down"}.get(kind)
+        return ["osascript", "-e", f'tell application "System Events" to {event}'] if event else None
+    return {"sleep": ["systemctl", "suspend"], "shutdown": ["systemctl", "poweroff"]}.get(kind)
+
+
 # ---------------------------------------------------------------- GUI
 
 UPDATE_INTERVAL = 24 * 3600      # how often (seconds) to silently check for yt-dlp updates at startup
@@ -1314,7 +1353,7 @@ def looks_like_url(text: str) -> bool:
 try:
     import tkinter as tk
     import tkinter.font as tkfont
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import ttk, filedialog, messagebox, simpledialog
 except ImportError:                            # checked again in run_gui() with a helpful message
     tk = None
 
@@ -2496,7 +2535,7 @@ class AboutDialog(tk.Toplevel if tk else object):
 class App:
     """The main window: link input, download queue, history and log."""
 
-    NOTICE_ORDER = ("setup-error", "setup", "restore", "update")
+    NOTICE_ORDER = ("setup-error", "setup", "disk", "schedule", "restore", "update")
 
     def __init__(self, root):
         self.root = root
@@ -2524,6 +2563,8 @@ class App:
         self.save_job = None
         self._retry_job = None
         self._setup_panel_shown = False
+        self.start_at = None                   # when the queue starts by itself (Queue > Start at ...)
+        self._power_win = None
         self.setup_error = ""
         self._placeholders: dict = {}
         self._boxes: dict = {}                 # rendered card and button images
@@ -2773,6 +2814,7 @@ class App:
         self.single_var = tk.BooleanVar(value=cfg.get("single", True))
         self.sponsor_var = tk.BooleanVar(value=cfg.get("sponsorblock", False))
         self.auto_var = tk.BooleanVar(value=cfg.get("autostart", True))
+        self.after_var = tk.StringVar(value="none")             # what to do when the queue is done (never saved)
         self.chapters_var = tk.BooleanVar(value=cfg.get("chapters", False))
         self.clip_watch_var = tk.BooleanVar(value=False)                   # never on at startup
         self.clip_watch_var.trace_add("write", lambda *_: self._clip_watch_toggled())
@@ -3131,6 +3173,33 @@ class App:
             return "file:" + path
         value = self.cookie_var.get()
         return "" if value == NO_BROWSER else value
+
+    def schedule_start(self) -> None:
+        text = simpledialog.askstring("Start the queue at", "Time (24 h, like 02:30):", parent=self.root)
+        if not text:
+            return
+        when = parse_clock_time(text)
+        if when is None:
+            self.toast("Times look like 02:30")
+            return
+        self.start_at = when
+        stamp = time.strftime("%H:%M", time.localtime(when))
+        self.set_notice("schedule", f"The queue starts at {stamp}. Leave the app open.",
+                        actions=[("Cancel", self.cancel_schedule)], dismiss=False)
+        self._schedule_tick()
+
+    def cancel_schedule(self) -> None:
+        self.start_at = None
+        self.clear_notice("schedule")
+
+    def _schedule_tick(self) -> None:
+        if self.start_at is None:
+            return
+        if time.time() >= self.start_at:
+            self.cancel_schedule()
+            self.start_all()
+            return
+        self.root.after(15000, self._schedule_tick)
 
     def pick_cookie_file(self) -> None:
         path = filedialog.askopenfilename(title="Cookies file (cookies.txt)",
@@ -3740,7 +3809,16 @@ class App:
         self._drop([it for it in self.items if it.finished])
         self._items_changed()
 
+    def check_disk(self) -> None:
+        """A notice while the download folder is nearly full."""
+        free = free_space(self.out_var.get() or DEFAULT_OUT)
+        if free is not None and free < LOW_DISK:
+            self.set_notice("disk", f"Only {fmt_size(free)} free in the download folder - downloads may fail.")
+        else:
+            self.clear_notice("disk")
+
     def start_all(self) -> None:
+        self.check_disk()
         if not self.running:
             self.batch = {"ok": 0, "bad": 0}
             self.batch_ids = set()
@@ -3779,6 +3857,44 @@ class App:
             summary = f"{ok} succeeded" + (f", {bad} failed" if bad else "")
             self.log("Done. " + summary)
             notify(APP_NAME, "Done: " + summary, self.root)
+            if ok and self.after_var.get() != "none":
+                self.power_countdown(self.after_var.get())
+
+    def _run_power(self, kind: str) -> None:
+        try:
+            subprocess.Popen(power_command(kind), **_no_window())
+        except OSError as e:
+            self.log(f"ERROR: {e}")
+
+    def power_countdown(self, kind: str, seconds: int = 30) -> None:
+        """Sleep or shut down after a countdown that can be cancelled (the choice is used up once)."""
+        self.after_var.set("none")
+        if power_command(kind) is None:
+            return
+        win = tk.Toplevel(self.root)
+        self._power_win = win
+        win.title(APP_NAME)
+        win.transient(self.root)
+        win.resizable(False, False)
+        label = tk.StringVar()
+        body = ttk.Frame(win, padding=20)
+        body.pack()
+        ttk.Label(body, textvariable=label, style="Big.TLabel").pack()
+        ttk.Button(body, text="Cancel", command=win.destroy).pack(pady=(14, 0))
+        word = "Shutting down" if kind == "shutdown" else "Going to sleep"
+        state = {"left": seconds}
+
+        def tick() -> None:
+            if not win.winfo_exists():
+                return
+            if state["left"] <= 0:
+                win.destroy()
+                self._run_power(kind)
+                return
+            label.set(f"{word} in {state['left']} s")
+            state["left"] -= 1
+            win.after(1000, tick)
+        tick()
 
     def snapshot(self) -> dict:
         return {"mode": self.mode_key(), "out": Path(self.out_var.get() or DEFAULT_OUT).expanduser(),
@@ -3795,6 +3911,13 @@ class App:
 
     def _launch(self, item: Item) -> None:
         opts = self.snapshot()
+        free = free_space(opts["out"])
+        if free is not None and free < MIN_DISK:               # nothing to write to: say so instead of failing oddly
+            item.status, item.error, item.retry_at = "failed", "No space left on device", 0.0
+            self.batch["bad"] += 1
+            self.batch_ids.add(item.id)
+            self.view.touch(item)
+            return
         ov = item.overrides                    # what was changed for this item wins
         for key in ("mode", "format", "section", "exact", "split", "chapters", "name"):
             if key in ov:
@@ -4208,6 +4331,13 @@ class App:
                                command=lambda: self.move_selected(-1))
         queue_menu.add_command(label="Move down", accelerator="Alt+↓" if not mac else "⌥↓",
                                command=lambda: self.move_selected(1))
+        queue_menu.add_separator()
+        queue_menu.add_command(label="Start at a set time …", command=self.schedule_start)
+        done_menu = tk.Menu(queue_menu, tearoff=0)
+        for label, value in (("Do nothing", "none"), ("Put the computer to sleep", "sleep"),
+                             ("Shut the computer down", "shutdown")):
+            done_menu.add_radiobutton(label=label, value=value, variable=self.after_var)
+        queue_menu.add_cascade(label="When the queue is done", menu=done_menu)
         queue_menu.add_separator()
         queue_menu.add_command(label="Clear finished", command=self.clear_finished)
         bar.add_cascade(label="Queue", menu=queue_menu)
