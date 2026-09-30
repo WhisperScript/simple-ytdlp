@@ -38,7 +38,7 @@ jobs:
       - name: System packages (Tk, virtual display, a font)
         run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb fonts-dejavu-core
       - name: Dependencies
-        run: python -m pip install sv-ttk pillow darkdetect certifi yt-dlp imageio-ffmpeg
+        run: python -m pip install sv-ttk pillow darkdetect certifi yt-dlp imageio-ffmpeg tkinterdnd2
       - name: Window tests
         run: xvfb-run -a -s "-screen 0 1280x1024x24" python -X faulthandler -m unittest discover -s tests -v
       - name: README screenshots still build

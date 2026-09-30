@@ -363,6 +363,31 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ReleaseNotes(unittest.TestCase):
+    def test_markdown_becomes_plain_text_and_the_generated_part_is_cut(self):
+        body = "## simple-ytdlp 2.5\n\n- **Drag and drop:** drop a `link`\n- More\n\n\n## What's Changed\n* PR by @x"
+        self.assertEqual(app.release_notes_text(body), "simple-ytdlp 2.5\n\n\u2022 Drag and drop: drop a link\n\u2022 More")
+
+
+class DropsAndLive(unittest.TestCase):
+    def test_links_in_dropped_text(self):
+        self.assertEqual(app.links_from_drop("look https://a.b/c and\nhttps://d.e/f", str.split), ["https://a.b/c", "https://d.e/f"])
+
+    def test_links_in_dropped_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lst, shortcut = Path(tmp) / "list.txt", Path(tmp) / "x.url"
+            lst.write_text("# videos\nhttps://a.b/1\nhttps://a.b/2\n")
+            shortcut.write_text("[InternetShortcut]\nURL=https://c.d/3\n")
+            self.assertEqual(app.links_from_drop(f"{lst} {shortcut}", str.split),
+                             ["https://a.b/1", "https://a.b/2", "https://c.d/3"])
+            self.assertEqual(app.links_from_drop(str(Path(tmp) / "missing.txt"), str.split), [])
+
+    def test_live_streams_are_recognised(self):
+        self.assertTrue(app.parse_info({"title": "t", "is_live": True})["live"])
+        self.assertTrue(app.parse_info({"title": "t", "live_status": "is_upcoming"})["live"])
+        self.assertFalse(app.parse_info({"title": "t", "live_status": "not_live"})["live"])
+
+
 class TimeAndPower(unittest.TestCase):
     def test_clock_times(self):
         now = time.mktime((2026, 9, 30, 12, 0, 0, 0, 0, -1))

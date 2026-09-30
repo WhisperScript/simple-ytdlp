@@ -122,6 +122,12 @@ nothing is fetched twice. **Pause all** and **Resume all** do the same for the w
 
 ### More
 
+- **Drag and drop:** drag a link, some text with links, or a `.txt` list / internet shortcut onto the window.
+- **Plays everywhere:** by default videos are saved as MP4 (H.264 + AAC when the website offers them), so they
+  open on phones, TVs and in QuickTime. Turn it off in the settings if you prefer the original format.
+- **Overnight:** *Queue → Start at a set time …* starts the queue later; *Queue → When the queue is done* puts the
+  computer to sleep or shuts it down (after a 30-second countdown you can cancel). The app warns when the disk is nearly full.
+- **Live streams** are marked **LIVE** and recorded until the stream ends.
 - **Many links at once:** paste as many as you like; they wait in line and download two at a time (up to four in the settings).
 - **Same video twice?** A video is in the list once per format - paste it again and the app jumps to its card (a failed one is retried). Want it as MP3 or in another quality? That is a new download, saved under its own file name. Deleted the file? Paste the link again and it downloads again. ("Skip already downloaded" in the settings only skips videos that are in the History *and* still on your disk.)
 - **Finished?** You get a notification when everything is done.
@@ -169,6 +175,14 @@ ffprobe. Use **Tools → Get ffmpeg tools** (about 150 MB, once; Windows and Lin
 </details>
 
 <details>
+<summary><b>"The browser's cookies cannot be read"</b></summary>
+
+Chrome (especially on Windows) locks its cookies while it is open and encrypts them in a way other programs often cannot read.
+Close the browser, choose **Firefox** or **Edge** under Settings → **Cookies from browser**, or export a `cookies.txt`
+file (browser extensions such as "Get cookies.txt LOCALLY" do that) and pick it under **Cookies file**.
+</details>
+
+<details>
 <summary><b>Suddenly every download fails</b></summary>
 
 The website probably changed something. Use **Tools → Update yt-dlp**, then **Retry**. The app also checks for
@@ -186,7 +200,7 @@ is not on the list, the card tells you the link is not supported.
 <details>
 <summary><b>How do I update the app?</b></summary>
 
-A banner appears when a new version is out: click **Update now**. The app downloads it, replaces itself and restarts;
+A banner appears when a new version is out: **What's new** shows the changes, **Update now** installs it. The app downloads it, replaces itself and restarts;
 your settings stay. On a Mac, keep the app in **Applications** (not in Downloads) so it can replace itself.
 Or simply download the new version from the [Releases page](https://github.com/WhisperScript/simple-ytdlp/releases/latest).
 </details>
@@ -220,7 +234,7 @@ terms of the websites; download what you have the right to keep.
 ### In the window
 
 - **Per download:** right-click a card (or double-click it, or press Enter; finished ones open their file
-  instead) to change just that download: video/audio quality, an exact format picked from the real format
+  instead) to change just that download: video/audio quality, subtitles on or off, an exact format picked from the real format
   list (video + audio rows are combined), only a part of the video (start/end, optionally an exact re-encoded
   cut), chapters (embed markers, one file per chapter) and extra yt-dlp arguments. "Apply to all waiting"
   copies the choices to the rest of the queue. The menu also copies the link, opens it in the browser and
@@ -308,7 +322,7 @@ data folder.
 2. Copy `simple-ytdlp.py` over and start it: `uv run simple-ytdlp.py`
    (on macOS/Linux after `chmod +x simple-ytdlp.py` also `./simple-ytdlp.py` - the shebang line calls uv).
 
-Without uv, an existing Python works too: `pip install imageio-ffmpeg certifi sv-ttk darkdetect pillow`, then
+Without uv, an existing Python works too: `pip install imageio-ffmpeg certifi sv-ttk darkdetect pillow tkinterdnd2`, then
 `python3 simple-ytdlp.py`. On Linux you may need `sudo apt install python3-tk` for the window.
 
 ### What happens automatically
@@ -338,7 +352,7 @@ Without uv, an existing Python works too: `pip install imageio-ffmpeg certifi sv
   and drops connections; every finished file must be bit-identical to the source.
 - `tests/test_real_ytdlp.py` - real yt-dlp and ffmpeg: video + audio in one go, exact cuts.
 
-The window tests need Tk, sv-ttk, Pillow and a display (`pip install sv-ttk pillow yt-dlp imageio-ffmpeg`; on Linux
+The window tests need Tk, sv-ttk, Pillow and a display (`pip install sv-ttk pillow yt-dlp imageio-ffmpeg tkinterdnd2`; on Linux
 `sudo apt install python3-tk xvfb` and `xvfb-run -a python -m unittest discover -s tests -v`) and skip themselves
 otherwise. They use a temporary data folder, never your real settings. They run on every pull request
 (`.github/workflows/ci.yml`: `test` on Python 3.9 and 3.12, `gui` under a virtual display).
@@ -356,9 +370,9 @@ The workflow [.github/workflows/build.yml](.github/workflows/build.yml) builds W
 Intel) and Linux. Started by hand (**Actions → Build → Run workflow**) without a tag it only produces downloadable
 artifacts. Locally, e.g. on Windows:
 
-    pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect pillow
+    pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect pillow tkinterdnd2
     python simple-ytdlp.py --make-icons build-assets
-    pyinstaller --onefile --windowed --name simple-ytdlp --icon build-assets/icon.ico --collect-all imageio_ffmpeg --collect-all sv_ttk simple-ytdlp.py
+    pyinstaller --onefile --windowed --name simple-ytdlp --icon build-assets/icon.ico --collect-all imageio_ffmpeg --collect-all sv_ttk --collect-all tkinterdnd2 simple-ytdlp.py
 
 (The icon is drawn by the program itself. On macOS leave out `--onefile` and use `icon.icns`; on Linux no icon is
 embedded.)

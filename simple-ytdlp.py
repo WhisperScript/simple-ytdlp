@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect", "pillow"]
+# dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect", "pillow", "tkinterdnd2"]
 # ///
 """
 simple-ytdlp.py - cross-platform frontend for yt-dlp (macOS, Linux, Windows).
@@ -292,7 +292,7 @@ def _release_asset_name() -> str | None:
 def check_app_update() -> dict | None:
     """Info about a newer simple-ytdlp release, or None.
 
-    Returns {"version", "page", "asset_url", "asset_name", "digest"}; asset_url is None when
+    Returns {"version", "page", "asset_url", "asset_name", "digest", "notes"}; asset_url is None when
     the release has no file for this platform. Silent on any failure (offline, private repo,
     rate limit) - it is only a hint.
     """
@@ -313,10 +313,21 @@ def check_app_update() -> dict | None:
         if url and not url.startswith(f"https://github.com/{REPO}/releases/download/"):
             url = None                          # only ever fetch from our own releases
         return {"version": latest.lstrip("v"), "asset_name": wanted, "asset_url": url,
+                "notes": str(data.get("body") or "")[:3000],
                 "digest": str(asset.get("digest") or "") if asset else "",
                 "page": str(data.get("html_url") or f"https://github.com/{REPO}/releases")}
     except Exception:
         return None
+
+
+def release_notes_text(body: str) -> str:
+    """A GitHub release description as plain text for a message box (markdown marks removed, the generated
+    'What's Changed' part cut off)."""
+    body = re.split(r"\n#+\s*What's Changed", body or "")[0]
+    text = re.sub(r"^#+\s*", "", body, flags=re.M)
+    text = re.sub(r"\*\*|`", "", text)
+    text = re.sub(r"^[ \t]*[-*][ \t]+", "\u2022 ", text, flags=re.M)
+    return text.strip()
 
 
 def can_self_update() -> bool:
@@ -901,7 +912,8 @@ def parse_info(data: dict) -> dict:
     if not thumb and data.get("thumbnails"):
         thumb = (data["thumbnails"][-1] or {}).get("url", "")
     info = {"title": data.get("title") or "", "uploader": data.get("uploader") or data.get("channel") or "",
-            "duration": data.get("duration"), "thumbnail": thumb, "is_playlist": False, "entries": []}
+            "duration": data.get("duration"), "thumbnail": thumb, "is_playlist": False, "entries": [],
+            "live": bool(data.get("is_live")) or data.get("live_status") in ("is_live", "is_upcoming")}
     if data.get("_type") == "playlist" or "entries" in data:
         info["is_playlist"] = True
         for e in data.get("entries") or []:
@@ -1087,6 +1099,8 @@ def overrides_summary(o: dict) -> str:
         parts.append("split chapters")
     if o.get("extra"):
         parts.append("custom arguments")
+    if "subs" in o:
+        parts.append("subtitles" if o["subs"] else "no subtitles")
     if o.get("name"):
         parts.append("file named by quality")
     return "  ·  ".join(parts)
@@ -1118,6 +1132,24 @@ def read_url_file(path: str | Path) -> list[str]:
         line = raw.strip()
         if line and not line.startswith("#"):
             urls.append(line)
+    return urls
+
+
+def links_from_drop(data: str, splitlist) -> list[str]:
+    """The links in something dropped on the window: dragged text/links, or files (.txt lists, .url/.webloc
+    shortcuts) - splitlist turns Tk's file list into paths."""
+    urls = extract_urls(data or "")
+    if urls:
+        return urls
+    for part in splitlist(data or ""):
+        try:
+            path = Path(part)
+            if path.is_file() and path.stat().st_size < 2_000_000:
+                for u in extract_urls(path.read_text(encoding="utf-8", errors="ignore")):
+                    if u not in urls:
+                        urls.append(u)
+        except OSError:
+            continue
     return urls
 
 
@@ -1524,6 +1556,7 @@ class Item:
         self.url = url
         self.vkey = url_key(url)               # the same video behind different links has the same key
         self.added_mode = ""                   # the format chosen when it was added
+        self.live = False                      # a live stream: it records until the stream ends
         self.title = url
         self.uploader = ""
         self.duration = None
@@ -1790,7 +1823,7 @@ class Row:
             if it.retry_at > time.time():
                 return (f"Connection problem - retrying in {max(int(it.retry_at - time.time()) + 1, 1)} s "
                         f"({it.retries}/{len(AUTO_RETRY_DELAYS)})")
-            return "Waiting"
+            return "Waiting - live stream, records until it ends" if it.live else "Waiting"
         if st == "paused":
             kept = partial_size(it.dests)
             return f"Paused at {it.pct:.0f}%" + (f"  ·  {fmt_size(kept)} kept" if kept else "")
@@ -1919,8 +1952,9 @@ class Row:
         else:
             C.itemconfigure(self.i_thumb, state="hidden")
         x0, y0, x1, y1 = self.geo["thumb"]
-        if it.duration:
-            text = fmt_duration(it.duration)
+        if it.duration or it.live:
+            text = "LIVE" if it.live else fmt_duration(it.duration)
+            C.itemconfigure(self.i_badge_bg, fill="#c62828" if it.live else "#000000")
             bw = self.app.font_badge.measure(text) + 10
             bh = self.app.line_h["badge"] + 2
             C.coords(self.i_badge_bg, x1 - 5 - bw, y1 - 5 - bh, x1 - 5, y1 - 5)
@@ -2273,8 +2307,12 @@ class ItemDialog(tk.Toplevel if tk else object):
         chap.grid(row=7, column=1, columnspan=3, sticky="w", pady=(10, 0))
         self.chap_var = tk.BooleanVar(value=o.get("chapters", app.chapters_var.get()))
         self.split_var = tk.BooleanVar(value=o.get("split", False))
+        self.subs_choice = tk.StringVar(value={True: "Yes", False: "No"}.get(o.get("subs"), "As in the settings"))
         ttk.Checkbutton(chap, text="Embed chapter markers", variable=self.chap_var).pack(side="left")
         ttk.Checkbutton(chap, text="One file per chapter", variable=self.split_var).pack(side="left", padx=14)
+        ttk.Label(chap, text="Subtitles").pack(side="left", padx=(14, 6))
+        ttk.Combobox(chap, textvariable=self.subs_choice, values=["As in the settings", "Yes", "No"],
+                     state="readonly", width=16).pack(side="left")
 
         ttk.Label(body, text="Extra arguments").grid(row=8, column=0, sticky="w", pady=4)
         self.extra_var = tk.StringVar(value=o.get("extra", ""))
@@ -2366,12 +2404,18 @@ class ItemDialog(tk.Toplevel if tk else object):
         result = {k: v for k, v in result.items() if v}
         if self.chap_var.get() != self.app.chapters_var.get():         # only a difference is an override
             result["chapters"] = self.chap_var.get()
+        if self.subs_choice.get() in ("Yes", "No"):
+            result["subs"] = self.subs_choice.get() == "Yes"
+        if "name" in self.item.overrides:                              # set by the program, not in this window
+            result["name"] = self.item.overrides["name"]
         self.item.overrides = result
         if all_waiting:
             for other in self.app.items:
                 if other is not self.item and other.status == "queued":
-                    other.overrides = dict(result)
-                    other.card.refresh()
+                    keep = {k: v for k, v in other.overrides.items() if k == "name"}
+                    other.overrides = {**result, **keep}
+                    self.app.view.touch(other)
+        self.app.view.touch(self.item)
         self.destroy()
 
 
@@ -2500,7 +2544,7 @@ class AboutDialog(tk.Toplevel if tk else object):
             row=3, column=0, columnspan=2, sticky="w", pady=(16, 0))
         row = ttk.Frame(body)
         row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(18, 0))
-        ttk.Button(row, text="Copy info", command=self.copy_info).pack(side="left")
+        ttk.Button(row, text="Copy diagnostics", command=self.copy_info).pack(side="left")
         ttk.Button(row, text="Project page",
                    command=lambda: webbrowser.open(f"https://github.com/{REPO}")).pack(side="left", padx=8)
         ttk.Button(row, text="Close", command=self.destroy).pack(side="right")
@@ -2527,9 +2571,10 @@ class AboutDialog(tk.Toplevel if tk else object):
         self.app.ui(lambda: self.winfo_exists() and self.info_var.set(text))
 
     def copy_info(self) -> None:
+        tail = "\n".join(list(self.app.log_lines)[-40:])
         self.app.root.clipboard_clear()
-        self.app.root.clipboard_append(self.info_var.get())
-        self.app.toast("Copied to the clipboard")
+        self.app.root.clipboard_append(self.info_var.get() + ("\n\nLog (last lines):\n" + tail if tail else ""))
+        self.app.toast("Copied to the clipboard - paste it into your bug report")
 
 
 class App:
@@ -2604,6 +2649,7 @@ class App:
         if Image is None:
             self.log("Note: Pillow is not installed - no thumbnails (pip install pillow).")
 
+        self._setup_drop()
         self._restore_queue()
         self.root.after(1000, self._watch_clipboard)
         self._startup_tools()
@@ -3174,6 +3220,24 @@ class App:
         value = self.cookie_var.get()
         return "" if value == NO_BROWSER else value
 
+    def _setup_drop(self) -> None:
+        """Links, text and files can be dropped on the window (needs the optional tkinterdnd2 package)."""
+        if not hasattr(self.root, "drop_target_register"):
+            return
+        try:
+            self.root.drop_target_register("DND_Text", "DND_Files")
+            self.root.dnd_bind("<<Drop>>", lambda e: self.on_drop(e.data))
+        except Exception:
+            pass
+
+    def on_drop(self, data: str) -> str:
+        urls = links_from_drop(data, self.root.tk.splitlist)
+        if urls:
+            self.add_urls(urls)
+        else:
+            self.toast("No link found in what you dropped")
+        return "copy"
+
     def schedule_start(self) -> None:
         text = simpledialog.askstring("Start the queue at", "Time (24 h, like 02:30):", parent=self.root)
         if not text:
@@ -3426,6 +3490,7 @@ class App:
             item.title = info["title"] or item.url
             item.uploader = info["uploader"]
             item.duration = info["duration"]
+            item.live = info.get("live", False)
             item.thumb_url = info["thumbnail"]
             item.thumb = thumb
             item.thumb_state = "done" if thumb is not None else "failed"
@@ -3919,7 +3984,7 @@ class App:
             self.view.touch(item)
             return
         ov = item.overrides                    # what was changed for this item wins
-        for key in ("mode", "format", "section", "exact", "split", "chapters", "name"):
+        for key in ("mode", "format", "section", "exact", "split", "chapters", "name", "subs"):
             if key in ov:
                 opts[key] = ov[key]
         if ov.get("extra"):
@@ -4515,12 +4580,17 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def show_app_update(self, update: dict) -> None:
-        actions = [("Release page", lambda: webbrowser.open(update["page"]))]
+        actions = [("What's new", lambda: self.show_whats_new(update)),
+                   ("Release page", lambda: webbrowser.open(update["page"]))]
         if can_self_update() and update["asset_url"]:
             actions.insert(0, ("Update now", lambda: self.run_self_update(update)))
         self.set_notice("update", f"A new version of {APP_NAME} is available: v{update['version']}",
                         actions=actions)
         self.log(f"New version available: v{update['version']}  ->  {update['page']}")
+
+    def show_whats_new(self, update: dict) -> None:
+        text = release_notes_text(update.get("notes", ""))
+        messagebox.showinfo(f"What's new in {update['version']}", text or "See the release page for the details.")
 
     def run_self_update(self, update: dict) -> None:
         if any(it.status == "downloading" for it in self.items) or self.tools_busy:
@@ -4559,7 +4629,11 @@ def run_gui() -> int:
         print("Linux:  sudo apt install python3-tk   (or python3-tkinter)")
         return 1
     cleanup_old_versions()                     # leftovers of a previous self-update
-    root = tk.Tk()
+    try:                                       # drag and drop of links and files (optional package)
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+    except Exception:
+        root = tk.Tk()
     App(root)
     root.mainloop()
     return 0

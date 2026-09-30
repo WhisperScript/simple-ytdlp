@@ -728,6 +728,44 @@ class QueueExtras(GuiCase):
         app.after_var.set("none")
 
 
+class DropAndItemOptions(GuiCase):
+    def test_dropping_links_adds_them_and_dropping_nothing_says_so(self):
+        self.assertEqual(app.on_drop("https://x.test/watch?v=dropped1 https://x.test/watch?v=dropped2"), "copy")
+        self.assertEqual(len(app.items), 2)
+        app.on_drop("nothing useful")
+        self.assertIn("No link", app.toast_lbl.cget("text"))
+
+    def test_live_cards_show_a_live_badge(self):
+        live = mk(1)
+        live.live, live.duration = True, None
+        app.items.append(live)
+        app._items_changed()
+        pump(100)
+        row = app.view.row_for(live)
+        self.assertEqual(row.badge.cget("text"), "LIVE")
+        self.assertIn("live stream", row.status.cget("text"))
+
+    def test_item_subtitles_and_apply_to_all_waiting(self):
+        a, b = add(U("subA")), add(U("subB"))
+        b.overrides["name"] = "%(title)s [Up to 720p]"
+        dialog = mod.ItemDialog(app, a)
+        self.addCleanup(lambda: dialog.winfo_exists() and dialog.destroy())
+        dialog.subs_choice.set("Yes")
+        dialog.accept(all_waiting=True)
+        self.assertIs(a.overrides["subs"], True)
+        self.assertIs(b.overrides["subs"], True, "copied to the waiting item")
+        self.assertEqual(b.overrides["name"], "%(title)s [Up to 720p]", "its own file name stays")
+        self.assertIn("subtitles", mod.overrides_summary(a.overrides))
+
+    def test_the_subtitle_choice_reaches_yt_dlp(self):
+        it = add(U("subC"))
+        it.overrides["subs"] = True
+        app.subs_var.set(False)
+        app.start_all()
+        self.assertTrue(wait(lambda: any("-o" in c for c in calls()), 15))
+        self.assertIn("--write-subs", [c for c in calls() if "-o" in c][0])
+
+
 class HistoryAndLog(GuiCase):
     def test_history_list_and_search(self):
         t = time.localtime()
