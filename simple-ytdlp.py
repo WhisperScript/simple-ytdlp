@@ -4,20 +4,20 @@
 # dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect", "pillow"]
 # ///
 """
-ytdl.py - cross-platform frontend for yt-dlp (macOS, Linux, Windows).
+simple-ytdlp.py - cross-platform frontend for yt-dlp (macOS, Linux, Windows).
 
 yt-dlp and deno (the JS engine YouTube needs) are downloaded into the user's data folder
 on first start and can be updated with one click. ffmpeg is bundled (imageio-ffmpeg)
 if no system ffmpeg is installed.
 
 Easiest way (only uv needed):
-    uv run ytdl.py
-    ./ytdl.py                      (macOS/Linux, after chmod +x)
+    uv run simple-ytdlp.py
+    ./simple-ytdlp.py                      (macOS/Linux, after chmod +x)
 
 Without uv, using an existing Python (then: pip install imageio-ffmpeg certifi sv-ttk darkdetect pillow):
-    python3 ytdl.py "https://youtube.com/watch?v=XXXX"
-    python3 ytdl.py -a urls.txt --mode mp3
-    python3 ytdl.py --gui
+    python3 simple-ytdlp.py "https://youtube.com/watch?v=XXXX"
+    python3 simple-ytdlp.py -a urls.txt --mode mp3
+    python3 simple-ytdlp.py --gui
 
 Ready-made programs (Windows/macOS/Linux): see the README, section "Ready-made programs".
 """
@@ -42,9 +42,10 @@ import zipfile
 from pathlib import Path
 
 __version__ = "dev"          # the release workflow replaces this with the git tag (v1.2 -> "1.2")
-REPO = "WhisperScript/ytdl"  # GitHub repo that hosts the releases (used for the update hint)
+REPO = "WhisperScript/simple-ytdlp"  # GitHub repo that hosts the releases (used for the update hint)
 
-APP_NAME = "ytdl"
+APP_NAME = "simple-ytdlp"
+LEGACY_APP_NAME = "ytdl"     # the app used to be called ytdl
 DEFAULT_OUT = Path.home() / "Downloads" / "yt-dlp"
 
 MODES = {
@@ -75,6 +76,17 @@ def data_dir() -> Path:
     else:
         base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     return base / APP_NAME
+
+
+def migrate_legacy_data() -> None:
+    """Carry settings, history and downloaded tools over from the folder of the old app name (ytdl)."""
+    new = data_dir()
+    old = new.with_name(LEGACY_APP_NAME)
+    try:
+        if old.is_dir() and not new.exists():
+            old.rename(new)
+    except OSError:
+        pass                                   # the old folder simply stays unused
 
 
 BIN_DIR = data_dir() / "bin"
@@ -215,14 +227,14 @@ def _version_tuple(v: str) -> tuple[int, ...]:
 def _release_asset_name() -> str | None:
     """Name of this platform's file in a release (None = no self-update for this platform)."""
     if os.name == "nt":
-        return "ytdl-windows.zip"
+        return "simple-ytdlp-windows.zip"
     if sys.platform == "darwin":
-        return "ytdl-macos.zip" if _machine() == "arm64" else "ytdl-macos-intel.zip"
-    return "ytdl-linux.tar.gz"
+        return "simple-ytdlp-macos.zip" if _machine() == "arm64" else "simple-ytdlp-macos-intel.zip"
+    return "simple-ytdlp-linux.tar.gz"
 
 
 def check_app_update() -> dict | None:
-    """Info about a newer ytdl release, or None.
+    """Info about a newer simple-ytdlp release, or None.
 
     Returns {"version", "page", "asset_url", "asset_name", "digest"}; asset_url is None when
     the release has no file for this platform. Silent on any failure (offline, private repo,
@@ -252,7 +264,7 @@ def check_app_update() -> dict | None:
 
 
 def can_self_update() -> bool:
-    """Self-update only makes sense for the packaged program, not for `uv run ytdl.py`."""
+    """Self-update only makes sense for the packaged program, not for `uv run simple-ytdlp.py`."""
     return bool(getattr(sys, "frozen", False)) and _release_asset_name() is not None
 
 
@@ -294,7 +306,7 @@ def install_app_update(update: dict, log=print, *, exe: Path | None = None, star
     work.mkdir(parents=True, exist_ok=True)
     archive = work / update["asset_name"]
     try:
-        log(f"Downloading ytdl v{update['version']} ...")
+        log(f"Downloading simple-ytdlp v{update['version']} ...")
         _fetch(update["asset_url"], archive, log)
         digest = update.get("digest", "")
         if digest.startswith("sha256:"):
@@ -305,17 +317,17 @@ def install_app_update(update: dict, log=print, *, exe: Path | None = None, star
 
         if os.name == "nt":
             with zipfile.ZipFile(archive) as zf:
-                zf.extract("ytdl.exe", work)
-            new, target = work / "ytdl.exe", exe
+                zf.extract("simple-ytdlp.exe", work)
+            new, target = work / "simple-ytdlp.exe", exe
             launch = [str(target)]
         elif sys.platform == "darwin":
             subprocess.run(["ditto", "-x", "-k", str(archive), str(work)], check=True)   # keeps permissions
-            new, target = work / "ytdl.app", exe.parents[2]                              # .../ytdl.app
+            new, target = work / "simple-ytdlp.app", exe.parents[2]                      # .../simple-ytdlp.app
             launch = ["open", "-n", str(target)]
         else:
             import tarfile
-            new = work / "ytdl"
-            with tarfile.open(archive) as tf, tf.extractfile("ytdl") as src, new.open("wb") as dst:
+            new = work / "simple-ytdlp"
+            with tarfile.open(archive) as tf, tf.extractfile("simple-ytdlp") as src, new.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
             new.chmod(0o755)
             target = exe
@@ -1113,15 +1125,19 @@ class App:
         self.placeholder = "Paste a video or playlist link and press Enter"
         self.placeholder_on = False
 
-        default = system_theme()
-        self.theme = (self.cfg.get("theme") or default) if sv_ttk is not None else "light"
+        self.theme_mode = tk.StringVar(value=self.cfg.get("theme") or "system")    # system | light | dark
+        if self.theme_mode.get() not in ("system", "light", "dark"):
+            self.theme_mode.set("system")
+        self.theme = self._resolve_theme() if sv_ttk is not None else "light"
 
-        root.title("ytdl" + ("" if __version__ == "dev" else f"  v{__version__}"))
-        root.geometry("920x780")
+        root.title(APP_NAME + ("" if __version__ == "dev" else f"  v{__version__}"))
+        size = str(self.cfg.get("size", ""))
+        root.geometry(size if re.fullmatch(r"\d{3,4}x\d{3,4}", size) else "920x780")
         root.minsize(780, 580)
 
         self._fonts()
         self._build()
+        self._build_menu()
         self.apply_theme(self.theme)
         self.sync_mode_options()
         self.refresh_history()
@@ -1129,7 +1145,8 @@ class App:
 
         root.bind("<FocusIn>", self._on_focus)
         root.bind("<<Paste>>", self._on_global_paste)
-        self.log(("ytdl " + ("(dev)" if __version__ == "dev" else f"v{__version__}"))
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.log((APP_NAME + " " + ("(dev)" if __version__ == "dev" else f"v{__version__}"))
                  + f" ready. Output folder: {self.out_var.get()}")
         if find_ffmpeg()[1] == "none":
             self.log("Note: " + ffmpeg_hint())
@@ -1138,6 +1155,13 @@ class App:
 
         self._startup_tools()
         threading.Thread(target=self._check_app_update, daemon=True).start()
+
+    def ui(self, fn) -> None:
+        """Run fn on the Tk thread (called from worker threads; silent once the window is gone)."""
+        try:
+            self.root.after(0, fn)
+        except (RuntimeError, tk.TclError):
+            pass
 
     # ------------------------------------------------------------ styling
 
@@ -1168,9 +1192,18 @@ class App:
                 it.card.refresh()
         self._history_tags()
 
+    def _resolve_theme(self) -> str:
+        mode = self.theme_mode.get()
+        return system_theme() if mode == "system" else mode
+
+    def set_theme_mode(self) -> None:
+        """Apply the mode chosen in the View menu (system follows the operating system)."""
+        self.apply_theme(self._resolve_theme())
+        save_settings({"theme": self.theme_mode.get()})
+
     def toggle_theme(self) -> None:
-        self.apply_theme("light" if self.theme == "dark" else "dark")
-        save_settings({"theme": self.theme})
+        self.theme_mode.set("light" if self.theme == "dark" else "dark")
+        self.set_theme_mode()
 
     # ------------------------------------------------------------ layout
 
@@ -1188,7 +1221,7 @@ class App:
         # header
         head = ttk.Frame(main)
         head.grid(row=0, column=0, sticky="ew")
-        ttk.Label(head, text="ytdl", style="Big.TLabel").pack(side="left")
+        ttk.Label(head, text=APP_NAME, style="Big.TLabel").pack(side="left")
         ttk.Label(head, text="  yt-dlp made comfortable", style="Muted.TLabel").pack(side="left", pady=(8, 0))
         if sv_ttk is not None:
             ttk.Button(head, text="☀ / ☾", width=6, command=self.toggle_theme).pack(side="right")
@@ -1408,6 +1441,9 @@ class App:
 
     def _toggle_options(self) -> None:
         self.opts_open.set(not self.opts_open.get())
+        self._options_changed()
+
+    def _options_changed(self) -> None:
         self._apply_options_visibility()
         save_settings({"options_open": self.opts_open.get()})
 
@@ -1455,7 +1491,7 @@ class App:
                 self.log_box.delete("1.0", "500.0")
             self.log_box.see("end")
             self.log_box.configure(state="disabled")
-        self.root.after(0, _append)
+        self.ui(_append)
 
     def save_options(self) -> None:
         save_settings({"mode": self.mode_key(), "out": self.out_var.get(), "cookies": self.cookies(),
@@ -1464,7 +1500,7 @@ class App:
                        "single": self.single_var.get(), "also_audio": self.also_var.get(),
                        "sponsorblock": self.sponsor_var.get(), "autostart": self.auto_var.get(),
                        "limit": self.limit_var.get().strip(), "parallel": self.parallel(),
-                       "theme": self.theme})
+                       "theme": self.theme_mode.get()})
 
     def cookies(self) -> str:
         value = self.cookie_var.get()
@@ -1577,7 +1613,7 @@ class App:
             else:
                 info = fetch_info(item.url, no_playlist=no_playlist, cookies_browser=cookies)
             thumb = fetch_thumbnail(info["thumbnail"]) if info and not info["is_playlist"] else None
-        self.root.after(0, lambda: self._info_done(item, info, thumb))
+        self.ui(lambda: self._info_done(item, info, thumb))
 
     def _info_done(self, item: Item, info: dict | None, thumb) -> None:
         if item.removed:
@@ -1620,7 +1656,7 @@ class App:
                 if not item.removed and item.card:
                     item.thumb = img
                     item.card.set_thumb()
-            self.root.after(0, apply)
+            self.ui(apply)
 
     def _pick_playlist(self, info: dict) -> list[dict] | None:
         if len(info["entries"]) == 1:
@@ -1703,7 +1739,7 @@ class App:
         if ok or bad:
             summary = f"{ok} succeeded" + (f", {bad} failed" if bad else "")
             self.log("Done. " + summary)
-            notify("ytdl", "Done: " + summary, self.root)
+            notify(APP_NAME, "Done: " + summary, self.root)
 
     def snapshot(self) -> dict:
         return {"mode": self.mode_key(), "out": Path(self.out_var.get() or DEFAULT_OUT).expanduser(),
@@ -1741,12 +1777,12 @@ class App:
                 now = time.monotonic()
                 if now - state["last"] > 0.15 or prog["pct"] >= 100:
                     state["last"] = now
-                    self.root.after(0, refresh_card)
+                    self.ui(refresh_card)
                 return
             track_output_file(found, line, audio)
             if item.title == item.url and DEST_RE.match(line.strip()):
                 item.title = INTERMEDIATE_RE.sub("", Path(DEST_RE.match(line.strip()).group("path")).name)
-                self.root.after(0, refresh_card)
+                self.ui(refresh_card)
             if ARCHIVED_RE.search(line):
                 state["skipped"] = True
             if line.startswith("ERROR"):
@@ -1766,7 +1802,7 @@ class App:
             item.error = str(e)
             self.log(f"ERROR: {e}")
         path = output_file(found)
-        self.root.after(0, lambda: self._download_done(item, rc, path, state["skipped"]))
+        self.ui(lambda: self._download_done(item, rc, path, state["skipped"]))
 
     def _download_done(self, item: Item, rc: int, path: str, skipped: bool) -> None:
         if item.removed:
@@ -1876,6 +1912,141 @@ class App:
             save_history(self.history)
             self.refresh_history()
 
+    # ------------------------------------------------------------ menu bar, quitting
+
+    def _build_menu(self) -> None:
+        """Native menu bar: at the top of the screen on macOS, inside the window on Windows/Linux."""
+        root, mac = self.root, sys.platform == "darwin"
+        mod = "Command" if mac else "Control"
+        acc = (lambda key: f"⌘{key}") if mac else (lambda key: f"Ctrl+{key}")
+        bar = tk.Menu(root, tearoff=0)
+        self.menubar = bar
+
+        if mac:                                # the application menu ("simple-ytdlp") must come first
+            app_menu = tk.Menu(bar, name="apple", tearoff=0)
+            app_menu.add_command(label=f"About {APP_NAME}", command=self.show_about)
+            bar.add_cascade(menu=app_menu)
+            root.createcommand("tk::mac::ShowPreferences", self._toggle_options)
+            root.createcommand("tk::mac::Quit", self.on_close)
+
+        file_menu = tk.Menu(bar, tearoff=0)
+        file_menu.add_command(label="Paste links", accelerator=acc("V"), command=self._on_global_paste_menu)
+        file_menu.add_command(label="Import list …", accelerator=acc("O"), command=self.on_import)
+        file_menu.add_separator()
+        file_menu.add_command(label="Open download folder", accelerator=acc("Shift+O") if not mac else "⇧⌘O",
+                              command=self.open_out_folder)
+        if not mac:
+            file_menu.add_separator()
+            file_menu.add_command(label="Quit", accelerator="Ctrl+Q", command=self.on_close)
+        bar.add_cascade(label="File", menu=file_menu)
+
+        queue_menu = tk.Menu(bar, tearoff=0)
+        queue_menu.add_command(label="Download all", accelerator=acc("Return") if not mac else "⌘↩",
+                               command=self.start_all)
+        queue_menu.add_command(label="Stop", accelerator=acc("."), command=self.stop_all)
+        queue_menu.add_command(label="Retry failed", command=self.retry_failed)
+        queue_menu.add_separator()
+        queue_menu.add_command(label="Clear finished", command=self.clear_finished)
+        bar.add_cascade(label="Queue", menu=queue_menu)
+
+        view_menu = tk.Menu(bar, tearoff=0)
+        for label, value in (("Follow system theme", "system"), ("Light theme", "light"), ("Dark theme", "dark")):
+            view_menu.add_radiobutton(label=label, value=value, variable=self.theme_mode,
+                                      command=self.set_theme_mode, state="normal" if sv_ttk else "disabled")
+        view_menu.add_separator()
+        view_menu.add_checkbutton(label="Show options", variable=self.opts_open, accelerator=acc(","),
+                                  command=self._options_changed)
+        for i, name in enumerate(("Queue", "History", "Log")):
+            view_menu.add_command(label=f"Show {name}", accelerator=acc(str(i + 1)),
+                                  command=lambda i=i: self.tabs.select(i))
+        bar.add_cascade(label="View", menu=view_menu)
+
+        tools_menu = tk.Menu(bar, tearoff=0)
+        tools_menu.add_command(label="Update yt-dlp", command=self.on_update_ytdlp)
+        tools_menu.add_command(label=f"Check for {APP_NAME} updates …", command=self.check_app_update_manually)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Open settings folder", command=lambda: open_folder(data_dir()))
+        bar.add_cascade(label="Tools", menu=tools_menu)
+
+        help_menu = tk.Menu(bar, name="help", tearoff=0)
+        help_menu.add_command(label="Project page", command=lambda: webbrowser.open(f"https://github.com/{REPO}"))
+        help_menu.add_command(label="Report a problem",
+                              command=lambda: webbrowser.open(f"https://github.com/{REPO}/issues"))
+        if not mac:
+            help_menu.add_separator()
+            help_menu.add_command(label=f"About {APP_NAME}", command=self.show_about)
+        bar.add_cascade(label="Help", menu=help_menu)
+        root.configure(menu=bar)
+
+        def bind(seq: str, fn) -> None:
+            root.bind_all(f"<{mod}-{seq}>", lambda e: (fn(), "break")[1])
+
+        bind("o", self.on_import)
+        bind("O", self.open_out_folder)
+        bind("Return", self.start_all)
+        bind("period", self.stop_all)
+        for i in range(3):
+            bind(f"Key-{i + 1}", lambda i=i: self.tabs.select(i))
+        if not mac:                            # on macOS the application menu already provides these
+            bind("comma", self._toggle_options)
+            bind("q", self.on_close)
+
+    def _on_global_paste_menu(self) -> None:
+        urls = extract_urls(self._clipboard())
+        if urls:
+            self.add_urls(urls)
+        else:
+            messagebox.showinfo("Paste links", "There is no link in the clipboard.")
+
+    def open_out_folder(self) -> None:
+        open_folder(Path(self.out_var.get() or DEFAULT_OUT))
+
+    def retry_failed(self) -> None:
+        failed = [it for it in self.items if it.status == "failed"]
+        for it in failed:
+            it.stop = threading.Event()
+            it.status, it.pct, it.error = "queued", 0.0, ""
+            it.speed = it.eta = it.size = ""
+            it.card.refresh()
+        if failed:
+            self.start_all()
+
+    def show_about(self) -> None:
+        try:
+            base = find_ytdlp()
+            ytdlp = subprocess.run(base + ["--version"], capture_output=True, text=True, timeout=10,
+                                   **_no_window()).stdout.strip() if base else "not installed yet"
+        except Exception:
+            ytdlp = "unknown"
+        ffmpeg, source = find_ffmpeg()
+        js = find_js_runtime()
+        messagebox.showinfo(
+            f"About {APP_NAME}",
+            f"{APP_NAME} {'(dev)' if __version__ == 'dev' else 'v' + __version__}\n"
+            "A friendly graphical front end for yt-dlp.\n\n"
+            f"yt-dlp: {ytdlp}\n"
+            f"ffmpeg: {source}\n"
+            f"JS engine: {js[1].split(':')[0] if js else 'none'}\n"
+            f"Settings: {data_dir()}\n\n"
+            f"https://github.com/{REPO}")
+
+    def on_close(self) -> None:
+        """Quit: ask first while downloads run, and stop their yt-dlp/ffmpeg processes."""
+        running = [it for it in self.items if it.status == "downloading"]
+        if running and not messagebox.askyesno(
+                "Quit", f"{len(running)} download(s) are still running. Quit and cancel them?\n"
+                        "(Partial files are kept - downloading the link again resumes them.)"):
+            return
+        self.running = False
+        for it in running:
+            it.stop.set()                      # the watcher threads kill the process trees
+        try:
+            save_settings({"size": f"{self.root.winfo_width()}x{self.root.winfo_height()}"})
+        except tk.TclError:
+            pass
+        self.root.withdraw()
+        self.root.after(800 if running else 0, self.root.destroy)
+
     # ------------------------------------------------------------ tools & updates
 
     def set_tools_busy(self, busy: bool, text: str = "") -> None:
@@ -1905,11 +2076,14 @@ class App:
                 if ok:
                     save_settings({"last_update": time.time()})
             finally:
-                self.root.after(0, lambda: self.set_tools_busy(False))
+                self.ui(lambda: self.set_tools_busy(False))
 
         threading.Thread(target=work, daemon=True).start()
 
     def on_update_ytdlp(self) -> None:
+        if self.tools_busy or any(it.status == "downloading" for it in self.items):
+            messagebox.showinfo("Update yt-dlp", "Please wait until the current downloads have finished.")
+            return
         self.set_tools_busy(True, "Updating yt-dlp …")
 
         def work():
@@ -1919,17 +2093,28 @@ class App:
                 if find_js_runtime() is None:
                     install_deno(self.log)
             finally:
-                self.root.after(0, lambda: self.set_tools_busy(False))
+                self.ui(lambda: self.set_tools_busy(False))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _check_app_update(self) -> None:       # newer ytdl release on GitHub? (silent if not)
+    def _check_app_update(self) -> None:       # newer release on GitHub? (silent if not)
         found = check_app_update()
         if found:
-            self.root.after(0, lambda: self.show_app_update(found))
+            self.ui(lambda: self.show_app_update(found))
+
+    def check_app_update_manually(self) -> None:
+        def work():
+            found = check_app_update()
+            if found:
+                self.ui(lambda: (self.show_app_update(found), self.tabs.select(0)))
+            else:
+                self.ui(lambda: messagebox.showinfo(
+                    "Updates", f"{APP_NAME} is up to date." if __version__ != "dev"
+                    else "This is a development version - the update check is disabled."))
+        threading.Thread(target=work, daemon=True).start()
 
     def show_app_update(self, update: dict) -> None:
-        self.news_label.configure(text=f"A new version of ytdl is available: v{update['version']}")
+        self.news_label.configure(text=f"A new version of simple-ytdlp is available: v{update['version']}")
         self.news_page_btn.configure(command=lambda: webbrowser.open(update["page"]))
         if can_self_update() and update["asset_url"]:
             self.news_now_btn.configure(command=lambda: self.run_self_update(update))
@@ -1944,7 +2129,7 @@ class App:
                                           "(or cancel them), then click 'Update now' again.")
             return
         self.news_now_btn.configure(state="disabled")
-        self.set_tools_busy(True, "Updating ytdl …")
+        self.set_tools_busy(True, f"Updating {APP_NAME} …")
 
         def work():
             done = install_app_update(update, self.log)
@@ -1959,7 +2144,7 @@ class App:
                     "Update failed",
                     "The automatic update did not work (see the log).\n"
                     "Use 'Release page' to download the new version manually.")
-            self.root.after(0, finish)
+            self.ui(finish)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1987,14 +2172,15 @@ def run_gui() -> int:
 # ---------------------------------------------------------------- CLI
 
 def main(argv: list[str] | None = None) -> int:
+    migrate_legacy_data()
     p = argparse.ArgumentParser(
         prog=APP_NAME,
         description="Cross-platform yt-dlp wrapper (CLI + GUI).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  python3 ytdl.py URL1 URL2\n"
-               "  python3 ytdl.py -a urls.txt -m mp3 -o ~/Music\n"
-               "  python3 ytdl.py --gui\n",
+               "  python3 simple-ytdlp.py URL1 URL2\n"
+               "  python3 simple-ytdlp.py -a urls.txt -m mp3 -o ~/Music\n"
+               "  python3 simple-ytdlp.py --gui\n",
     )
     p.add_argument("urls", nargs="*", help="One or more URLs")
     p.add_argument("-a", "--batch-file", help="Text file with one URL per line (# = comment)")
