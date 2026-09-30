@@ -45,7 +45,7 @@ jobs:
         run: python -m pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect
 
       - name: Build (Windows/Linux - single file)
-        if: !startsWith(matrix.name, 'macos')
+        if: ${{ !startsWith(matrix.name, 'macos') }}
         run: pyinstaller --onefile --windowed --name ytdl --collect-all imageio_ffmpeg --collect-all sv_ttk ytdl.py
 
       - name: Build (macOS - .app bundle)
