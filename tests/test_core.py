@@ -1,9 +1,11 @@
 """Tests for the non-GUI core of simple-ytdlp (run: python -m unittest discover -s tests)."""
 import importlib.util
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("simple_ytdlp", ROOT / "simple-ytdlp.py")
@@ -226,5 +228,189 @@ class Storage(unittest.TestCase):
         app.migrate_legacy_data()              # a second run changes nothing
 
 
+class DisplayHelpers(unittest.TestCase):
+    def test_fit_text_cuts_with_an_ellipsis_at_the_right_place(self):
+        measure = lambda t: len(t) * 10                       # 10 px per character
+        self.assertEqual(app.fit_text(measure, "hello", 50), "hello")
+        self.assertEqual(app.fit_text(measure, "hello world", 60), "hello…")
+        self.assertEqual(app.fit_text(measure, "hello world", 5), "")
+        self.assertEqual(app.fit_text(measure, "  spaced   out  ", 1000), "spaced out")
+        self.assertEqual(app.fit_text(measure, "anything", 0), "")
+
+    def test_fit_text_never_exceeds_the_limit(self):
+        measure = lambda t: sum(14 if ord(c) > 255 else 7 for c in t)        # wide characters like CJK
+        for text in ("x" * 40, "日本語のとても長いタイトル" * 3, "mixed 日本語 title"):
+            for limit in range(0, 200, 9):
+                self.assertLessEqual(measure(app.fit_text(measure, text, limit)), limit)
+
+    def test_tilde_path(self):
+        home = Path.home()
+        self.assertEqual(app.tilde_path(home), "~")
+        self.assertTrue(app.tilde_path(home / "Downloads" / "yt-dlp").startswith("~"))
+        long = app.tilde_path(home / ("very-long-folder-name-" * 6) / "end", limit=40)
+        self.assertLessEqual(len(long), 40)
+        self.assertIn("…", long)
+        self.assertTrue(long.endswith("end"))
+
+    def test_humanize_when(self):
+        import time
+        now = time.mktime((2026, 9, 30, 15, 0, 0, 0, 0, -1))
+        at = lambda d, h=9, m=5: time.mktime((2026, 9, d, h, m, 0, 0, 0, -1))
+        self.assertEqual(app.humanize_when(at(30), now), "Today 09:05")
+        self.assertEqual(app.humanize_when(at(29, 23, 59), now), "Yesterday 23:59")
+        self.assertRegex(app.humanize_when(at(27), now), r"^[A-Z][a-z]{2} 09:05$")      # this week: weekday
+        self.assertEqual(app.humanize_when(at(10), now), "2026-09-10")
+
+    def test_speed(self):
+        self.assertEqual(app.parse_speed("3.20MiB/s"), 3.2 * 1024 ** 2)
+        self.assertEqual(app.parse_speed("512KiB/s"), 512 * 1024)
+        self.assertEqual(app.parse_speed("Unknown"), 0.0)
+        self.assertEqual(app.parse_speed(""), 0.0)
+        self.assertEqual(app.fmt_rate(2.5 * 1024 ** 2), "2.5 MiB/s")
+
+    def test_quality_labels(self):
+        self.assertEqual(app.quality_label("video1080"), "Up to 1080p")
+        self.assertEqual(app.mode_label("mp3"), "Audio · MP3")
+        self.assertEqual(app.mode_label("video"), "Video · Best quality")
+        self.assertEqual(app.mode_label("nonsense"), "")
+        self.assertEqual(set(app.UI_QUALITY), set(app.MODES))                              # every mode has a short label
+        self.assertEqual(len(set(app.UI_QUALITY.values())), len(app.UI_QUALITY))           # and they are unique
+
+
+class Resume(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def part(self, name, size, byte=b"x"):
+        (self.dir / (name + ".part")).write_bytes(byte * size)
+        return str(self.dir / name)
+
+    def test_partial_size_counts_only_unfinished_files(self):
+        a = self.part("a.f137.mp4", 1000)
+        b = self.part("b.webm", 500)
+        done = self.dir / "done.mp4"
+        done.write_bytes(b"x" * 9999)                                  # a complete file has no .part
+        self.assertEqual(app.partial_size([a, b, str(done)]), 1500)
+        self.assertEqual(app.partial_size([]), 0)
+        self.assertEqual(app.partial_size(None), 0)
+
+    def test_trim_cuts_the_tail_after_an_unclean_stop(self):
+        dest = self.part("clip.mp4", 3000)
+        self.assertEqual(app.trim_partial_tail([dest], margin=1000), 1000)
+        self.assertEqual((self.dir / "clip.mp4.part").stat().st_size, 2000)
+
+    def test_trim_never_goes_below_zero(self):
+        dest = self.part("small.mp4", 300)
+        self.assertEqual(app.trim_partial_tail([dest], margin=1000), 300)
+        self.assertEqual((self.dir / "small.mp4.part").stat().st_size, 0)
+
+    def test_trim_leaves_fragment_downloads_alone(self):
+        dest = self.part("stream.mp4", 3000)
+        (self.dir / "stream.mp4.ytdl").write_text("{}")                # yt-dlp tracks fragments in this file
+        self.assertEqual(app.trim_partial_tail([dest], margin=1000), 0)
+        self.assertEqual((self.dir / "stream.mp4.part").stat().st_size, 3000)
+
+    def test_trim_handles_missing_files(self):
+        self.assertEqual(app.trim_partial_tail([str(self.dir / "nope.mp4")]), 0)
+
+    def test_discard_removes_partial_and_state_files(self):
+        dest = self.part("x.mp4", 700)
+        (self.dir / "x.mp4.ytdl").write_text("12345")
+        self.assertEqual(app.discard_partial([dest]), 705)
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_transient_errors_get_a_retry_real_ones_do_not(self):
+        yes = ["ERROR: [download] Got error: Downloaded 2621440 bytes, expected 31083202 bytes. Giving up after 3 retries",
+               "urlopen error [Errno -3] Temporary failure in name resolution", "HTTP Error 503: Service Unavailable",
+               "('Connection aborted.', ConnectionResetError(104, 'Connection reset by peer'))",
+               "The read operation timed out", "IncompleteRead(1024 bytes read, 2048 more expected)"]
+        no = ["Unable to download webpage: HTTP Error 404: Not Found", "Private video", "HTTP Error 403: Forbidden",
+              "Sign in to confirm your age", "Unsupported URL: https://example.com", ""]
+        for text in yes:
+            self.assertTrue(app.is_transient_error(text), text)
+        for text in no:
+            self.assertFalse(app.is_transient_error(text), text)
+
+    def test_retry_delays_grow(self):
+        self.assertEqual(list(app.AUTO_RETRY_DELAYS), sorted(app.AUTO_RETRY_DELAYS))
+        self.assertGreaterEqual(len(app.AUTO_RETRY_DELAYS), 3)
+
+    def test_update_hint_and_dropping_connection_messages(self):
+        self.assertTrue(app.suggests_update("ERROR: Unable to extract uploader id; please report this issue"))
+        self.assertTrue(app.suggests_update("nsig extraction failed: Some formats may be missing"))
+        self.assertFalse(app.suggests_update("Private video"))
+        self.assertIn("update it", app.friendly_error("ERROR: Unable to extract player response"))
+        self.assertIn("keeps dropping", app.friendly_error("Got error: Downloaded 2621440 bytes, expected 31083202 bytes. Giving up after 3 retries"))
+
+    def test_resume_line_is_recognised(self):
+        m = app.RESUME_RE.search("[download] Resuming download at byte 10008260")
+        self.assertEqual(int(m.group("n")), 10008260)
+
+
+class QueueStorageV2(unittest.TestCase):
+    def test_overrides_summary_includes_paused_fields_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app.QUEUE_FILE = Path(tmp) / "queue.json"
+            entry = {"url": "https://a.b", "status": "paused", "pct": 32.0, "dests": ["/o/x.mp4"], "interrupted": True}
+            app.save_queue([entry])
+            self.assertEqual(app.load_queue()[0], entry)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class QueueSummary(unittest.TestCase):
+    COUNTS = {"downloading": 2, "paused": 1, "queued": 4, "fetching": 1, "done": 3, "skipped": 1, "failed": 2}
+
+    def test_most_detailed_text_comes_first_and_shrinks_step_by_step(self):
+        options = app.summary_options(self.COUNTS, 11_744_051)
+        self.assertEqual(options[0], "2 downloading · 11.2 MiB/s  ·  1 paused  ·  5 waiting  ·  4 done  ·  2 failed")
+        self.assertEqual(options[1], "2 downloading  ·  1 paused  ·  5 waiting  ·  4 done  ·  2 failed")
+        self.assertEqual(options[2], "2 active · 1 paused · 5 queued · 4 done · 2 failed")
+        self.assertEqual(options[3], "2 active · 1 paused · 5 queued · 2 failed")
+        self.assertEqual([len(o) for o in options], sorted((len(o) for o in options), reverse=True))
+
+    def test_failures_survive_every_step(self):
+        self.assertTrue(all(o.endswith("2 failed") for o in app.summary_options(self.COUNTS, 1)))
+
+    def test_no_repeats_and_empty_queue(self):
+        self.assertEqual(app.summary_options({"failed": 1}), ["1 failed"])
+        self.assertEqual(app.summary_options({}), [""])
+        self.assertEqual(len(set(app.summary_options({"done": 2}))), len(app.summary_options({"done": 2})))
+
+
+class LegacyData(unittest.TestCase):
+    """The app used to be called ytdl; its settings, history and tools move to the new folder once."""
+
+    def run_migration(self, prepare):
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        prepare(base)
+        with mock.patch.object(app, "data_dir", lambda: base / "simple-ytdlp"):
+            app.migrate_legacy_data()
+        return base
+
+    def test_old_folder_is_moved(self):
+        def prepare(base):
+            (base / "ytdl").mkdir()
+            (base / "ytdl" / "settings.json").write_text('{"mode": "mp3"}')
+        base = self.run_migration(prepare)
+        self.assertEqual(json.loads((base / "simple-ytdlp" / "settings.json").read_text()), {"mode": "mp3"})
+        self.assertFalse((base / "ytdl").exists())
+
+    def test_existing_new_folder_wins(self):
+        def prepare(base):
+            (base / "ytdl").mkdir()
+            (base / "ytdl" / "settings.json").write_text("old")
+            (base / "simple-ytdlp").mkdir()
+            (base / "simple-ytdlp" / "settings.json").write_text("new")
+        base = self.run_migration(prepare)
+        self.assertEqual((base / "simple-ytdlp" / "settings.json").read_text(), "new")
+        self.assertTrue((base / "ytdl" / "settings.json").exists())
+
+    def test_nothing_to_move(self):
+        base = self.run_migration(lambda base: None)
+        self.assertFalse((base / "simple-ytdlp").exists())

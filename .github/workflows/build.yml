@@ -74,13 +74,20 @@ jobs:
       - name: Dependencies
         run: python -m pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect pillow
 
-      - name: Build (Windows/Linux - single file)
-        if: ${{ !startsWith(matrix.name, 'macos') }}
+      - name: App icon (png, ico, icns)
+        run: python simple-ytdlp.py --make-icons build-assets
+
+      - name: Build (Windows - single file)
+        if: matrix.name == 'windows'
+        run: pyinstaller --onefile --windowed --name simple-ytdlp --icon build-assets/icon.ico --collect-all imageio_ffmpeg --collect-all sv_ttk simple-ytdlp.py
+
+      - name: Build (Linux - single file)
+        if: matrix.name == 'linux'
         run: pyinstaller --onefile --windowed --name simple-ytdlp --collect-all imageio_ffmpeg --collect-all sv_ttk simple-ytdlp.py
 
       - name: Build (macOS - .app bundle)
         if: startsWith(matrix.name, 'macos')
-        run: pyinstaller --windowed --name simple-ytdlp --collect-all imageio_ffmpeg --collect-all sv_ttk simple-ytdlp.py
+        run: pyinstaller --windowed --name simple-ytdlp --icon build-assets/icon.icns --collect-all imageio_ffmpeg --collect-all sv_ttk simple-ytdlp.py
 
       - name: Package (Windows)
         if: matrix.name == 'windows'
