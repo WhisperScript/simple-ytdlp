@@ -3,6 +3,7 @@ import importlib.util
 import json
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -360,6 +361,79 @@ class QueueStorageV2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseNotes(unittest.TestCase):
+    def test_markdown_becomes_plain_text_and_the_generated_part_is_cut(self):
+        body = "## simple-ytdlp 2.5\n\n- **Drag and drop:** drop a `link`\n- More\n\n\n## What's Changed\n* PR by @x"
+        self.assertEqual(app.release_notes_text(body), "simple-ytdlp 2.5\n\n\u2022 Drag and drop: drop a link\n\u2022 More")
+
+
+class DropsAndLive(unittest.TestCase):
+    def test_links_in_dropped_text(self):
+        self.assertEqual(app.links_from_drop("look https://a.b/c and\nhttps://d.e/f", str.split), ["https://a.b/c", "https://d.e/f"])
+
+    def test_links_in_dropped_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lst, shortcut = Path(tmp) / "list.txt", Path(tmp) / "x.url"
+            lst.write_text("# videos\nhttps://a.b/1\nhttps://a.b/2\n")
+            shortcut.write_text("[InternetShortcut]\nURL=https://c.d/3\n")
+            self.assertEqual(app.links_from_drop(f"{lst} {shortcut}", str.split),
+                             ["https://a.b/1", "https://a.b/2", "https://c.d/3"])
+            self.assertEqual(app.links_from_drop(str(Path(tmp) / "missing.txt"), str.split), [])
+
+    def test_live_streams_are_recognised(self):
+        self.assertTrue(app.parse_info({"title": "t", "is_live": True})["live"])
+        self.assertTrue(app.parse_info({"title": "t", "live_status": "is_upcoming"})["live"])
+        self.assertFalse(app.parse_info({"title": "t", "live_status": "not_live"})["live"])
+
+
+class TimeAndPower(unittest.TestCase):
+    def test_clock_times(self):
+        now = time.mktime((2026, 9, 30, 12, 0, 0, 0, 0, -1))
+        self.assertEqual(time.localtime(app.parse_clock_time("14:30", now))[2:5], (30, 14, 30))
+        later = app.parse_clock_time("02:30", now)
+        self.assertEqual(time.localtime(later)[2:5], (1, 2, 30), "already past today: tomorrow")
+        self.assertEqual(app.parse_clock_time(" 9.05 ", now), app.parse_clock_time("9:05", now))
+        for bad in ("", "25:00", "12:60", "noon", "1230"):
+            self.assertIsNone(app.parse_clock_time(bad, now))
+
+    def test_power_commands(self):
+        self.assertIsNone(app.power_command("hibernate"))
+        self.assertTrue(app.power_command("sleep") and app.power_command("shutdown"))
+
+    def test_free_space_of_a_folder_that_does_not_exist_yet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertGreater(app.free_space(Path(tmp) / "a" / "b"), 0)
+
+    def test_full_disk_error_is_explained(self):
+        self.assertIn("disk is full", app.friendly_error("OSError: [Errno 28] No space left on device"))
+
+
+class CompatAndCookies(unittest.TestCase):
+    def test_compat_prefers_mp4_h264_without_lowering_the_resolution(self):
+        a = app.build_args("video1080", Path("/o"), compat=True)
+        self.assertEqual(a[a.index("-S") + 1], "res,vcodec:h264,acodec:m4a")
+        self.assertEqual(a[a.index("--merge-output-format") + 1], "mp4")
+        self.assertEqual(a[a.index("-f") + 1], "bv*[height<=1080]+ba/b[height<=1080]/b")
+
+    def test_compat_leaves_audio_and_chosen_formats_alone(self):
+        self.assertNotIn("-S", app.build_args("mp3", Path("/o"), compat=True))
+        self.assertNotIn("-S", app.build_args("video", Path("/o"), compat=True, format_override="137+251"))
+        self.assertNotIn("-S", app.build_args("video", Path("/o")))
+
+    def test_cookie_sources(self):
+        self.assertEqual(app.cookie_args(""), [])
+        self.assertEqual(app.cookie_args("firefox"), ["--cookies-from-browser", "firefox"])
+        self.assertEqual(app.cookie_args("file:/c/cookies.txt"), ["--cookies", "/c/cookies.txt"])
+        a = app.build_args("video", Path("/o"), cookies_browser="file:/c/cookies.txt")
+        self.assertIn("--cookies", a)
+        self.assertNotIn("--cookies-from-browser", a)
+
+    def test_unreadable_browser_cookies_are_explained(self):
+        for err in ("ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271",
+                    "ERROR: Failed to decrypt with DPAPI"):
+            self.assertIn("cookies.txt", app.friendly_error(err))
 
 
 class FfmpegTools(unittest.TestCase):

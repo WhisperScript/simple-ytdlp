@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect", "pillow"]
+# dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect", "pillow", "tkinterdnd2"]
 # ///
 """
 simple-ytdlp.py - cross-platform frontend for yt-dlp (macOS, Linux, Windows).
@@ -292,7 +292,7 @@ def _release_asset_name() -> str | None:
 def check_app_update() -> dict | None:
     """Info about a newer simple-ytdlp release, or None.
 
-    Returns {"version", "page", "asset_url", "asset_name", "digest"}; asset_url is None when
+    Returns {"version", "page", "asset_url", "asset_name", "digest", "notes"}; asset_url is None when
     the release has no file for this platform. Silent on any failure (offline, private repo,
     rate limit) - it is only a hint.
     """
@@ -313,10 +313,21 @@ def check_app_update() -> dict | None:
         if url and not url.startswith(f"https://github.com/{REPO}/releases/download/"):
             url = None                          # only ever fetch from our own releases
         return {"version": latest.lstrip("v"), "asset_name": wanted, "asset_url": url,
+                "notes": str(data.get("body") or "")[:3000],
                 "digest": str(asset.get("digest") or "") if asset else "",
                 "page": str(data.get("html_url") or f"https://github.com/{REPO}/releases")}
     except Exception:
         return None
+
+
+def release_notes_text(body: str) -> str:
+    """A GitHub release description as plain text for a message box (markdown marks removed, the generated
+    'What's Changed' part cut off)."""
+    body = re.split(r"\n#+\s*What's Changed", body or "")[0]
+    text = re.sub(r"^#+\s*", "", body, flags=re.M)
+    text = re.sub(r"\*\*|`", "", text)
+    text = re.sub(r"^[ \t]*[-*][ \t]+", "\u2022 ", text, flags=re.M)
+    return text.strip()
 
 
 def can_self_update() -> bool:
@@ -489,7 +500,7 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
                archive=False, cookies_browser="", sort_by_uploader=False,
                no_playlist=False, also_audio="", limit_rate="", sponsorblock=False,
                sub_langs="en,de", format_override="", section="", exact_cut=False,
-               embed_chapters=False, split_chapters=False, proxy="", name_template="",
+               embed_chapters=False, split_chapters=False, proxy="", name_template="", compat=False,
                extra: list[str] | None = None) -> list[str]:
     out_dir = Path(out_dir).expanduser()
     name = name_template.strip() or "%(title)s"
@@ -515,6 +526,9 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
             args += ["-f", f"bv*[height<={h}]+ba/b[height<={h}]/b"]
         else:
             args += ["-f", "bv*+ba/b"]
+    if compat and mode not in AUDIO_MODES and not format_override:
+        # same resolution as before, but among equals H.264 + AAC (plays on phones, TVs, QuickTime) in an .mp4
+        args += ["-S", "res,vcodec:h264,acodec:m4a", "--merge-output-format", "mp4"]
     if mode in AUDIO_MODES:
         args += ["-x", "--audio-format", mode, "--audio-quality", "0"]
 
@@ -530,8 +544,7 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
         args += ["--embed-thumbnail"]
     if archive:
         args += ["--download-archive", str(out_dir / "archive.txt")]
-    if cookies_browser:
-        args += ["--cookies-from-browser", cookies_browser]
+    args += cookie_args(cookies_browser)
     if no_playlist:
         args += ["--no-playlist"]
     if limit_rate:
@@ -551,6 +564,15 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
     if extra:
         args += extra
     return args
+
+
+def cookie_args(spec: str) -> list[str]:
+    """yt-dlp arguments for a cookie source: a browser name, or 'file:<path>' for a cookies.txt file."""
+    if not spec:
+        return []
+    if spec.startswith("file:"):
+        return ["--cookies", spec[5:]]
+    return ["--cookies-from-browser", spec]
 
 
 def parse_clock(text: str) -> float | None:
@@ -592,6 +614,9 @@ UPDATE_RE = re.compile(r"unable to extract|nsig extraction failed|player respons
 
 FRIENDLY_ERRORS = [
     (UPDATE_RE.pattern, UPDATE_HINT),
+    (r"could not (?:copy|find|read).{0,40}cookie|failed to decrypt|dpapi|cookies? database|cookiejar",
+     "The browser's cookies cannot be read (Chrome locks them) - close the browser, pick Firefox or Edge, "
+     "or use a cookies.txt file (Settings > Login and network)"),
     (r"confirm your age|age-restricted|age restricted",
      "Age-restricted - pick your browser under Settings > Cookies from browser"),
     (r"private video|this video is private",
@@ -604,6 +629,8 @@ FRIENDLY_ERRORS = [
      "Not available in your country"),
     (r"video unavailable|has been removed|no longer available|does not exist",
      "Video unavailable (removed, private or blocked)"),
+    (r"no space left|not enough (?:disk )?space|disk full|errno 28",
+     "The disk is full - free some space, then Retry"),
     (r"unsupported url", "This link is not supported by yt-dlp"),
     (r"requested format is not available", "That format is not offered for this video - choose another"),
     (r"ffprobe.*(not found|not installed)", "ffprobe is missing - Tools > Get ffmpeg tools, then Retry"),
@@ -640,8 +667,7 @@ def fetch_formats(url: str, *, cookies_browser: str = "", timeout: int = 90) -> 
         return None
     cmd = base + ["--dump-single-json", "--no-warnings", "--skip-download", "--no-playlist"]
     cmd += find_js_runtime() or []
-    if cookies_browser:
-        cmd += ["--cookies-from-browser", cookies_browser]
+    cmd += cookie_args(cookies_browser)
     try:
         r = subprocess.run(cmd + ["--", url], capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=timeout, **_no_window())
@@ -886,7 +912,8 @@ def parse_info(data: dict) -> dict:
     if not thumb and data.get("thumbnails"):
         thumb = (data["thumbnails"][-1] or {}).get("url", "")
     info = {"title": data.get("title") or "", "uploader": data.get("uploader") or data.get("channel") or "",
-            "duration": data.get("duration"), "thumbnail": thumb, "is_playlist": False, "entries": []}
+            "duration": data.get("duration"), "thumbnail": thumb, "is_playlist": False, "entries": [],
+            "live": bool(data.get("is_live")) or data.get("live_status") in ("is_live", "is_upcoming")}
     if data.get("_type") == "playlist" or "entries" in data:
         info["is_playlist"] = True
         for e in data.get("entries") or []:
@@ -912,8 +939,7 @@ def fetch_info(url: str, *, no_playlist: bool = False, cookies_browser: str = ""
         return None
     cmd = base + ["--dump-single-json", "--flat-playlist", "--no-warnings", "--skip-download"]
     cmd += find_js_runtime() or []
-    if cookies_browser:
-        cmd += ["--cookies-from-browser", cookies_browser]
+    cmd += cookie_args(cookies_browser)
     if no_playlist:
         cmd += ["--no-playlist"]
     try:
@@ -1073,6 +1099,8 @@ def overrides_summary(o: dict) -> str:
         parts.append("split chapters")
     if o.get("extra"):
         parts.append("custom arguments")
+    if "subs" in o:
+        parts.append("subtitles" if o["subs"] else "no subtitles")
     if o.get("name"):
         parts.append("file named by quality")
     return "  ·  ".join(parts)
@@ -1104,6 +1132,24 @@ def read_url_file(path: str | Path) -> list[str]:
         line = raw.strip()
         if line and not line.startswith("#"):
             urls.append(line)
+    return urls
+
+
+def links_from_drop(data: str, splitlist) -> list[str]:
+    """The links in something dropped on the window: dragged text/links, or files (.txt lists, .url/.webloc
+    shortcuts) - splitlist turns Tk's file list into paths."""
+    urls = extract_urls(data or "")
+    if urls:
+        return urls
+    for part in splitlist(data or ""):
+        try:
+            path = Path(part)
+            if path.is_file() and path.stat().st_size < 2_000_000:
+                for u in extract_urls(path.read_text(encoding="utf-8", errors="ignore")):
+                    if u not in urls:
+                        urls.append(u)
+        except OSError:
+            continue
     return urls
 
 
@@ -1259,6 +1305,43 @@ def shorten(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
 
 
+LOW_DISK = 1 << 30                          # below this much free space the window warns
+MIN_DISK = 50 << 20                         # below this a download is not even started
+
+
+def free_space(path) -> int | None:
+    """Free bytes on the disk that holds path (or its nearest existing parent), None if unknown."""
+    p = Path(path).expanduser()
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
+def parse_clock_time(text: str, now: float | None = None) -> float | None:
+    """The next moment it is HH:MM (today, or tomorrow if that has passed) as a timestamp; None if not a time."""
+    m = re.fullmatch(r"\s*(\d{1,2})[:.](\d{2})\s*", text or "")
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    now = time.time() if now is None else now
+    t = time.localtime(now)
+    target = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, int(m.group(1)), int(m.group(2)), 0, 0, 0, -1))
+    return target if target > now else target + 86400
+
+
+def power_command(kind: str) -> list[str] | None:
+    """The command that puts the computer to sleep or shuts it down (kind: sleep | shutdown), None if unknown."""
+    if os.name == "nt":
+        return {"sleep": ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+                "shutdown": ["shutdown", "/s", "/t", "0"]}.get(kind)
+    if sys.platform == "darwin":
+        event = {"sleep": "sleep", "shutdown": "shut down"}.get(kind)
+        return ["osascript", "-e", f'tell application "System Events" to {event}'] if event else None
+    return {"sleep": ["systemctl", "suspend"], "shutdown": ["systemctl", "poweroff"]}.get(kind)
+
+
 # ---------------------------------------------------------------- GUI
 
 UPDATE_INTERVAL = 24 * 3600      # how often (seconds) to silently check for yt-dlp updates at startup
@@ -1302,7 +1385,7 @@ def looks_like_url(text: str) -> bool:
 try:
     import tkinter as tk
     import tkinter.font as tkfont
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import ttk, filedialog, messagebox, simpledialog
 except ImportError:                            # checked again in run_gui() with a helpful message
     tk = None
 
@@ -1473,6 +1556,7 @@ class Item:
         self.url = url
         self.vkey = url_key(url)               # the same video behind different links has the same key
         self.added_mode = ""                   # the format chosen when it was added
+        self.live = False                      # a live stream: it records until the stream ends
         self.title = url
         self.uploader = ""
         self.duration = None
@@ -1739,7 +1823,7 @@ class Row:
             if it.retry_at > time.time():
                 return (f"Connection problem - retrying in {max(int(it.retry_at - time.time()) + 1, 1)} s "
                         f"({it.retries}/{len(AUTO_RETRY_DELAYS)})")
-            return "Waiting"
+            return "Waiting - live stream, records until it ends" if it.live else "Waiting"
         if st == "paused":
             kept = partial_size(it.dests)
             return f"Paused at {it.pct:.0f}%" + (f"  ·  {fmt_size(kept)} kept" if kept else "")
@@ -1868,8 +1952,9 @@ class Row:
         else:
             C.itemconfigure(self.i_thumb, state="hidden")
         x0, y0, x1, y1 = self.geo["thumb"]
-        if it.duration:
-            text = fmt_duration(it.duration)
+        if it.duration or it.live:
+            text = "LIVE" if it.live else fmt_duration(it.duration)
+            C.itemconfigure(self.i_badge_bg, fill="#c62828" if it.live else "#000000")
             bw = self.app.font_badge.measure(text) + 10
             bh = self.app.line_h["badge"] + 2
             C.coords(self.i_badge_bg, x1 - 5 - bw, y1 - 5 - bh, x1 - 5, y1 - 5)
@@ -2222,8 +2307,12 @@ class ItemDialog(tk.Toplevel if tk else object):
         chap.grid(row=7, column=1, columnspan=3, sticky="w", pady=(10, 0))
         self.chap_var = tk.BooleanVar(value=o.get("chapters", app.chapters_var.get()))
         self.split_var = tk.BooleanVar(value=o.get("split", False))
+        self.subs_choice = tk.StringVar(value={True: "Yes", False: "No"}.get(o.get("subs"), "As in the settings"))
         ttk.Checkbutton(chap, text="Embed chapter markers", variable=self.chap_var).pack(side="left")
         ttk.Checkbutton(chap, text="One file per chapter", variable=self.split_var).pack(side="left", padx=14)
+        ttk.Label(chap, text="Subtitles").pack(side="left", padx=(14, 6))
+        ttk.Combobox(chap, textvariable=self.subs_choice, values=["As in the settings", "Yes", "No"],
+                     state="readonly", width=16).pack(side="left")
 
         ttk.Label(body, text="Extra arguments").grid(row=8, column=0, sticky="w", pady=4)
         self.extra_var = tk.StringVar(value=o.get("extra", ""))
@@ -2315,12 +2404,18 @@ class ItemDialog(tk.Toplevel if tk else object):
         result = {k: v for k, v in result.items() if v}
         if self.chap_var.get() != self.app.chapters_var.get():         # only a difference is an override
             result["chapters"] = self.chap_var.get()
+        if self.subs_choice.get() in ("Yes", "No"):
+            result["subs"] = self.subs_choice.get() == "Yes"
+        if "name" in self.item.overrides:                              # set by the program, not in this window
+            result["name"] = self.item.overrides["name"]
         self.item.overrides = result
         if all_waiting:
             for other in self.app.items:
                 if other is not self.item and other.status == "queued":
-                    other.overrides = dict(result)
-                    other.card.refresh()
+                    keep = {k: v for k, v in other.overrides.items() if k == "name"}
+                    other.overrides = {**result, **keep}
+                    self.app.view.touch(other)
+        self.app.view.touch(self.item)
         self.destroy()
 
 
@@ -2379,15 +2474,20 @@ class SettingsDialog(tk.Toplevel if tk else object):
 
         extras = section("Video and audio extras", 2)
         toggles(extras, (("Subtitles", app.subs_var), ("Embed thumbnail", app.thumb_var),
-                         ("Embed chapters", app.chapters_var), ("Remove sponsor segments", app.sponsor_var)))
-        field(extras, 2, "Subtitle languages", ttk.Entry(extras, textvariable=app.sub_langs_var, width=14),
+                         ("Embed chapters", app.chapters_var), ("Remove sponsor segments", app.sponsor_var),
+                         ("MP4 files that play everywhere", app.compat_var)))
+        field(extras, 3, "Subtitle languages", ttk.Entry(extras, textvariable=app.sub_langs_var, width=14),
               "e.g. en,de or all")
 
         net = section("Login and network", 3)
         field(net, 0, "Cookies from browser",
               ttk.Combobox(net, textvariable=app.cookie_var, values=[NO_BROWSER, *BROWSERS[1:]],
                            state="readonly", width=12), "for private or age-restricted videos")
-        field(net, 1, "Proxy", ttk.Entry(net, textvariable=app.proxy_var, width=30), "e.g. http://host:8080")
+        pick = ttk.Frame(net)
+        ttk.Entry(pick, textvariable=app.cookiefile_var, width=24).pack(side="left")
+        ttk.Button(pick, text="Browse …", command=app.pick_cookie_file).pack(side="left", padx=(6, 0))
+        field(net, 1, "Cookies file", pick, "cookies.txt - if the browser's cookies cannot be read")
+        field(net, 2, "Proxy", ttk.Entry(net, textvariable=app.proxy_var, width=30), "e.g. http://host:8080")
 
         adv = section("Advanced", 4)
         field(adv, 0, "File name", ttk.Entry(adv, textvariable=app.name_var, width=30), "default: %(title)s")
@@ -2444,7 +2544,7 @@ class AboutDialog(tk.Toplevel if tk else object):
             row=3, column=0, columnspan=2, sticky="w", pady=(16, 0))
         row = ttk.Frame(body)
         row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(18, 0))
-        ttk.Button(row, text="Copy info", command=self.copy_info).pack(side="left")
+        ttk.Button(row, text="Copy diagnostics", command=self.copy_info).pack(side="left")
         ttk.Button(row, text="Project page",
                    command=lambda: webbrowser.open(f"https://github.com/{REPO}")).pack(side="left", padx=8)
         ttk.Button(row, text="Close", command=self.destroy).pack(side="right")
@@ -2471,15 +2571,16 @@ class AboutDialog(tk.Toplevel if tk else object):
         self.app.ui(lambda: self.winfo_exists() and self.info_var.set(text))
 
     def copy_info(self) -> None:
+        tail = "\n".join(list(self.app.log_lines)[-40:])
         self.app.root.clipboard_clear()
-        self.app.root.clipboard_append(self.info_var.get())
-        self.app.toast("Copied to the clipboard")
+        self.app.root.clipboard_append(self.info_var.get() + ("\n\nLog (last lines):\n" + tail if tail else ""))
+        self.app.toast("Copied to the clipboard - paste it into your bug report")
 
 
 class App:
     """The main window: link input, download queue, history and log."""
 
-    NOTICE_ORDER = ("setup-error", "setup", "restore", "update")
+    NOTICE_ORDER = ("setup-error", "setup", "disk", "schedule", "restore", "update")
 
     def __init__(self, root):
         self.root = root
@@ -2507,6 +2608,8 @@ class App:
         self.save_job = None
         self._retry_job = None
         self._setup_panel_shown = False
+        self.start_at = None                   # when the queue starts by itself (Queue > Start at ...)
+        self._power_win = None
         self.setup_error = ""
         self._placeholders: dict = {}
         self._boxes: dict = {}                 # rendered card and button images
@@ -2546,6 +2649,7 @@ class App:
         if Image is None:
             self.log("Note: Pillow is not installed - no thumbnails (pip install pillow).")
 
+        self._setup_drop()
         self._restore_queue()
         self.root.after(1000, self._watch_clipboard)
         self._startup_tools()
@@ -2756,10 +2860,13 @@ class App:
         self.single_var = tk.BooleanVar(value=cfg.get("single", True))
         self.sponsor_var = tk.BooleanVar(value=cfg.get("sponsorblock", False))
         self.auto_var = tk.BooleanVar(value=cfg.get("autostart", True))
+        self.after_var = tk.StringVar(value="none")             # what to do when the queue is done (never saved)
         self.chapters_var = tk.BooleanVar(value=cfg.get("chapters", False))
         self.clip_watch_var = tk.BooleanVar(value=False)                   # never on at startup
         self.clip_watch_var.trace_add("write", lambda *_: self._clip_watch_toggled())
         self.cookie_var = tk.StringVar(value=cfg.get("cookies") or NO_BROWSER)
+        self.cookiefile_var = tk.StringVar(value=cfg.get("cookie_file", ""))
+        self.compat_var = tk.BooleanVar(value=cfg.get("compat", True))
         self.limit_var = tk.StringVar(value=cfg.get("limit", ""))
         self.parallel_var = tk.StringVar(value=str(cfg.get("parallel", 2)))
         self.sub_langs_var = tk.StringVar(value=cfg.get("sub_langs", "en,de"))
@@ -3041,6 +3148,7 @@ class App:
                 "archive": self.arch_var.get(), "uploader": self.uploader_var.get(),
                 "single": self.single_var.get(), "also_audio": self.also_var.get(),
                 "sponsorblock": self.sponsor_var.get(), "chapters": self.chapters_var.get(),
+                "compat": self.compat_var.get(), "cookie_file": self.cookiefile_var.get().strip(),
                 "sub_langs": self.sub_langs_var.get().strip(), "name": self.name_var.get().strip(),
                 "proxy": self.proxy_var.get().strip(), "args": self.args_var.get().strip(),
                 "limit": self.limit_var.get().strip()}
@@ -3056,11 +3164,13 @@ class App:
         self.also_var.set(d.get("also_audio") or ALSO_AUDIO_NONE)
         for var, key in ((self.subs_var, "subs"), (self.thumb_var, "thumb"), (self.arch_var, "archive"),
                          (self.uploader_var, "uploader"), (self.single_var, "single"),
-                         (self.sponsor_var, "sponsorblock"), (self.chapters_var, "chapters")):
+                         (self.sponsor_var, "sponsorblock"), (self.chapters_var, "chapters"),
+                         (self.compat_var, "compat")):
             if key in d:
                 var.set(bool(d[key]))
         for var, key in ((self.sub_langs_var, "sub_langs"), (self.name_var, "name"),
-                         (self.proxy_var, "proxy"), (self.args_var, "args"), (self.limit_var, "limit")):
+                         (self.proxy_var, "proxy"), (self.args_var, "args"), (self.limit_var, "limit"),
+                         (self.cookiefile_var, "cookie_file")):
             if key in d:
                 var.set(str(d[key]))
         self.sync_mode_options()
@@ -3103,8 +3213,63 @@ class App:
             self.profile_var.set("")
 
     def cookies(self) -> str:
+        """The cookie source for yt-dlp: 'file:<path>' (a cookies.txt wins), a browser name, or ''."""
+        path = self.cookiefile_var.get().strip()
+        if path:
+            return "file:" + path
         value = self.cookie_var.get()
         return "" if value == NO_BROWSER else value
+
+    def _setup_drop(self) -> None:
+        """Links, text and files can be dropped on the window (needs the optional tkinterdnd2 package)."""
+        if not hasattr(self.root, "drop_target_register"):
+            return
+        try:
+            self.root.drop_target_register("DND_Text", "DND_Files")
+            self.root.dnd_bind("<<Drop>>", lambda e: self.on_drop(e.data))
+        except Exception:
+            pass
+
+    def on_drop(self, data: str) -> str:
+        urls = links_from_drop(data, self.root.tk.splitlist)
+        if urls:
+            self.add_urls(urls)
+        else:
+            self.toast("No link found in what you dropped")
+        return "copy"
+
+    def schedule_start(self) -> None:
+        text = simpledialog.askstring("Start the queue at", "Time (24 h, like 02:30):", parent=self.root)
+        if not text:
+            return
+        when = parse_clock_time(text)
+        if when is None:
+            self.toast("Times look like 02:30")
+            return
+        self.start_at = when
+        stamp = time.strftime("%H:%M", time.localtime(when))
+        self.set_notice("schedule", f"The queue starts at {stamp}. Leave the app open.",
+                        actions=[("Cancel", self.cancel_schedule)], dismiss=False)
+        self._schedule_tick()
+
+    def cancel_schedule(self) -> None:
+        self.start_at = None
+        self.clear_notice("schedule")
+
+    def _schedule_tick(self) -> None:
+        if self.start_at is None:
+            return
+        if time.time() >= self.start_at:
+            self.cancel_schedule()
+            self.start_all()
+            return
+        self.root.after(15000, self._schedule_tick)
+
+    def pick_cookie_file(self) -> None:
+        path = filedialog.askopenfilename(title="Cookies file (cookies.txt)",
+                                          filetypes=[("Cookies", "*.txt"), ("All files", "*.*")])
+        if path:
+            self.cookiefile_var.set(path)
 
     def parallel(self) -> int:
         try:
@@ -3325,6 +3490,7 @@ class App:
             item.title = info["title"] or item.url
             item.uploader = info["uploader"]
             item.duration = info["duration"]
+            item.live = info.get("live", False)
             item.thumb_url = info["thumbnail"]
             item.thumb = thumb
             item.thumb_state = "done" if thumb is not None else "failed"
@@ -3708,7 +3874,16 @@ class App:
         self._drop([it for it in self.items if it.finished])
         self._items_changed()
 
+    def check_disk(self) -> None:
+        """A notice while the download folder is nearly full."""
+        free = free_space(self.out_var.get() or DEFAULT_OUT)
+        if free is not None and free < LOW_DISK:
+            self.set_notice("disk", f"Only {fmt_size(free)} free in the download folder - downloads may fail.")
+        else:
+            self.clear_notice("disk")
+
     def start_all(self) -> None:
+        self.check_disk()
         if not self.running:
             self.batch = {"ok": 0, "bad": 0}
             self.batch_ids = set()
@@ -3747,6 +3922,44 @@ class App:
             summary = f"{ok} succeeded" + (f", {bad} failed" if bad else "")
             self.log("Done. " + summary)
             notify(APP_NAME, "Done: " + summary, self.root)
+            if ok and self.after_var.get() != "none":
+                self.power_countdown(self.after_var.get())
+
+    def _run_power(self, kind: str) -> None:
+        try:
+            subprocess.Popen(power_command(kind), **_no_window())
+        except OSError as e:
+            self.log(f"ERROR: {e}")
+
+    def power_countdown(self, kind: str, seconds: int = 30) -> None:
+        """Sleep or shut down after a countdown that can be cancelled (the choice is used up once)."""
+        self.after_var.set("none")
+        if power_command(kind) is None:
+            return
+        win = tk.Toplevel(self.root)
+        self._power_win = win
+        win.title(APP_NAME)
+        win.transient(self.root)
+        win.resizable(False, False)
+        label = tk.StringVar()
+        body = ttk.Frame(win, padding=20)
+        body.pack()
+        ttk.Label(body, textvariable=label, style="Big.TLabel").pack()
+        ttk.Button(body, text="Cancel", command=win.destroy).pack(pady=(14, 0))
+        word = "Shutting down" if kind == "shutdown" else "Going to sleep"
+        state = {"left": seconds}
+
+        def tick() -> None:
+            if not win.winfo_exists():
+                return
+            if state["left"] <= 0:
+                win.destroy()
+                self._run_power(kind)
+                return
+            label.set(f"{word} in {state['left']} s")
+            state["left"] -= 1
+            win.after(1000, tick)
+        tick()
 
     def snapshot(self) -> dict:
         return {"mode": self.mode_key(), "out": Path(self.out_var.get() or DEFAULT_OUT).expanduser(),
@@ -3757,13 +3970,21 @@ class App:
                 "also": "" if self.also_var.get() == ALSO_AUDIO_NONE else self.also_var.get(),
                 "limit": self.limit_rate(), "sub_langs": self.sub_langs_var.get().strip() or "en,de",
                 "name": self.name_var.get().strip(), "proxy": self.proxy_var.get().strip(),
+                "compat": self.compat_var.get(),
                 "args": self.args_var.get().strip(), "chapters": self.chapters_var.get(),
                 "format": "", "section": "", "exact": False, "split": False}
 
     def _launch(self, item: Item) -> None:
         opts = self.snapshot()
+        free = free_space(opts["out"])
+        if free is not None and free < MIN_DISK:               # nothing to write to: say so instead of failing oddly
+            item.status, item.error, item.retry_at = "failed", "No space left on device", 0.0
+            self.batch["bad"] += 1
+            self.batch_ids.add(item.id)
+            self.view.touch(item)
+            return
         ov = item.overrides                    # what was changed for this item wins
-        for key in ("mode", "format", "section", "exact", "split", "chapters", "name"):
+        for key in ("mode", "format", "section", "exact", "split", "chapters", "name", "subs"):
             if key in ov:
                 opts[key] = ov[key]
         if ov.get("extra"):
@@ -3797,7 +4018,7 @@ class App:
                           cookies_browser=o["cookies"], sort_by_uploader=o["uploader"],
                           no_playlist=o["single"], also_audio=o["also"], limit_rate=o["limit"],
                           sponsorblock=o["sponsor"], sub_langs=o["sub_langs"], format_override=o["format"],
-                          section=o["section"], exact_cut=o["exact"], embed_chapters=o["chapters"],
+                          section=o["section"], exact_cut=o["exact"], embed_chapters=o["chapters"], compat=o["compat"],
                           split_chapters=o["split"], proxy=o["proxy"], name_template=o["name"],
                           extra=extra)
         found: dict = {}
@@ -4176,6 +4397,13 @@ class App:
         queue_menu.add_command(label="Move down", accelerator="Alt+↓" if not mac else "⌥↓",
                                command=lambda: self.move_selected(1))
         queue_menu.add_separator()
+        queue_menu.add_command(label="Start at a set time …", command=self.schedule_start)
+        done_menu = tk.Menu(queue_menu, tearoff=0)
+        for label, value in (("Do nothing", "none"), ("Put the computer to sleep", "sleep"),
+                             ("Shut the computer down", "shutdown")):
+            done_menu.add_radiobutton(label=label, value=value, variable=self.after_var)
+        queue_menu.add_cascade(label="When the queue is done", menu=done_menu)
+        queue_menu.add_separator()
         queue_menu.add_command(label="Clear finished", command=self.clear_finished)
         bar.add_cascade(label="Queue", menu=queue_menu)
 
@@ -4352,12 +4580,17 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def show_app_update(self, update: dict) -> None:
-        actions = [("Release page", lambda: webbrowser.open(update["page"]))]
+        actions = [("What's new", lambda: self.show_whats_new(update)),
+                   ("Release page", lambda: webbrowser.open(update["page"]))]
         if can_self_update() and update["asset_url"]:
             actions.insert(0, ("Update now", lambda: self.run_self_update(update)))
         self.set_notice("update", f"A new version of {APP_NAME} is available: v{update['version']}",
                         actions=actions)
         self.log(f"New version available: v{update['version']}  ->  {update['page']}")
+
+    def show_whats_new(self, update: dict) -> None:
+        text = release_notes_text(update.get("notes", ""))
+        messagebox.showinfo(f"What's new in {update['version']}", text or "See the release page for the details.")
 
     def run_self_update(self, update: dict) -> None:
         if any(it.status == "downloading" for it in self.items) or self.tools_busy:
@@ -4396,7 +4629,11 @@ def run_gui() -> int:
         print("Linux:  sudo apt install python3-tk   (or python3-tkinter)")
         return 1
     cleanup_old_versions()                     # leftovers of a previous self-update
-    root = tk.Tk()
+    try:                                       # drag and drop of links and files (optional package)
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+    except Exception:
+        root = tk.Tk()
     App(root)
     root.mainloop()
     return 0

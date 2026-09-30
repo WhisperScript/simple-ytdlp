@@ -84,6 +84,13 @@ class RealYtdlp(unittest.TestCase):
         self.assertNotIn("Video:", audio.replace("Video: png", ""))
         self.assertIn("Video: mpeg4", probe(out / [f for f in files if f.endswith(".mp4")][0]))
 
+    def test_compat_mode_arguments_are_accepted_by_yt_dlp(self):
+        out = WORK / "compat"
+        url = self.serve("compat.mp4", 2)
+        args = mod.build_args("video", out, archive=False, compat=True)
+        self.assertEqual(mod.download([url], args, out, log=lambda m: None), (1, 0))
+        self.assertEqual([p.suffix for p in out.iterdir() if p.is_file()], [".mp4"])
+
     def test_an_exact_cut_with_a_file_name_template(self):
         out = WORK / "cut"
         url = self.serve("long.mp4", 6)
