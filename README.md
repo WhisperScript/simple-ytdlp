@@ -20,24 +20,46 @@ takes a few seconds). ffmpeg is built in. The **"Update yt-dlp"** button keeps i
 this helps when YouTube changes something and downloads suddenly fail. Once a day the
 program also checks silently for a yt-dlp update at startup and installs it.
 
-The interface follows the system theme (light/dark) and can be switched with a button.
-A URL in the clipboard is offered in the link field when you switch back to the window, and you
-get a notification when a run finishes.
+The interface follows the system theme (light/dark); change it under View → Theme or in the
+settings. A URL in the clipboard is offered in the link field when you switch back to the window,
+and you get a notification when a run finishes.
 
 ### The interface
 
 - **Paste and go:** press Ctrl+V / Cmd+V (in the link field or anywhere in the window) and every
   link in the clipboard lands in the queue. Text files with one link per line can be imported.
+  New installs start downloading as soon as a link is added (Settings → "Start as soon as a link
+  is added").
 - **Queue with previews:** each download is a card with thumbnail, title, channel, duration, live
-  progress, speed and ETA. Cancel, retry, remove or show the file per card; up to 4 downloads
-  run in parallel (Settings → Parallel downloads).
+  progress, speed and ETA. Titles are cut with an ellipsis at the edge of the card (hover for the
+  full text). The list only builds the rows you can see, so a playlist with thousands of videos
+  scrolls as smoothly as three links. Up to 4 downloads run in parallel (Settings → Parallel
+  downloads). While downloading, the window title shows the overall progress (visible in the task
+  bar / Dock).
+- **Select and act on many:** click, Shift-click (range) and Ctrl/Cmd-click (add) select cards;
+  the right-click menu and the keys below work on the whole selection.
+- **Pause and resume:** *Pause* stops a download but keeps what has been downloaded; *Resume*
+  continues at exactly that byte - the same idea as `rsync --partial`, nothing is fetched twice.
+  Per card, for the selection (Space) or for the whole queue (*Pause all* / *Resume all*).
+  *Start over* deletes the partial data and downloads from the beginning.
+- **Interruptions do not cost you the download:**
+  - *Network trouble:* after yt-dlp's own retries the app retries on its own (after 3, 10, 30, 60
+    and 120 seconds) and continues from the partial file. The card shows the countdown; "Download
+    all" skips the wait. Errors that a retry cannot fix (private video, 404, age restriction)
+    fail right away with an explanation.
+  - *Closing the app:* running downloads are saved as paused and continue where they stopped at
+    the next start (a banner offers "Resume all").
+  - *Crash or power loss:* the end of a partial file can be torn, and appending to it would
+    silently corrupt the finished video. So the last MiB is fetched again before continuing
+    (fragment downloads such as HLS/DASH track their state themselves and are left alone).
+  - Servers that do not support range requests cannot continue - yt-dlp then starts over by itself.
 - **Playlists:** a playlist link opens a selection list first, so you only add the videos you want.
 - **Video or audio:** pick the kind, then the quality (best, 4K, 1440p, 1080p, 720p, 480p, or
   mp3 / m4a / opus).
-- **History:** every finished download is kept; open the file, show it in the folder or
-  download it again.
-- **Per item:** right-click a card (or double-click it, or the **Options** button) to change just that
-  download: video/audio quality, an exact format picked from the real format list (video + audio
+- **History:** every finished download is kept, with search; open the file, show it in the folder
+  or download it again.
+- **Per item:** right-click a card (or double-click it, or press Enter; finished ones open their file
+  instead) to change just that download: video/audio quality, an exact format picked from the real format list (video + audio
   rows are combined), only a part of the video (start/end, optionally an exact re-encoded cut),
   chapters (embed markers, one file per chapter) and extra yt-dlp arguments. "Apply to all
   waiting" copies the choices to the rest of the queue. The menu also copies the link, opens it
@@ -48,10 +70,28 @@ get a notification when a run finishes.
 - **Profiles:** save the current settings under a name ("Music", "Archive", …) and load them
   with one click.
 - **Clipboard watcher:** optionally adds every link you copy, in any program.
-- **The queue survives a restart:** waiting and failed items are restored next time.
+- **The queue survives a restart:** waiting, paused and failed items are restored next time, with
+  their options and partial data.
 - **Clear error messages:** common problems (age restriction, private video, HTTP 429, no
-  network, ...) are explained on the card and say what to do; the log keeps the raw output.
+  network, ...) are explained on the card and say what to do; the log (with filter and copy
+  button) keeps the raw output.
 - **Menu bar:** native on every system (top of the screen on macOS), with keyboard shortcuts.
+
+On macOS use Cmd instead of Ctrl and Option instead of Alt.
+
+| Key | Action |
+|---|---|
+| Ctrl+V | paste links |
+| Ctrl+Enter | download / resume all |
+| Ctrl+. | pause all |
+| ↑ ↓ Home End, Shift+↑ ↓ | move / extend the selection |
+| Space | pause or resume the selected downloads |
+| Enter | options of the selected download |
+| Delete | remove the selected downloads |
+| Ctrl+A | select all |
+| Alt+↑ / Alt+↓ | move the selected downloads in the queue |
+| Ctrl+1 / 2 / 3 | Queue / History / Log |
+| Ctrl+, | settings |
 
 Settings and the downloaded tools live in the user data folder (Windows `%LOCALAPPDATA%\simple-ytdlp`,
 macOS `~/Library/Application Support/simple-ytdlp`, Linux `~/.local/share/simple-ytdlp`).
@@ -98,15 +138,29 @@ manually via **Actions → Build → Run workflow** (result is a downloadable ar
 published). Locally, e.g. on Windows:
 
     pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect pillow
-    pyinstaller --onefile --windowed --name simple-ytdlp --collect-all imageio_ffmpeg --collect-all sv_ttk simple-ytdlp.py
+    python simple-ytdlp.py --make-icons build-assets
+    pyinstaller --onefile --windowed --name simple-ytdlp --icon build-assets/icon.ico --collect-all imageio_ffmpeg --collect-all sv_ttk simple-ytdlp.py
+
+(The icon is drawn by the program itself. On macOS leave out `--onefile` and use `icon.icns`; on
+Linux no icon is embedded.)
 
 ## Development
 
     python -m pip install pyflakes
-    python -m pyflakes simple-ytdlp.py
+    python -m pyflakes simple-ytdlp.py tests
     python -m unittest discover -s tests -v
 
-The same checks run on every pull request (`.github/workflows/ci.yml`).
+- `tests/test_core.py` - the parts without a window (argument building, parsers, resume helpers,
+  queue storage, ...).
+- `tests/test_gui.py` - the real window, driven with a fake yt-dlp (`tests/fake_ytdlp.py`): the
+  virtual list, selection and keys, menus, pause/resume, automatic retries, options, persistence.
+- `tests/test_resume_e2e.py` - the real yt-dlp against a local HTTP server that supports Range
+  requests, throttles and drops connections; every finished file must be bit-identical to the source.
+
+The window tests need Tk, sv-ttk, Pillow and a display (`pip install sv-ttk pillow yt-dlp`; on Linux
+`sudo apt install python3-tk xvfb` and `xvfb-run -a python -m unittest discover -s tests -v`) and skip
+themselves otherwise. They run on every pull request (`.github/workflows/ci.yml`: `test` on
+Python 3.9 and 3.12, `gui` under a virtual display).
 
 ## As a script
 

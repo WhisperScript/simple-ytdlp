@@ -24,6 +24,8 @@ Ready-made programs (Windows/macOS/Linux): see the README, section "Ready-made p
 from __future__ import annotations
 
 import argparse
+import collections
+import datetime
 import json
 import os
 import platform
@@ -529,12 +531,17 @@ def fmt_clock(seconds: float) -> str:
     return text + (f"{frac:.2f}"[1:].rstrip("0") if frac else "")
 
 
+UPDATE_HINT = "yt-dlp is probably out of date - update it (Tools > Update yt-dlp) and retry"
+UPDATE_RE = re.compile(r"unable to extract|nsig extraction failed|player response|precondition check failed|"
+                       r"http error 403|no video formats found", re.I)
+
 FRIENDLY_ERRORS = [
+    (UPDATE_RE.pattern, UPDATE_HINT),
     (r"confirm your age|age-restricted|age restricted",
      "Age-restricted - pick your browser under Settings > Cookies from browser"),
     (r"private video|this video is private",
      "Private video - sign in in your browser and pick it under Settings > Cookies from browser"),
-    (r"not a bot|sign in to confirm",
+    (r"sign in to confirm",
      "YouTube wants a login - use Settings > Cookies from browser, or update yt-dlp"),
     (r"http error 429|too many requests",
      "Rate limited (HTTP 429) - wait a few minutes, lower Parallel, or use cookies"),
@@ -546,9 +553,16 @@ FRIENDLY_ERRORS = [
     (r"requested format is not available", "That format is not offered for this video - choose another"),
     (r"ffmpeg.*(not found|not installed)|ffprobe.*(not found|not installed)", "ffmpeg is missing"),
     (r"premieres in|live event will begin|will begin in", "The live stream or premiere has not started yet"),
+    (r"giving up after|got error: downloaded \d+ bytes",
+     "The connection keeps dropping - what was downloaded is kept, Retry continues from there"),
     (r"unable to download|getaddrinfo|name resolution|timed out|connection (reset|refused)",
      "Network problem - check your connection"),
 ]
+
+
+def suggests_update(text: str) -> bool:
+    """True if the error looks like "YouTube changed something", which a yt-dlp update usually fixes."""
+    return bool(UPDATE_RE.search(text or ""))
 
 
 def friendly_error(text: str) -> str:
@@ -645,7 +659,7 @@ def _stream(cmd: list[str], log, stop_flag=None) -> int:
             while proc.poll() is None:
                 if stop_flag.wait(0.3):
                     _kill_tree(proc)
-                    log("-- cancelled --")
+                    log("-- stopped --")
                     return
         threading.Thread(target=watch, daemon=True).start()
 
@@ -656,6 +670,8 @@ def _stream(cmd: list[str], log, stop_flag=None) -> int:
     except KeyboardInterrupt:
         _kill_tree(proc)
         raise
+    finally:
+        proc.stdout.close()
     return proc.wait()
 
 
@@ -855,6 +871,77 @@ def track_output_file(found: dict, line: str, audio_mode: bool) -> None:
             return
 
 
+RESUME_RE = re.compile(r"Resuming download at byte (?P<n>\d+)")
+
+# --- Resuming interrupted downloads -------------------------------------------------------------
+# yt-dlp keeps unfinished data in "<file>.part" and continues from its end (an HTTP range request), so a
+# stopped download only fetches what is missing - the same idea as rsync --partial. The helpers below make
+# that dependable: they find the partial data, repair its end after a crash, and recognise network errors
+# that are worth an automatic retry.
+
+TAIL_MARGIN = 1 << 20                       # after an unclean stop the last MiB is fetched again
+AUTO_RETRY_DELAYS = (3, 10, 30, 60, 120)    # seconds to wait before each automatic retry
+TRANSIENT_RE = re.compile(
+    r"getaddrinfo|name resolution|timed out|timeout|connection (?:reset|refused|aborted)|"
+    r"http error 5\d\d|incompleteread|remote end closed|eof occurred|network is unreachable|"
+    r"temporary failure|giving up after|broken pipe|urlopen error", re.I)
+
+
+def is_transient_error(text: str) -> bool:
+    """True for errors a retry can fix (network trouble, server hiccups) - not for 404, private videos etc."""
+    return bool(TRANSIENT_RE.search(text or "")) and not re.search(r"http error 4\d\d", text or "", re.I)
+
+
+def partial_files(dests) -> list[Path]:
+    """The unfinished '<file>.part' files of a download (nothing for files that are complete)."""
+    return [p for p in (Path(str(d) + ".part") for d in dests or []) if p.is_file()]
+
+
+def partial_size(dests) -> int:
+    total = 0
+    for p in partial_files(dests):
+        try:
+            total += p.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def trim_partial_tail(dests, margin: int = TAIL_MARGIN) -> int:
+    """Cut the last `margin` bytes off the partial files so they are downloaded again.
+
+    After a crash or power loss the end of a partial file can be incomplete or zero-filled, and appending to
+    it would corrupt the finished video. Re-fetching one MiB costs next to nothing (rsync --append-verify
+    checks the existing part with checksums instead). Fragment downloads (HLS/DASH) track their position
+    per fragment in a '.ytdl' file and are left alone. Returns the number of bytes removed."""
+    removed = 0
+    for p in partial_files(dests):
+        if Path(str(p)[:-len(".part")] + ".ytdl").exists():
+            continue
+        try:
+            size = p.stat().st_size
+            keep = max(size - margin, 0)
+            with open(p, "r+b") as fh:
+                fh.truncate(keep)
+            removed += size - keep
+        except OSError:
+            pass
+    return removed
+
+
+def discard_partial(dests) -> int:
+    """Delete the partial data of a download ('start over'). Returns the bytes freed."""
+    freed = 0
+    for d in dests or []:
+        for p in (Path(str(d) + ".part"), Path(str(d) + ".ytdl")):
+            try:
+                freed += p.stat().st_size
+                p.unlink()
+            except OSError:
+                pass
+    return freed
+
+
 def output_file(found: dict) -> str:
     return found.get("merge") or found.get("extract") or found.get("dest") or ""
 
@@ -963,6 +1050,123 @@ def reveal_file(path: Path) -> None:
         subprocess.Popen(["xdg-open", str(path.parent)])
 
 
+# ---------------------------------------------------------------- Display helpers (no GUI needed)
+
+# Short quality names for the interface (the long MODES texts stay for the command line).
+UI_QUALITY = {
+    "video": "Best quality", "video2160": "Up to 4K", "video1440": "Up to 1440p", "video1080": "Up to 1080p",
+    "video720": "Up to 720p", "video480": "Up to 480p", "mp3": "MP3", "m4a": "M4A (AAC)", "opus": "Opus",
+}
+
+
+def quality_label(mode: str) -> str:
+    return UI_QUALITY.get(mode, mode)
+
+
+def mode_label(mode: str) -> str:
+    """'Video · Up to 1080p' - for places that do not show the Video/Audio switch next to it."""
+    if mode not in UI_QUALITY:
+        return ""
+    return ("Audio" if mode in AUDIO_MODES else "Video") + " · " + UI_QUALITY[mode]
+
+
+def fit_text(measure, text: str, max_px: int, ellipsis: str = "…") -> str:
+    """text cut with an ellipsis so that measure(text) <= max_px ('measure' returns the pixel width)."""
+    text = " ".join(str(text).split())
+    if max_px <= 0:
+        return ""
+    if measure(text) <= max_px:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:                                 # longest prefix that still fits together with the ellipsis
+        mid = (lo + hi + 1) // 2
+        if measure(text[:mid].rstrip() + ellipsis) <= max_px:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo == 0:
+        return ellipsis if measure(ellipsis) <= max_px else ""
+    return text[:lo].rstrip() + ellipsis
+
+
+def tilde_path(path, limit: int = 44) -> str:
+    """A path for display: home folder as ~, the middle cut out when it is long."""
+    text, home = str(path), str(Path.home())
+    if text == home or text.startswith(home + os.sep):
+        text = "~" + text[len(home):]
+    if len(text) > limit:
+        tail = max(limit * 2 // 3, 8)
+        text = text[:limit - tail - 1] + "…" + text[-tail:]
+    return text
+
+
+def humanize_when(ts: float, now: float | None = None) -> str:
+    """'Today 14:05', 'Yesterday 09:12', 'Mon 18:30' (this week) or '2026-09-28'."""
+    now = time.time() if now is None else now
+    t, n = time.localtime(ts), time.localtime(now)
+    days = (datetime.date(n.tm_year, n.tm_mon, n.tm_mday) - datetime.date(t.tm_year, t.tm_mon, t.tm_mday)).days
+    clock = time.strftime("%H:%M", t)
+    if days == 0:
+        return f"Today {clock}"
+    if days == 1:
+        return f"Yesterday {clock}"
+    if 1 < days < 7:
+        return time.strftime("%a", t) + f" {clock}"
+    return time.strftime("%Y-%m-%d", t)
+
+
+_RATE_UNITS = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
+
+
+def parse_speed(text: str) -> float:
+    """Bytes per second from yt-dlp's '3.20MiB/s' (0 for 'Unknown' and everything else)."""
+    m = re.fullmatch(r"\s*([\d.]+)\s*([KMG]?i?B)/s\s*", text or "")
+    return float(m.group(1)) * _RATE_UNITS.get(m.group(2), 0) if m else 0.0
+
+
+def fmt_size(num: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if num < 1024 or unit == "GiB":
+            return f"{num:.0f} B" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+    return ""
+
+
+def fmt_rate(bytes_per_second: float) -> str:
+    return fmt_size(bytes_per_second) + "/s"
+
+
+def summary_options(counts: dict, speed: float = 0.0) -> list[str]:
+    """Texts for the queue summary above the list, most detailed first - the tab bar shows the first one that
+    fits. Finished and failed counts are the last things to go."""
+    waiting = counts.get("queued", 0) + counts.get("fetching", 0)
+    finished = counts.get("done", 0) + counts.get("skipped", 0)
+
+    def build(short: bool, with_speed: bool, with_done: bool) -> str:
+        parts = []
+        if counts.get("downloading"):
+            parts.append(f"{counts['downloading']} " + ("active" if short else "downloading")
+                         + (f" · {fmt_rate(speed)}" if with_speed and speed else ""))
+        if counts.get("paused"):
+            parts.append(f"{counts['paused']} paused")
+        if waiting:
+            parts.append(f"{waiting} " + ("queued" if short else "waiting"))
+        if finished and with_done:
+            parts.append(f"{finished} done")
+        if counts.get("failed"):
+            parts.append(f"{counts['failed']} failed")
+        return (" · " if short else "  ·  ").join(parts)
+
+    options = [build(False, True, True), build(False, False, True), build(True, False, True),
+               build(True, False, False)]
+    return list(dict.fromkeys(options))            # without repeats, order kept
+
+
+def shorten(text: str, limit: int) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
 # ---------------------------------------------------------------- GUI
 
 UPDATE_INTERVAL = 24 * 3600      # how often (seconds) to silently check for yt-dlp updates at startup
@@ -1010,10 +1214,10 @@ try:
 except ImportError:                            # checked again in run_gui() with a helpful message
     tk = None
 
-try:                                           # thumbnails; without Pillow the cards just show a placeholder
-    from PIL import Image, ImageTk
+try:                                           # thumbnails and the icon; without Pillow the cards show a placeholder
+    from PIL import Image, ImageDraw, ImageTk
 except ImportError:
-    Image = ImageTk = None
+    Image = ImageDraw = ImageTk = None
 
 try:                                           # modern theme; without sv-ttk the default Tk look stays
     import sv_ttk
@@ -1021,37 +1225,42 @@ except ImportError:
     sv_ttk = None
 
 THUMB_SIZE = (128, 72)
+CARD_H, CARD_GAP = 92, 8                       # every queue card has the same height -> the list can be virtual
+ROW_H = CARD_H + CARD_GAP
 
-# Status colours that stay readable on both the light and the dark theme.
+# Colours of both themes. "bg"/"border" are sv-ttk's own window and card-outline colours.
 COLORS = {
-    "light": {"ok": "#1e8e4e", "bad": "#c93030", "muted": "#6b6b6b", "thumb": "#dcdcdc",
-              "text_bg": "#ffffff", "text_fg": "#1a1a1a", "text_border": "#c8c8c8", "accent": "#0067c0"},
-    "dark":  {"ok": "#5fd38d", "bad": "#ff7b7b", "muted": "#a0a0a0", "thumb": "#3a3a3a",
-              "text_bg": "#2b2b2b", "text_fg": "#e6e6e6", "text_border": "#4a4a4a", "accent": "#60cdff"},
+    "light": {"bg": "#fafafa", "border": "#e7e7e7", "ok": "#167a3f", "bad": "#c93030", "muted": "#6b6b6b",
+              "thumb": "#e3e3e3", "text_bg": "#ffffff", "text_fg": "#1a1a1a", "text_border": "#c8c8c8",
+              "accent": "#0067c0", "warn": "#996400", "toast_bg": "#323232", "toast_fg": "#ffffff",
+              "tip_bg": "#fffbe6"},
+    "dark":  {"bg": "#1c1c1c", "border": "#2f2f2f", "ok": "#5fd38d", "bad": "#ff7b7b", "muted": "#a0a0a0",
+              "thumb": "#2f2f2f", "text_bg": "#2b2b2b", "text_fg": "#e6e6e6", "text_border": "#4a4a4a",
+              "accent": "#60cdff", "warn": "#f0b45a", "toast_bg": "#e6e6e6", "toast_fg": "#1c1c1c",
+              "tip_bg": "#2f2f2f"},
 }
-
-STATUS_ORDER = ("downloading", "queued", "fetching", "failed", "cancelled", "done", "skipped")
-
-
-def shorten(text: str, limit: int) -> str:
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
-
-
-def fmt_size(num: float) -> str:
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if num < 1024 or unit == "GiB":
-            return f"{num:.0f} B" if unit == "B" else f"{num:.1f} {unit}"
-        num /= 1024
-    return ""
+STATUS_COLOR = {"fetching": "muted", "queued": "muted", "downloading": "accent", "paused": "warn", "done": "ok",
+                "skipped": "ok", "failed": "bad", "cancelled": "muted"}
+STATUS_ORDER = ("downloading", "paused", "queued", "fetching", "failed", "cancelled", "done", "skipped")
+IS_MAC = sys.platform == "darwin"
 
 
 def mode_kind(mode: str) -> str:
     return "audio" if mode in AUDIO_MODES else "video"
 
 
+def round_corners(img, radius: int):
+    """img as RGBA with transparent, anti-aliased rounded corners."""
+    img = img.convert("RGBA")
+    scale = 4                                      # draw the mask large, shrink it -> smooth edge
+    mask = Image.new("L", (img.width * scale, img.height * scale), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, mask.width - 1, mask.height - 1), radius * scale, fill=255)
+    img.putalpha(mask.resize(img.size, Image.LANCZOS))
+    return img
+
+
 def fetch_thumbnail(url: str):
-    """Download a thumbnail and crop it to THUMB_SIZE (a PIL image), or None."""
+    """Download a thumbnail, crop it to THUMB_SIZE and round its corners (a PIL image), or None."""
     if Image is None or not url:
         return None
     try:
@@ -1063,9 +1272,101 @@ def fetch_thumbnail(url: str):
         scale = max(w / img.width, h / img.height)
         img = img.resize((max(w, round(img.width * scale)), max(h, round(img.height * scale))))
         left, top = (img.width - w) // 2, (img.height - h) // 2
-        return img.crop((left, top, left + w, top + h))
+        return round_corners(img.crop((left, top, left + w, top + h)), 6)
     except Exception:
         return None
+
+
+def thumb_placeholder(theme: str):
+    """Rounded grey box with a play triangle, shown until the real thumbnail is there."""
+    if Image is None:
+        return None
+    c = COLORS[theme]
+    img = Image.new("RGB", THUMB_SIZE, c["thumb"])
+    d = ImageDraw.Draw(img)
+    cx, cy = THUMB_SIZE[0] // 2, THUMB_SIZE[1] // 2
+    d.polygon([(cx - 8, cy - 11), (cx - 8, cy + 11), (cx + 12, cy)], fill=c["muted"])
+    return round_corners(img, 6)
+
+
+def make_icon(size: int = 256):
+    """The app icon as a PIL image (None without Pillow): rounded square, download arrow and tray."""
+    if Image is None:
+        return None
+    S = 1024
+    top, bottom = (92, 156, 255), (104, 72, 238)
+    grad = Image.new("RGBA", (S, S))
+    gd = ImageDraw.Draw(grad)
+    for y in range(S):
+        t = y / (S - 1)
+        gd.line([(0, y), (S, y)], fill=tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)) + (255,))
+    mask = Image.new("L", (S, S), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((44, 44, S - 44, S - 44), radius=224, fill=255)
+    icon = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    icon.paste(grad, (0, 0), mask)
+    d = ImageDraw.Draw(icon)
+    white, cx = (255, 255, 255, 255), S // 2
+    d.rounded_rectangle((cx - 58, 214, cx + 58, 560), radius=44, fill=white)               # arrow shaft
+    d.polygon([(cx - 214, 504), (cx + 214, 504), (cx, 722)], fill=white)                   # arrow head
+    d.line([(262, 640), (262, 790), (S - 262, 790), (S - 262, 640)], fill=white, width=68, joint="curve")
+    for x, y in ((262, 640), (S - 262, 640)):                                              # round tray ends
+        d.ellipse((x - 34, y - 34, x + 34, y + 34), fill=white)
+    return icon.resize((size, size), Image.LANCZOS)
+
+
+def write_icons(folder: str) -> list[str]:
+    """Write icon.png/.ico/.icns into folder (used by the release build). Returns the file names."""
+    out = Path(folder)
+    out.mkdir(parents=True, exist_ok=True)
+    big = make_icon(1024)
+    if big is None:
+        raise SystemExit("Pillow is needed to draw the icon (pip install pillow).")
+    big.save(out / "icon.png")
+    big.save(out / "icon.ico", sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
+    big.save(out / "icon.icns")
+    return ["icon.png", "icon.ico", "icon.icns"]
+
+
+class Tooltip:
+    """A small hint that appears when the pointer rests on a widget. text may be a function (evaluated
+    when the hint is about to show), which is how the recycled queue rows get the text of their item."""
+
+    current_theme = "light"
+
+    def __init__(self, widget, text, delay: int = 550):
+        self.widget, self.text, self.delay = widget, text, delay
+        self.tip = None
+        self.job = None
+        widget.bind("<Enter>", self._enter, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _enter(self, _event=None) -> None:
+        self._hide()
+        self.job = self.widget.after(self.delay, self._show)
+
+    def _show(self) -> None:
+        self.job = None
+        text = self.text() if callable(self.text) else self.text
+        if not text:
+            return
+        c = COLORS[Tooltip.current_theme]
+        x, y = self.widget.winfo_pointerx() + 14, self.widget.winfo_pointery() + 18
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=text, justify="left", wraplength=460, padx=8, pady=5, background=c["tip_bg"],
+                 foreground=c["text_fg"], relief="solid", borderwidth=1).pack()
+
+    def _hide(self, _event=None) -> None:
+        if self.job is not None:
+            self.widget.after_cancel(self.job)
+            self.job = None
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
 
 
 class Item:
@@ -1079,18 +1380,24 @@ class Item:
         self.title = url
         self.uploader = ""
         self.duration = None
-        self.thumb = None                      # PIL image, set by the info thread
+        self.thumb = None                      # PIL image (rounded RGBA), loaded when its row gets visible
+        self.thumb_state = None                # None (not asked yet) | "loading" | "done" | "failed"
+        self.thumb_url = ""
         self.status = "fetching"               # fetching queued downloading done skipped failed cancelled
         self.pct = 0.0
         self.speed = self.eta = self.size = ""
         self.path = ""
         self.error = ""
         self.mode = ""
-        self.thumb_url = ""
         self.overrides: dict = {}              # per-item changes, see ItemDialog
         self.stop = threading.Event()
         self.removed = False
-        self.card: "Card | None" = None
+        self.dests: list[str] = []             # files yt-dlp writes for this item (their '.part' files hold the partial data)
+        self.resumed = False                   # yt-dlp reported that it continues from partial data
+        self.interrupted = False               # stopped uncleanly (crash, power loss): repair the partial end first
+        self.pause_requested = False
+        self.retries = 0                       # automatic retries after network problems
+        self.retry_at = 0.0                    # when the next automatic retry starts
 
     @property
     def active(self) -> bool:
@@ -1101,125 +1408,424 @@ class Item:
         return self.status in ("done", "skipped", "failed", "cancelled")
 
 
-class Card:
-    """The row of one Item in the queue: thumbnail, title, progress and action buttons."""
+class Jobs:
+    """A few worker threads for the slow network jobs (video info first, then thumbnails, newest first).
+    A queue of hundreds of links therefore never means hundreds of threads."""
 
-    def __init__(self, app: "App", item: Item):
-        self.app, self.item = app, item
-        self._buttons_for = None
+    def __init__(self, workers: int = 3):
+        import itertools
+        import queue
+        self.q: "queue.PriorityQueue" = queue.PriorityQueue()
+        self.seq = itertools.count()
+        for _ in range(workers):
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def submit(self, priority: int, fn, *args) -> None:
+        n = next(self.seq)
+        self.q.put((priority, -n if priority else n, fn, args))   # info: first in first out; thumbnails: newest first
+
+    def _run(self) -> None:
+        while True:
+            _, _, fn, args = self.q.get()
+            try:
+                fn(*args)
+            except Exception:
+                pass
+
+
+class Row:
+    """The widgets of one visible queue row: status strip, thumbnail, text, progress and buttons.
+    Rows are recycled while scrolling - bind() points a row at another Item."""
+
+    PRIMARY = {"fetching": "Remove", "queued": "Download", "downloading": "Pause", "paused": "Resume",
+               "done": "Show", "skipped": "Show", "failed": "Retry", "cancelled": "Retry"}
+
+    def __init__(self, app: "App", canvas):
+        self.app, self.canvas = app, canvas
+        self.item: Item | None = None
         self.photo = None
-        card_style = "Card.TFrame" if sv_ttk is not None else "TFrame"
-        self.frame = ttk.Frame(app.list_inner, style=card_style, padding=10)
-        self.frame.columnconfigure(1, weight=1)
+        self.thumb_key = None
+        self.width = 10
+        self.bar_mode = "determinate"
+        self._text: dict = {}                  # label -> (font, full text), re-fitted when the label gets wider/narrower
+        self._label_w: dict = {}
+        c = COLORS[app.theme]
 
-        self.thumb_box = tk.Frame(self.frame, width=THUMB_SIZE[0], height=THUMB_SIZE[1])
-        self.thumb_box.grid(row=0, column=0, rowspan=3, sticky="n", padx=(0, 12))
+        self.outer = tk.Frame(canvas, background=c["bg"], borderwidth=0, highlightthickness=0)   # selection ring
+        self.win = canvas.create_window(0, 0, anchor="nw", window=self.outer, width=self.width, height=CARD_H,
+                                        state="hidden")
+        self.card = ttk.Frame(self.outer, style="Card.TFrame" if sv_ttk is not None else "TFrame",
+                              padding=(10, 8, 10, 8))
+        self.card.pack(fill="both", expand=True, padx=2, pady=2)
+        self.card.columnconfigure(2, weight=1)
+        self.card.rowconfigure(0, weight=1)
+
+        self.strip = tk.Frame(self.card, width=4, borderwidth=0, highlightthickness=0)
+        self.strip.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=3)
+
+        self.thumb_box = tk.Frame(self.card, width=THUMB_SIZE[0], height=THUMB_SIZE[1], background=c["bg"],
+                                  borderwidth=0, highlightthickness=0)
+        self.thumb_box.grid(row=0, column=1, sticky="w", padx=(0, 12))
         self.thumb_box.grid_propagate(False)
-        self.thumb_box.pack_propagate(False)
-        self.thumb_lbl = tk.Label(self.thumb_box, text="▶", borderwidth=0)
-        self.thumb_lbl.pack(fill="both", expand=True)
+        self.thumb_lbl = tk.Label(self.thumb_box, borderwidth=0, background=c["bg"], foreground=c["muted"],
+                                  text="▶")
+        self.thumb_lbl.place(x=0, y=0, relwidth=1, relheight=1)
+        self.badge = tk.Label(self.thumb_box, font=app.font_badge, padx=4, pady=0, borderwidth=0,
+                              background="#000000", foreground="#ffffff")
 
-        self.title_lbl = ttk.Label(self.frame, style="CardTitle.TLabel", anchor="w")
-        self.title_lbl.grid(row=0, column=1, sticky="ew")
-        self.meta_lbl = ttk.Label(self.frame, style="Muted.TLabel", anchor="w")
-        self.meta_lbl.grid(row=1, column=1, sticky="ew", pady=(1, 6))
+        body = ttk.Frame(self.card)
+        body.grid(row=0, column=2, sticky="ew")            # centred vertically: the card row is the tall one
+        body.columnconfigure(0, weight=1)
+        self.title = ttk.Label(body, style="CardTitle.TLabel", anchor="w", width=1)
+        self.title.grid(row=0, column=0, sticky="ew")
+        self.meta = ttk.Label(body, style="Muted.TLabel", anchor="w", width=1)
+        self.meta.grid(row=1, column=0, sticky="ew")
+        self.status = ttk.Label(body, style="CardStatus.TLabel", anchor="w", width=1)
+        self.status.grid(row=2, column=0, sticky="ew")
+        self.bar = ttk.Progressbar(body, maximum=100, length=10)
+        self.bar.grid(row=3, column=0, sticky="ew", pady=(4, 0))
 
-        self.bar = ttk.Progressbar(self.frame, maximum=100)
-        self.bar.grid(row=2, column=1, sticky="ew", pady=(0, 4))
-        self.status_lbl = ttk.Label(self.frame, anchor="w", wraplength=560, justify="left")
-        self.status_lbl.grid(row=3, column=1, sticky="ew")
+        btns = ttk.Frame(self.card)
+        btns.grid(row=0, column=3, padx=(12, 0))
+        self.primary = ttk.Button(btns, width=10, command=self._primary_click)
+        self.primary.pack(side="left")
+        self.more = ttk.Button(btns, text="…", width=3, command=self._more_click)
+        self.more.pack(side="left", padx=(6, 0))
 
-        self.btn_box = ttk.Frame(self.frame)
-        self.btn_box.grid(row=0, column=2, rowspan=4, sticky="ne", padx=(12, 0))
-        self._bind_menu(self.frame)
-        self.refresh()
+        for label in (self.title, self.meta, self.status):
+            label.bind("<Configure>", lambda e, w=label: self._refit(w))
+        Tooltip(self.title, self._tip_title)
+        Tooltip(self.status, lambda: self.item.error if self.item and self.item.status == "failed" else "")
+        Tooltip(self.more, "More actions (or right-click the row)")
+        self._bind_click(self.outer)
 
-    def _bind_menu(self, widget) -> None:
-        """Right click opens the item menu, double click the item options (or the finished file)."""
-        secondary = ("<Button-2>", "<Control-Button-1>") if sys.platform == "darwin" else ("<Button-3>",)
+    # -- events
+
+    def _bind_click(self, widget) -> None:
+        """Click selects, double click opens, right click shows the menu - on everything except the buttons."""
+        secondary = ("<Button-2>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)
+        widget.bind("<Button-1>", lambda e: self.app.row_click(self.item, e))
+        widget.bind("<Double-Button-1>", lambda e: self.app.card_activate(self.item))
         for seq in secondary:
             widget.bind(seq, lambda e: self.app.card_menu(self.item, e))
-        widget.bind("<Double-Button-1>", lambda e: self.app.card_activate(self.item))
         for child in widget.winfo_children():
             if not isinstance(child, ttk.Button):
-                self._bind_menu(child)
+                self._bind_click(child)
 
-    def _set_buttons(self, specs) -> None:
-        for child in self.btn_box.winfo_children():
-            child.destroy()
-        for text, command in specs:
-            ttk.Button(self.btn_box, text=text, command=command, width=8).pack(pady=(0, 4), anchor="e")
-
-    def refresh(self) -> None:
+    def _primary_click(self) -> None:
         it, app = self.item, self.app
-        colors = COLORS[app.theme]
-        self.title_lbl.configure(text=shorten(it.title, 110))
-        meta = "  ·  ".join(x for x in (it.uploader, fmt_duration(it.duration),
-                                         ("⚙ " + overrides_summary(it.overrides)) if it.overrides else "") if x)
-        self.meta_lbl.configure(text=meta or (it.url if it.title != it.url else ""))
-        self.thumb_box.configure(background=colors["thumb"])
-        self.thumb_lbl.configure(background=colors["thumb"], foreground=colors["muted"])
+        if it is None:
+            return
+        {"fetching": app.remove_item, "queued": app.start_item, "downloading": app.pause_item,
+         "paused": app.resume_item, "done": app.show_item, "skipped": app.show_item, "failed": app.retry_item,
+         "cancelled": app.retry_item}[it.status](it)
 
+    def _more_click(self) -> None:
+        if self.item is not None:
+            self.app.card_menu(self.item, None, anchor=self.more)
+
+    def _tip_title(self) -> str:
+        it = self.item
+        return f"{it.title}\n{it.url}" if it and it.title != it.url else (it.url if it else "")
+
+    # -- text that must not be cut by the widget edge
+
+    def _set_text(self, label, font, text: str) -> None:
+        self._text[label] = (font, text)
+        self._fit(label)
+
+    def _fit(self, label) -> None:
+        font, text = self._text[label]
+        width = label.winfo_width()
+        if width <= 10:                                    # not laid out yet: estimate from the row width
+            width = max(self.width - 340, 120)
+        label.configure(text=fit_text(font.measure, text, width - 4))
+
+    def _refit(self, label) -> None:
+        width = label.winfo_width()
+        if label in self._text and abs(width - self._label_w.get(label, 0)) >= 2:
+            self._label_w[label] = width
+            self._fit(label)
+
+    # -- binding to an item
+
+    def bind(self, item: Item) -> None:
+        self.item = item
+        self.thumb_key = None
+        self.canvas.itemconfigure(self.win, state="normal")
+        self.refresh()
+        self.app.request_thumb(item)
+
+    def unbind(self) -> None:
+        self.item = None
+        self.bar.stop()
+        self.bar_mode = "determinate"
+        self.canvas.itemconfigure(self.win, state="hidden")
+
+    def status_text(self, it: Item) -> str:
         st = it.status
         if st == "fetching":
-            text, color = "Loading info …", colors["muted"]
-        elif st == "queued":
-            text, color = "Waiting", colors["muted"]
-        elif st == "downloading":
-            parts = [f"{it.pct:.0f}%"]
+            return "Loading info …"
+        if st == "queued":
+            if it.retry_at > time.time():
+                return (f"Connection problem - retrying in {max(int(it.retry_at - time.time()) + 1, 1)} s "
+                        f"({it.retries}/{len(AUTO_RETRY_DELAYS)})")
+            return "Waiting"
+        if st == "paused":
+            kept = partial_size(it.dests)
+            return f"Paused at {it.pct:.0f}%" + (f"  ·  {fmt_size(kept)} kept" if kept else "")
+        if st == "downloading":
+            if it.pause_requested:
+                return "Pausing …"
+            if it.pct >= 100:
+                return "Processing …"
+            parts = [("↻ " if it.resumed else "") + f"{it.pct:.0f}%"]
             if it.size:
                 parts.append(it.size)
             if it.speed and it.speed != "Unknown":
                 parts.append(it.speed)
             if it.eta and it.eta != "Unknown":
                 parts.append(f"ETA {it.eta}")
-            text, color = "   ·   ".join(parts), colors["accent"]
-            if it.pct >= 100:
-                text, color = "Processing …", colors["accent"]
-        elif st == "done":
-            text, color = "✓ Done" + (f"   ·   {it.size}" if it.size else ""), colors["ok"]
-        elif st == "skipped":
-            text, color = "✓ Already downloaded", colors["ok"]
-        elif st == "failed":
-            text, color = ("✗ Failed" + (f"   ·   {shorten(friendly_error(it.error), 160)}" if it.error else ""),
-                           colors["bad"])
-        else:
-            text, color = "Cancelled", colors["muted"]
-        self.status_lbl.configure(text=text, foreground=color)
+            return "  ·  ".join(parts)
+        if st == "done":
+            return "✓ Done" + (f"  ·  {it.size}" if it.size else "")
+        if st == "skipped":
+            return "✓ Already downloaded"
+        if st == "failed":
+            return "✗ " + (friendly_error(it.error) if it.error else "Failed")
+        kept = partial_size(it.dests)
+        return "Cancelled" + (f"  ·  {fmt_size(kept)} kept" if kept else "")
 
-        if st == "fetching":
-            if str(self.bar.cget("mode")) != "indeterminate":
+    def refresh(self) -> None:
+        it, app = self.item, self.app
+        if it is None:
+            return
+        c = COLORS[app.theme]
+        color = c[STATUS_COLOR[it.status]]
+        self.strip.configure(background=color)
+        self.outer.configure(background=c["accent"] if it.id in app.selected else c["bg"])
+        self._set_text(self.title, app.font_title, it.title)
+        meta = "  ·  ".join(x for x in (it.uploader, ("⚙ " + overrides_summary(it.overrides)) if it.overrides else "")
+                            if x)
+        self._set_text(self.meta, app.font_small, meta or (it.url if it.title != it.url else ""))
+        self._set_text(self.status, app.font_status, self.status_text(it))
+        self.status.configure(foreground=color)
+        self._refresh_bar(it)
+        self.primary.configure(text=self.PRIMARY[it.status])
+        self._refresh_thumb(it)
+
+    def _refresh_bar(self, it: Item) -> None:
+        if it.status == "fetching":
+            if self.bar_mode != "indeterminate":
                 self.bar.configure(mode="indeterminate")
-                self.bar.start(15)
+                self.bar.start(40)
+                self.bar_mode = "indeterminate"
             self.bar.grid()
-        elif st in ("queued", "downloading"):
-            if str(self.bar.cget("mode")) == "indeterminate":
+        elif it.status in ("downloading", "paused"):
+            if self.bar_mode == "indeterminate":
                 self.bar.stop()
                 self.bar.configure(mode="determinate")
+                self.bar_mode = "determinate"
             self.bar["value"] = it.pct
             self.bar.grid()
         else:
-            self.bar.stop()
+            if self.bar_mode == "indeterminate":
+                self.bar.stop()
+                self.bar.configure(mode="determinate")
+                self.bar_mode = "determinate"
             self.bar.grid_remove()
 
-        if self._buttons_for != st:
-            self._buttons_for = st
-            remove = ("Remove", lambda: app.remove_item(it))
-            if st == "downloading":
-                self._set_buttons([("Cancel", lambda: app.cancel_item(it))])
-            elif st in ("done", "skipped"):
-                self._set_buttons([("Show", lambda: app.show_item(it)), remove])
-            elif st in ("failed", "cancelled"):
-                self._set_buttons([("Retry", lambda: app.retry_item(it)),
-                                   ("Options", lambda: app.open_item_options(it)), remove])
-            else:
-                self._set_buttons([("Options", lambda: app.open_item_options(it)), remove])
+    def _refresh_thumb(self, it: Item) -> None:
+        c = COLORS[self.app.theme]
+        self.thumb_box.configure(background=c["bg"])
+        self.thumb_lbl.configure(background=c["bg"], foreground=c["muted"])
+        image = it.thumb if it.thumb is not None else self.app.placeholder()
+        key = (id(image), self.app.theme)
+        if image is not None and ImageTk is not None:
+            if key != self.thumb_key:
+                self.photo = ImageTk.PhotoImage(image)
+                self.thumb_lbl.configure(image=self.photo, text="")
+                self.thumb_key = key
+        else:
+            self.thumb_lbl.configure(image="", text="▶")
+        if it.duration:
+            self.badge.configure(text=fmt_duration(it.duration))
+            self.badge.place(relx=1, rely=1, x=-5, y=-5, anchor="se")
+        else:
+            self.badge.place_forget()
 
-    def set_thumb(self) -> None:
-        if ImageTk is None or self.item.thumb is None:
+
+class QueueList:
+    """The scrollable list of queue cards. It is virtual: only the rows that are (nearly) in view exist
+    as widgets, so a playlist with thousands of videos costs the same as one with ten."""
+
+    BUFFER = 2
+
+    def __init__(self, app: "App", parent):
+        self.app = app
+        self.canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0, yscrollincrement=12)
+        self.vsb = ttk.Scrollbar(parent, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self._on_yscroll)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vsb.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.free: list[Row] = []
+        self.bound: dict[int, Row] = {}
+        self.width = 400
+        self._job = None
+        self._scrollbar_shown = True
+        self._region = None                    # last scroll region / first visible fraction: only react to changes,
+        self._top = None                       # or setting the region would trigger the scrollbar callback forever
+        self.canvas.bind("<Configure>", lambda e: self.schedule())
+
+    def _on_yscroll(self, lo, hi) -> None:
+        self.vsb.set(lo, hi)
+        if lo != self._top:
+            self._top = lo
+            self.schedule()
+
+    def schedule(self) -> None:
+        if self._job is None:
+            self._job = self.canvas.after_idle(self.layout)
+
+    def layout(self) -> None:
+        """Bind rows to the items in view, position them, and size the scroll area to the whole list."""
+        self._job = None
+        items = self.app.items
+        n = len(items)
+        w, h = max(self.canvas.winfo_width(), 50), max(self.canvas.winfo_height(), 1)
+        total = n * ROW_H - CARD_GAP if n else 0
+        need_bar = total > h
+        if need_bar != self._scrollbar_shown:
+            self._scrollbar_shown = need_bar
+            if need_bar:
+                self.vsb.grid()
+            else:
+                self.vsb.grid_remove()
+        region = (0, 0, w, max(total, h))
+        if region != self._region:
+            self._region = region
+            self.canvas.configure(scrollregion=region)
+        top = self.canvas.canvasy(0)
+        first = max(0, int(top // ROW_H) - self.BUFFER)
+        last = min(n - 1, int((top + h) // ROW_H) + self.BUFFER)
+        wanted = {items[i].id: i for i in range(first, last + 1)}
+        for iid in [k for k in self.bound if k not in wanted]:
+            row = self.bound.pop(iid)
+            row.unbind()
+            self.free.append(row)
+        self.width = w
+        for iid, i in wanted.items():
+            row = self.bound.get(iid)
+            if row is None:
+                row = self.free.pop() if self.free else Row(self.app, self.canvas)
+                self.bound[iid] = row
+                row.width = w
+                self.canvas.itemconfigure(row.win, width=w)
+                row.bind(items[i])
+            elif row.width != w:
+                row.width = w
+                self.canvas.itemconfigure(row.win, width=w)
+            self.canvas.coords(row.win, 0, i * ROW_H)
+
+    def row_for(self, item: Item) -> "Row | None":
+        return self.bound.get(item.id)
+
+    def touch(self, item: Item) -> None:
+        row = self.bound.get(item.id)
+        if row is not None:
+            row.refresh()
+
+    def refresh_rows(self) -> None:
+        for row in self.bound.values():
+            row.refresh()
+
+    def scroll_to(self, item: Item) -> None:
+        """Scroll just far enough that the item is fully visible."""
+        if item not in self.app.items:
             return
-        self.photo = ImageTk.PhotoImage(self.item.thumb)
-        self.thumb_lbl.configure(image=self.photo, text="")
+        i = self.app.items.index(item)
+        top, h = self.canvas.canvasy(0), max(self.canvas.winfo_height(), 1)
+        y0, y1 = i * ROW_H, i * ROW_H + CARD_H
+        total = max(len(self.app.items) * ROW_H - CARD_GAP, h)
+        if y0 < top:
+            self.canvas.yview_moveto(y0 / total)
+        elif y1 > top + h:
+            self.canvas.yview_moveto((y1 - h) / total)
+        self.schedule()
+
+
+class TabBar(tk.Frame if tk else object):
+    """Text tabs with an underline for the current one (Queue / History / Log) and a status text at the right."""
+
+    def __init__(self, parent, names, command, font):
+        super().__init__(parent, borderwidth=0, highlightthickness=0)
+        self.command, self.current, self.font = command, 0, font
+        self.tabs: list[tuple] = []
+        for i, name in enumerate(names):
+            box = tk.Frame(self, borderwidth=0, highlightthickness=0)
+            label = tk.Label(box, text=name, font=font, padx=12, pady=7, borderwidth=0, cursor="hand2",
+                             takefocus=True, highlightthickness=1)
+            line = tk.Frame(box, height=3, borderwidth=0, highlightthickness=0)
+            label.pack()
+            line.pack(fill="x")
+            box.pack(side="left", padx=(0, 4))
+            for widget in (label, line):
+                widget.bind("<Button-1>", lambda e, i=i: self.select(i))
+            label.bind("<Return>", lambda e, i=i: self.select(i))
+            label.bind("<space>", lambda e, i=i: self.select(i))
+            label.bind("<Right>", lambda e, i=i: self._step(i, 1))
+            label.bind("<Left>", lambda e, i=i: self._step(i, -1))
+            self.tabs.append((box, label, line))
+        self.summary = tk.Label(self, text="", font=font, borderwidth=0)
+        self.summary.pack(side="right", padx=(8, 2))
+        self._summary_options = [""]
+        self.bind("<Configure>", self._fit_summary)
+
+    def set_summary(self, options: list[str]) -> None:
+        """Show the most detailed of the texts (longest first) that fits next to the tabs - a plain label
+        would cut a too long text in the middle."""
+        self._summary_options = options or [""]
+        self._fit_summary()
+
+    def _fit_summary(self, _event=None) -> None:
+        width = self.winfo_width()
+        free = width - sum(box.winfo_reqwidth() + 4 for box, _, _ in self.tabs) - 24 if width > 1 else 10 ** 6
+        text = next((t for t in self._summary_options if self.font.measure(t) <= free), None)
+        if text is None:
+            text = fit_text(self.font.measure, self._summary_options[-1], max(free, 40))
+        if text != self.summary.cget("text"):
+            self.summary.configure(text=text)
+
+    def _step(self, i: int, delta: int) -> None:
+        j = (i + delta) % len(self.tabs)
+        self.select(j)
+        self.tabs[j][1].focus_set()
+
+    def select(self, i: int, notify: bool = True) -> None:
+        self.current = i
+        self.colorize(self.theme)
+        if notify:
+            self.command(i)
+
+    def set_text(self, i: int, text: str) -> None:
+        self.tabs[i][1].configure(text=text)
+        self.after_idle(self._fit_summary)             # the tab got wider or narrower
+
+    theme = "light"
+
+    def colorize(self, theme: str) -> None:
+        self.theme = theme
+        c = COLORS[theme]
+        self.configure(background=c["bg"])
+        for i, (box, label, line) in enumerate(self.tabs):
+            on = i == self.current
+            box.configure(background=c["bg"])
+            label.configure(background=c["bg"], foreground=c["text_fg"] if on else c["muted"],
+                            highlightbackground=c["bg"], highlightcolor=c["accent"])
+            line.configure(background=c["accent"] if on else c["bg"])
+        self.summary.configure(background=c["bg"], foreground=c["muted"])
+
+
 
 
 class PlaylistDialog(tk.Toplevel if tk else object):
@@ -1327,9 +1933,9 @@ class ItemDialog(tk.Toplevel if tk else object):
                                                               pady=(0, 12))
 
         ttk.Label(body, text="Download as").grid(row=2, column=0, sticky="w", pady=4)
-        self.mode_var = tk.StringVar(value=MODES.get(o.get("mode", ""), self.DEFAULT_MODE))
-        ttk.Combobox(body, textvariable=self.mode_var, state="readonly", width=36,
-                     values=[self.DEFAULT_MODE, *MODES.values()]).grid(row=2, column=1, columnspan=3, sticky="w")
+        self.mode_var = tk.StringVar(value=mode_label(o.get("mode", "")) or self.DEFAULT_MODE)
+        ttk.Combobox(body, textvariable=self.mode_var, state="readonly", width=34,
+                     values=[self.DEFAULT_MODE, *[mode_label(k) for k in MODES]]).grid(row=2, column=1, columnspan=3, sticky="w")
 
         ttk.Label(body, text="Exact format").grid(row=3, column=0, sticky="w", pady=4)
         self.format_lbl = ttk.Label(body, style="Muted.TLabel")
@@ -1462,7 +2068,7 @@ class ItemDialog(tk.Toplevel if tk else object):
         except ValueError:
             messagebox.showwarning("Extra arguments", "Unbalanced quotes in the extra arguments.", parent=self)
             return
-        mode = next((k for k, v in MODES.items() if v == self.mode_var.get()), "")
+        mode = next((k for k in MODES if mode_label(k) == self.mode_var.get()), "")
         result = {"mode": mode, "format": self.picked_format, "section": section,
                   "start": self.start_var.get().strip(), "end": self.end_var.get().strip(),
                   "exact": self.exact_var.get(), "extra": extra, "split": self.split_var.get()}
@@ -1511,9 +2117,16 @@ class SettingsDialog(tk.Toplevel if tk else object):
                 if var is app.subs_var:
                     app.subs_check = check
 
-        general = section("Downloads", 0)
+        look = section("Appearance", 0)
+        for i, (label, value) in enumerate((("Follow the system", "system"), ("Light", "light"), ("Dark", "dark"))):
+            ttk.Radiobutton(look, text=label, value=value, variable=app.theme_mode,
+                            command=app.set_theme_mode).grid(row=0, column=i, sticky="w", padx=(0, 24), pady=3)
+            if sv_ttk is None:
+                look.winfo_children()[-1].configure(state="disabled")
+
+        general = section("Downloads", 1)
         toggles(general, (("Skip already downloaded", app.arch_var), ("Single video only (no playlist)", app.single_var),
-                          ("Folder per channel", app.uploader_var), ("Start right after adding", app.auto_var),
+                          ("Folder per channel", app.uploader_var), ("Start as soon as a link is added", app.auto_var),
                           ("Watch the clipboard for links", app.clip_watch_var)))
         speed = ttk.Frame(general)
         speed.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -1524,23 +2137,23 @@ class SettingsDialog(tk.Toplevel if tk else object):
         ttk.Entry(speed, textvariable=app.limit_var, width=7).pack(side="left", padx=(8, 4))
         ttk.Label(speed, text="e.g. 2M", style="Muted.TLabel").pack(side="left")
 
-        extras = section("Video and audio extras", 1)
+        extras = section("Video and audio extras", 2)
         toggles(extras, (("Subtitles", app.subs_var), ("Embed thumbnail", app.thumb_var),
                          ("Embed chapters", app.chapters_var), ("Remove sponsor segments", app.sponsor_var)))
         field(extras, 2, "Subtitle languages", ttk.Entry(extras, textvariable=app.sub_langs_var, width=14),
               "e.g. en,de or all")
 
-        net = section("Login and network", 2)
+        net = section("Login and network", 3)
         field(net, 0, "Cookies from browser",
               ttk.Combobox(net, textvariable=app.cookie_var, values=[NO_BROWSER, *BROWSERS[1:]],
                            state="readonly", width=12), "for private or age-restricted videos")
         field(net, 1, "Proxy", ttk.Entry(net, textvariable=app.proxy_var, width=30), "e.g. http://host:8080")
 
-        adv = section("Advanced", 3)
+        adv = section("Advanced", 4)
         field(adv, 0, "File name", ttk.Entry(adv, textvariable=app.name_var, width=30), "default: %(title)s")
         field(adv, 1, "Extra yt-dlp arguments", ttk.Entry(adv, textvariable=app.args_var, width=30))
 
-        prof = section("Profiles", 4)
+        prof = section("Profiles", 5)
         row = ttk.Frame(prof)
         row.grid(row=0, column=0, columnspan=3, sticky="w")
         app.profile_combo = ttk.Combobox(row, textvariable=app.profile_var, width=20,
@@ -1553,7 +2166,7 @@ class SettingsDialog(tk.Toplevel if tk else object):
                              "settings\n(quality, folder and everything above) under it.",
                   style="Muted.TLabel", justify="left").grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        ttk.Button(body, text="Close", command=self.close, width=10).grid(row=5, column=0, sticky="e")
+        ttk.Button(body, text="Close", command=self.close, width=10).grid(row=6, column=0, sticky="e")
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<Escape>", lambda e: self.close())
         app.sync_mode_options()                # e.g. subtitles are greyed out in audio mode
@@ -1568,39 +2181,115 @@ class SettingsDialog(tk.Toplevel if tk else object):
         self.destroy()
 
 
+class AboutDialog(tk.Toplevel if tk else object):
+    """Name, version and the tool versions in use - with a button that copies them for a bug report."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app.root)
+        self.app = app
+        self.title(f"About {APP_NAME}")
+        self.transient(app.root)
+        self.resizable(False, False)
+        body = ttk.Frame(self, padding=20)
+        body.grid(row=0, column=0)
+        if ImageTk is not None:
+            self.photo = ImageTk.PhotoImage(make_icon(96))
+            ttk.Label(body, image=self.photo).grid(row=0, column=0, rowspan=3, sticky="n", padx=(0, 18))
+        ttk.Label(body, text=APP_NAME, style="Big.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Label(body, text=("development version" if __version__ == "dev" else f"Version {__version__}"),
+                  style="Muted.TLabel").grid(row=1, column=1, sticky="w")
+        ttk.Label(body, text="A friendly graphical front end for yt-dlp.").grid(row=2, column=1, sticky="w", pady=(6, 0))
+        self.info_var = tk.StringVar(value="Checking tools …")
+        ttk.Label(body, textvariable=self.info_var, style="Muted.TLabel", justify="left").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(16, 0))
+        row = ttk.Frame(body)
+        row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        ttk.Button(row, text="Copy info", command=self.copy_info).pack(side="left")
+        ttk.Button(row, text="Project page",
+                   command=lambda: webbrowser.open(f"https://github.com/{REPO}")).pack(side="left", padx=8)
+        ttk.Button(row, text="Close", command=self.destroy).pack(side="right")
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        x = app.root.winfo_rootx() + max((app.root.winfo_width() - self.winfo_width()) // 2, 0)
+        self.geometry(f"+{x}+{app.root.winfo_rooty() + 70}")
+        threading.Thread(target=self._collect, daemon=True).start()
+
+    def _collect(self) -> None:
+        try:
+            base = find_ytdlp()
+            ytdlp = subprocess.run(base + ["--version"], capture_output=True, text=True, timeout=10,
+                                   **_no_window()).stdout.strip() if base else "not installed yet"
+        except Exception:
+            ytdlp = "unknown"
+        ffmpeg, source = find_ffmpeg()
+        js = find_js_runtime()
+        lines = [f"{APP_NAME} {'(dev)' if __version__ == 'dev' else __version__}",
+                 f"yt-dlp: {ytdlp}", f"ffmpeg: {source}", f"JS engine: {js[1].split(':')[0] if js else 'none'}",
+                 f"Python {platform.python_version()}, Tk {tk.TkVersion}, Pillow: {'yes' if Image else 'no'}",
+                 f"System: {platform.platform()}", f"Settings folder: {data_dir()}"]
+        text = "\n".join(lines)
+        self.app.ui(lambda: self.winfo_exists() and self.info_var.set(text))
+
+    def copy_info(self) -> None:
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(self.info_var.get())
+        self.app.toast("Copied to the clipboard")
+
+
 class App:
     """The main window: link input, download queue, history and log."""
+
+    NOTICE_ORDER = ("setup-error", "setup", "restore", "update")
 
     def __init__(self, root):
         self.root = root
         self.cfg = load_settings()
         self.items: list[Item] = []
+        self.selected: set[int] = set()        # ids of the selected queue items
+        self.anchor: int | None = None         # where a shift-click range starts
+        self.cursor: int | None = None         # the item the arrow keys move from
         self.running = False                   # True after "Download all" until the queue is empty
         self.tools_busy = False                # yt-dlp is being installed/updated
+        self.tools_ready = threading.Event()   # set once yt-dlp is usable (or the setup failed)
         self.batch = {"ok": 0, "bad": 0}
-        self.info_slots = threading.Semaphore(3)
+        self.batch_ids: set[int] = set()       # items of the current run (for the progress in the title)
+        self.jobs = Jobs(3)
         self.history = load_history()
+        self.log_lines: "collections.deque[str]" = collections.deque(maxlen=3000)
         self.text_widgets: list = []
+        self.notices: dict[str, dict] = {}
         self.restored = False
         self.watch_last = ""
         self.last_clip = ""
-        self.placeholder = "Paste a video or playlist link and press Enter"
+        self.placeholder_text = "Paste a video or playlist link here"
         self.placeholder_on = False
+        self.toast_job = None
+        self.save_job = None
+        self._retry_job = None
+        self._setup_panel_shown = False
+        self.setup_error = ""
+        self._placeholders: dict = {}
 
         self.theme_mode = tk.StringVar(value=self.cfg.get("theme") or "system")    # system | light | dark
         if self.theme_mode.get() not in ("system", "light", "dark"):
             self.theme_mode.set("system")
         self.theme = self._resolve_theme() if sv_ttk is not None else "light"
+        Tooltip.current_theme = self.theme
 
-        root.title(APP_NAME + ("" if __version__ == "dev" else f"  v{__version__}"))
+        self.base_title = APP_NAME + ("" if __version__ == "dev" else f"  v{__version__}")
+        root.title(self.base_title)
         size = str(self.cfg.get("size", ""))
-        root.geometry(size if re.fullmatch(r"\d{3,4}x\d{3,4}", size) else "920x780")
-        root.minsize(780, 580)
+        root.geometry(size if re.fullmatch(r"\d{3,4}x\d{3,4}", size) else "920x760")
+        root.minsize(780, 540)
 
+        self._set_icon()
+        if sv_ttk is not None:
+            sv_ttk.set_theme(self.theme)       # creates the theme's fonts, which _fonts() takes its sizes from
         self._fonts()
         self._build()
         self._build_menu()
         self.apply_theme(self.theme)
+        self.select_tab(0)
         self.sync_mode_options()
         self.refresh_history()
         self.update_state()
@@ -1608,6 +2297,7 @@ class App:
         root.bind("<FocusIn>", self._on_focus)
         root.bind("<<Paste>>", self._on_global_paste)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._bind_wheel()
         self.log((APP_NAME + " " + ("(dev)" if __version__ == "dev" else f"v{__version__}"))
                  + f" ready. Output folder: {self.out_var.get()}")
         if find_ffmpeg()[1] == "none":
@@ -1629,31 +2319,57 @@ class App:
 
     # ------------------------------------------------------------ styling
 
+    def _set_icon(self) -> None:
+        if ImageTk is None:
+            return
+        try:
+            self.icon_photo = ImageTk.PhotoImage(make_icon(128))
+            self.root.iconphoto(True, self.icon_photo)
+        except Exception:
+            pass
+
     def _fonts(self) -> None:
-        base = tkfont.nametofont("TkDefaultFont")
-        size = abs(int(base.cget("size"))) or 10
-        self.font_title = tkfont.Font(family=base.cget("family"), size=size + 1, weight="bold")
-        self.font_big = tkfont.Font(family=base.cget("family"), size=size + 8, weight="bold")
-        self.font_small = tkfont.Font(family=base.cget("family"), size=max(size - 1, 8))
+        """All fonts in pixels and derived from the one the theme uses for its widgets, so text of the
+        queue, the dialogs and the ttk widgets always has matching sizes (on every platform)."""
+        try:
+            body = tkfont.nametofont("SunValleyBodyFont" if sv_ttk is not None else "TkDefaultFont")
+        except tk.TclError:
+            body = tkfont.nametofont("TkDefaultFont")
+        family, size = body.actual("family"), int(body.cget("size"))
+        px = -size if size < 0 else max(round(size * float(self.root.tk.call("tk", "scaling"))), 11)
+
+        def make(delta: int, weight: str = "normal"):
+            return tkfont.Font(family=family, size=-(px + delta), weight=weight)
+
+        self.font_title, self.font_status, self.font_small = make(1, "bold"), make(0), make(-2)
+        self.font_badge, self.font_big, self.font_entry = make(-3, "bold"), make(8, "bold"), make(1)
+        self.font_tab = make(0, "bold")
+
+    def placeholder(self):
+        """The grey thumbnail stand-in for the current theme."""
+        if self.theme not in self._placeholders:
+            self._placeholders[self.theme] = thumb_placeholder(self.theme)
+        return self._placeholders[self.theme]
 
     def apply_theme(self, name: str) -> None:
         self.theme = name
+        Tooltip.current_theme = name
         if sv_ttk is not None:
             sv_ttk.set_theme(name)
         c = COLORS[name]
         style = ttk.Style()                    # style settings belong to one theme -> set them after switching
         style.configure("CardTitle.TLabel", font=self.font_title)
+        style.configure("CardStatus.TLabel", font=self.font_status)
         style.configure("Big.TLabel", font=self.font_big)
         style.configure("Muted.TLabel", font=self.font_small, foreground=c["muted"])
+        style.configure("Hint.TLabel", font=self.font_status, foreground=c["muted"])
         for w in self.text_widgets:            # ttk themes do not cover tk.Text
             w.configure(background=c["text_bg"], foreground=c["text_fg"], insertbackground=c["text_fg"],
                         highlightbackground=c["text_border"], highlightcolor=c["accent"])
-        bg = self.root.tk.eval("ttk::style lookup TFrame -background") or c["text_bg"]
-        self.canvas.configure(background=bg)
-        self.empty_lbl.configure(background=bg, foreground=c["muted"])
-        for it in self.items:
-            if it.card:
-                it.card.refresh()
+        self.view.canvas.configure(background=c["bg"])
+        self.rule.configure(background=c["border"])
+        self.tabbar.colorize(name)
+        self.view.refresh_rows()
         self._history_tags()
 
     def _resolve_theme(self) -> str:
@@ -1661,13 +2377,9 @@ class App:
         return system_theme() if mode == "system" else mode
 
     def set_theme_mode(self) -> None:
-        """Apply the mode chosen in the View menu (system follows the operating system)."""
+        """Apply the mode chosen in the View menu or the settings (system follows the operating system)."""
         self.apply_theme(self._resolve_theme())
         save_settings({"theme": self.theme_mode.get()})
-
-    def toggle_theme(self) -> None:
-        self.theme_mode.set("light" if self.theme == "dark" else "dark")
-        self.set_theme_mode()
 
     # ------------------------------------------------------------ layout
 
@@ -1675,42 +2387,33 @@ class App:
         root, cfg = self.root, self.cfg
         accent = "Accent.TButton" if sv_ttk is not None else "TButton"
         tool = "Toggle.TButton" if sv_ttk is not None else "TButton"
+        card_style = "Card.TFrame" if sv_ttk is not None else "TFrame"
 
-        main = ttk.Frame(root, padding=(18, 14, 18, 12))
+        main = ttk.Frame(root, padding=(18, 16, 18, 12))
         main.pack(fill="both", expand=True)
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(4, weight=1)
+        main.rowconfigure(2, weight=1)
 
-        # header
-        head = ttk.Frame(main)
-        head.grid(row=0, column=0, sticky="ew")
-        ttk.Label(head, text=APP_NAME, style="Big.TLabel").pack(side="left")
-        ttk.Label(head, text="  yt-dlp made comfortable", style="Muted.TLabel").pack(side="left", pady=(8, 0))
-        if sv_ttk is not None:
-            ttk.Button(head, text="☀ / ☾", width=6, command=self.toggle_theme).pack(side="right")
-        self.update_btn = ttk.Button(head, text="Update yt-dlp", command=self.on_update_ytdlp)
-        self.update_btn.pack(side="right", padx=8)
-        self.head_status = ttk.Label(head, text="", style="Muted.TLabel")
-        self.head_status.pack(side="right", padx=8)
-
-        # link input
+        # row 0: the link
         add = ttk.Frame(main)
-        add.grid(row=1, column=0, sticky="ew", pady=(14, 8))
+        add.grid(row=0, column=0, sticky="ew")
         add.columnconfigure(0, weight=1)
         self.url_var = tk.StringVar()
-        self.url_entry = ttk.Entry(add, textvariable=self.url_var, font=self.font_title)
+        self.url_entry = ttk.Entry(add, textvariable=self.url_var, font=self.font_entry)
         self.url_entry.grid(row=0, column=0, sticky="ew", ipady=5)
         self.url_entry.bind("<Return>", lambda e: self.on_add())
         self.url_entry.bind("<<Paste>>", self._on_entry_paste)
         self.url_entry.bind("<FocusIn>", lambda e: self._placeholder(False))
         self.url_entry.bind("<FocusOut>", lambda e: self._placeholder(True))
-        ttk.Button(add, text="Add", style=accent, command=self.on_add, width=8).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(add, text="Import list …", command=self.on_import).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(add, text="Paste", command=self._on_global_paste_menu, width=7).grid(
+            row=0, column=1, padx=(8, 0), sticky="ns")
+        ttk.Button(add, text="Add", style=accent, command=self.on_add, width=8).grid(
+            row=0, column=2, padx=(8, 0), sticky="ns")
         self._placeholder(True)
 
-        # mode / folder / options toggle
+        # row 1: what to download
         bar = ttk.Frame(main)
-        bar.grid(row=2, column=0, sticky="ew")
+        bar.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         bar.columnconfigure(3, weight=1)
         mode = cfg.get("mode", "video")
         if mode not in MODES:
@@ -1721,26 +2424,70 @@ class App:
         for text, value in (("Video", "video"), ("Audio", "audio")):
             ttk.Radiobutton(kinds, text=text, value=value, variable=self.kind_var, style=tool,
                             command=self._on_kind, width=7).pack(side="left", padx=(0, 4))
-        self.quality_var = tk.StringVar(value=MODES[mode])
-        self.quality_combo = ttk.Combobox(bar, textvariable=self.quality_var, state="readonly", width=19)
-        self.quality_combo.grid(row=0, column=1, padx=8)
+        self.quality_var = tk.StringVar(value=quality_label(mode))
+        self.quality_combo = ttk.Combobox(bar, textvariable=self.quality_var, state="readonly", width=14)
+        self.quality_combo.grid(row=0, column=1, padx=(8, 16))
         self.quality_combo.bind("<<ComboboxSelected>>", lambda e: self.sync_mode_options())
         also = ttk.Frame(bar)                  # video modes: keep the video AND save a separate audio file
         also.grid(row=0, column=2)
-        self.also_lbl = ttk.Label(also, text="+ Audio")
-        self.also_lbl.pack(side="left", padx=(0, 6))
+        self.also_lbl = ttk.Label(also, text="Also save audio")
+        self.also_lbl.pack(side="left", padx=(0, 8))
         self.also_var = tk.StringVar(value=cfg.get("also_audio") or ALSO_AUDIO_NONE)
         self.also_combo = ttk.Combobox(also, textvariable=self.also_var, values=[ALSO_AUDIO_NONE, *AUDIO_MODES],
                                        state="readonly", width=6)
         self.also_combo.pack(side="left")
-        self.out_var = tk.StringVar(value=cfg.get("out") or str(DEFAULT_OUT))
-        ttk.Label(bar, text="Save to").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(bar, textvariable=self.out_var).grid(row=1, column=1, columnspan=3, sticky="ew",
-                                                       padx=(8, 0), pady=(8, 0))
-        ttk.Button(bar, text="Browse …", command=self.pick_dir).grid(row=1, column=4, padx=(8, 0), pady=(8, 0))
-        ttk.Button(bar, text="Settings …", command=self.open_settings, width=11).grid(row=0, column=4, padx=(8, 0))
+        Tooltip(self.also_combo, "Keeps the video and saves the sound as a separate file next to it")
+        ttk.Button(bar, text="Settings …", command=self.open_settings, width=11).grid(row=0, column=4)
 
-        # settings (edited in the settings window, see SettingsDialog)
+        self.out_var = tk.StringVar(value=cfg.get("out") or str(DEFAULT_OUT))
+        self._init_settings_vars(cfg)
+
+        # row 2: queue / history / log
+        content = ttk.Frame(main)
+        content.grid(row=2, column=0, sticky="nsew", pady=(14, 0))
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(3, weight=1)
+        self.tabbar = TabBar(content, ["Queue", "History", "Log"], self._show_page, self.font_tab)
+        self.tabbar.grid(row=0, column=0, sticky="ew")
+        self.rule = tk.Frame(content, height=1, borderwidth=0, highlightthickness=0)
+        self.rule.grid(row=1, column=0, sticky="ew")
+        self.notice = ttk.Frame(content, style=card_style, padding=(12, 8))
+        self.notice.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.notice.grid_remove()
+        self.stack = ttk.Frame(content)
+        self.stack.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        self.stack.columnconfigure(0, weight=1)
+        self.stack.rowconfigure(0, weight=1)
+        self.pages = [ttk.Frame(self.stack) for _ in range(3)]
+        for page in self.pages:
+            page.grid(row=0, column=0, sticky="nsew")
+        self._build_queue_page(self.pages[0])
+        self._build_history_page(self.pages[1])
+        self._build_log_page(self.pages[2])
+        self.toast_lbl = tk.Label(content, padx=14, pady=8, borderwidth=0, font=self.font_status)
+
+        # row 3: footer
+        foot = ttk.Frame(main)
+        foot.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        foot.columnconfigure(1, weight=1)
+        self.folder_var = tk.StringVar()
+        self.folder_menu = tk.Menu(foot, tearoff=0, postcommand=self._fill_folder_menu)
+        self.folder_btn = ttk.Menubutton(foot, textvariable=self.folder_var, menu=self.folder_menu, width=34,
+                                         direction="above")
+        self.folder_btn.grid(row=0, column=0, sticky="w")
+        Tooltip(self.folder_btn, lambda: f"Downloads are saved in\n{self.out_var.get()}")
+        btns = ttk.Frame(foot)
+        btns.grid(row=0, column=2, sticky="e")
+        self.clear_btn = ttk.Button(btns, text="Clear finished", command=self.clear_finished)
+        self.clear_btn.grid(row=0, column=0, padx=(0, 6))
+        self.stop_btn = ttk.Button(btns, text="Pause all", command=self.pause_all)
+        self.stop_btn.grid(row=0, column=1, padx=(0, 6))
+        self.start_btn = ttk.Button(btns, text="Download all", style=accent, command=self.start_all)
+        self.start_btn.grid(row=0, column=2)
+        self._update_folder_label()
+
+    def _init_settings_vars(self, cfg: dict) -> None:
+        """The variables behind the settings window (see SettingsDialog)."""
         self.settings_win = None
         self.subs_check = None
         self.profile_combo = None
@@ -1750,7 +2497,7 @@ class App:
         self.uploader_var = tk.BooleanVar(value=cfg.get("uploader", False))
         self.single_var = tk.BooleanVar(value=cfg.get("single", True))
         self.sponsor_var = tk.BooleanVar(value=cfg.get("sponsorblock", False))
-        self.auto_var = tk.BooleanVar(value=cfg.get("autostart", False))
+        self.auto_var = tk.BooleanVar(value=cfg.get("autostart", True))
         self.chapters_var = tk.BooleanVar(value=cfg.get("chapters", False))
         self.clip_watch_var = tk.BooleanVar(value=False)                   # never on at startup
         self.clip_watch_var.trace_add("write", lambda *_: self._clip_watch_toggled())
@@ -1763,128 +2510,207 @@ class App:
         self.args_var = tk.StringVar(value=cfg.get("args", ""))
         self.profile_var = tk.StringVar(value="")
 
-        # tabs
-        self.tabs = ttk.Notebook(main)
-        self.tabs.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
-        self._build_queue_tab()
-        self._build_history_tab()
-        self._build_log_tab()
+    def _build_queue_page(self, page) -> None:
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(0, weight=1)
+        self.view = QueueList(self, page)
+        accent = "Accent.TButton" if sv_ttk is not None else "TButton"
+        self.empty = ttk.Frame(page)           # shown over the list while it is empty (also the first-run screen)
+        self.empty_icon = ttk.Label(self.empty)
+        if ImageTk is not None:
+            self.empty_photo = ImageTk.PhotoImage(make_icon(84))
+            self.empty_icon.configure(image=self.empty_photo)
+        self.empty_icon.pack(pady=(0, 14))
+        self.empty_title = ttk.Label(self.empty, style="Big.TLabel")
+        self.empty_title.pack()
+        self.empty_hint = ttk.Label(self.empty, style="Hint.TLabel", justify="center")
+        self.empty_hint.pack(pady=(8, 16))
+        self.empty_actions = ttk.Frame(self.empty)
+        self.empty_actions.pack()
+        ttk.Button(self.empty_actions, text="Paste from clipboard", style=accent,
+                   command=self._on_global_paste_menu).pack(side="left")
+        ttk.Button(self.empty_actions, text="Import list …", command=self.on_import).pack(side="left", padx=(8, 0))
+        self.empty_bar = ttk.Progressbar(self.empty, mode="indeterminate", length=220)
+        self.empty_retry = ttk.Button(self.empty, text="Try again", style=accent, command=self._startup_tools)
 
-        # footer
-        foot = ttk.Frame(main)
-        foot.grid(row=5, column=0, sticky="ew", pady=(10, 0))
-        self.summary = ttk.Label(foot, text="", style="Muted.TLabel")
-        self.summary.pack(side="left")
-        self.start_btn = ttk.Button(foot, text="Download all", style=accent, command=self.start_all)
-        self.start_btn.pack(side="right")
-        self.stop_btn = ttk.Button(foot, text="Stop", command=self.stop_all)
-        self.stop_btn.pack(side="right", padx=6)
-        ttk.Button(foot, text="Clear finished", command=self.clear_finished).pack(side="right")
-        ttk.Button(foot, text="Open folder",
-                   command=lambda: open_folder(Path(self.out_var.get() or DEFAULT_OUT))).pack(side="right", padx=6)
+    def _setup_panel(self) -> bool:
+        """True while the empty list shows the big 'Setting up' screen."""
+        return not self.items and self.tools_busy and "setup" in self.notices and find_ytdlp() is None
 
-        # update banner (only shown when a newer release exists)
-        card_style = "Card.TFrame" if sv_ttk is not None else "TFrame"
-        self.news = ttk.Frame(main, style=card_style, padding=(12, 8))
-        self.news.grid(row=6, column=0, sticky="ew", pady=(10, 0))
-        self.news_label = ttk.Label(self.news, text="")
-        self.news_label.pack(side="left")
-        self.news_page_btn = ttk.Button(self.news, text="Release page")
-        self.news_page_btn.pack(side="right")
-        self.news_now_btn = ttk.Button(self.news, text="Update now")
-        self.news_now_btn.pack(side="right", padx=6)
-        self.news.grid_remove()
+    def _update_empty(self) -> None:
+        """The empty list shows one of three screens: setting up, setup failed, or 'paste a link'."""
+        setting_up = self._setup_panel()
+        if setting_up != self._setup_panel_shown:
+            self._setup_panel_shown = setting_up
+            self._render_notice()              # the bar says the same as the big screen: hide it (calls back here)
+            return
+        if self.items:
+            self.empty.place_forget()
+            self.empty_bar.stop()
+            return
+        for w in (self.empty_actions, self.empty_bar, self.empty_retry):
+            w.pack_forget()
+        if setting_up:
+            self.empty_title.configure(text="Setting up …")
+            self.empty_hint.configure(text="Downloading yt-dlp - this happens once, on the first start.")
+            self.empty_bar.pack()
+            self.empty_bar.start(40)
+        elif self.setup_error:
+            self.empty_bar.stop()
+            self.empty_title.configure(text="Setup did not finish")
+            self.empty_hint.configure(text=self.setup_error)
+            self.empty_retry.pack()
+        else:
+            self.empty_bar.stop()
+            self.empty_title.configure(text="Paste a link to get started")
+            self.empty_hint.configure(text=f"Press {'⌘' if IS_MAC else 'Ctrl+'}V anywhere in this window.\n"
+                                           "Playlists let you choose the videos first.")
+            self.empty_actions.pack()
+        self.empty.place(relx=0.5, rely=0.44, anchor="center")
 
-    def _build_queue_tab(self) -> None:
-        tab = ttk.Frame(self.tabs, padding=(0, 10, 0, 0))
-        self.tabs.add(tab, text="Queue")
-        tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(0, weight=1)
-        self.canvas = tk.Canvas(tab, highlightthickness=0, borderwidth=0)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        vsb = ttk.Scrollbar(tab, orient="vertical", command=self.canvas.yview)
-        vsb.grid(row=0, column=1, sticky="ns", padx=(6, 0))
-        self.canvas.configure(yscrollcommand=vsb.set)
-        self.list_inner = ttk.Frame(self.canvas)
-        self.list_window = self.canvas.create_window((0, 0), window=self.list_inner, anchor="nw")
-        self.list_inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.list_window, width=e.width))
-        for widget in (self.canvas, self.list_inner):
-            widget.bind("<Enter>", self._bind_wheel)
-            widget.bind("<Leave>", self._unbind_wheel)
-        self.empty_lbl = tk.Label(
-            self.canvas, justify="center", borderwidth=0, font=self.font_title,
-            text="Nothing here yet.\n\nPaste a link above (or just press Ctrl+V / Cmd+V anywhere in this window).\n"
-                 "Playlists let you pick the videos first.")
-
-    def _build_history_tab(self) -> None:
-        tab = ttk.Frame(self.tabs, padding=(0, 10, 0, 0))
-        self.tabs.add(tab, text="History")
-        tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(0, weight=1)
-        self.hist = ttk.Treeview(tab, columns=("title", "mode", "when"), show="headings", selectmode="extended")
-        for col, text, width, stretch in (("title", "Title", 480, True), ("mode", "Format", 170, False),
-                                          ("when", "Downloaded", 140, False)):
+    def _build_history_page(self, page) -> None:
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(1, weight=1)
+        top = ttk.Frame(page)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(top, text="Search").pack(side="left", padx=(0, 8))
+        self.hist_filter = tk.StringVar()
+        ttk.Entry(top, textvariable=self.hist_filter).pack(side="left", fill="x", expand=True)
+        self.hist_filter.trace_add("write", lambda *_: self.refresh_history())
+        self.hist_count = ttk.Label(top, style="Muted.TLabel")
+        self.hist_count.pack(side="right", padx=(10, 0))
+        self.hist = ttk.Treeview(page, columns=("title", "format", "when", "file"), show="headings",
+                                 selectmode="extended")
+        for col, text, width, stretch in (("title", "Title", 400, True), ("format", "Format", 170, False),
+                                          ("when", "Downloaded", 150, False), ("file", "File", 64, False)):
             self.hist.heading(col, text=text, anchor="w")
             self.hist.column(col, width=width, stretch=stretch, anchor="w")
-        self.hist.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(tab, command=self.hist.yview)
-        sb.grid(row=0, column=1, sticky="ns")
+        self.hist.grid(row=1, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(page, command=self.hist.yview)
+        sb.grid(row=1, column=1, sticky="ns")
         self.hist.configure(yscrollcommand=sb.set)
         self.hist.bind("<Double-1>", lambda e: self.hist_open())
-        row = ttk.Frame(tab)
-        row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        for seq in (("<Button-2>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)):
+            self.hist.bind(seq, self._hist_menu)
+        row = ttk.Frame(page)
+        row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Button(row, text="Open file", command=self.hist_open).pack(side="left")
         ttk.Button(row, text="Show in folder", command=self.hist_reveal).pack(side="left", padx=6)
         ttk.Button(row, text="Download again", command=self.hist_again).pack(side="left")
         ttk.Button(row, text="Clear history", command=self.hist_clear).pack(side="right")
         ttk.Button(row, text="Remove", command=self.hist_remove).pack(side="right", padx=6)
 
-    def _build_log_tab(self) -> None:
-        tab = ttk.Frame(self.tabs, padding=(0, 10, 0, 0))
-        self.tabs.add(tab, text="Log")
-        tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(0, weight=1)
-        self.log_box = tk.Text(tab, wrap="none", state="disabled", relief="flat", borderwidth=0,
+    def _build_log_page(self, page) -> None:
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(1, weight=1)
+        top = ttk.Frame(page)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(top, text="Filter").pack(side="left", padx=(0, 8))
+        self.log_filter = tk.StringVar()
+        ttk.Entry(top, textvariable=self.log_filter).pack(side="left", fill="x", expand=True)
+        self.log_filter.trace_add("write", lambda *_: self._refilter_log())
+        ttk.Button(top, text="Copy", command=self.copy_log).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="Clear", command=self.clear_log).pack(side="left", padx=(6, 0))
+        self.log_box = tk.Text(page, wrap="none", state="disabled", relief="flat", borderwidth=0,
                                highlightthickness=1, padx=8, pady=8, font=self.font_small)
         self.text_widgets.append(self.log_box)
-        self.log_box.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(tab, command=self.log_box.yview)
-        sb.grid(row=0, column=1, sticky="ns")
+        self.log_box.grid(row=1, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(page, command=self.log_box.yview)
+        sb.grid(row=1, column=1, sticky="ns")
         self.log_box.configure(yscrollcommand=sb.set)
 
-    # ------------------------------------------------------------ small helpers
+    # ------------------------------------------------------------ tabs, scrolling, small helpers
 
-    def _bind_wheel(self, _e=None) -> None:
-        self.root.bind_all("<MouseWheel>", self._on_wheel)
-        self.root.bind_all("<Button-4>", self._on_wheel)
-        self.root.bind_all("<Button-5>", self._on_wheel)
+    def select_tab(self, i: int) -> None:
+        self.tabbar.select(i)
 
-    def _unbind_wheel(self, _e=None) -> None:
+    def _show_page(self, i: int) -> None:
+        for j, page in enumerate(self.pages):
+            if j == i:
+                page.grid()
+            else:
+                page.grid_remove()
+        if i == 0:
+            self.view.schedule()
+        elif i == 2:
+            self.log_box.see("end")
+
+    def _bind_wheel(self) -> None:
+        """One global wheel handler: it scrolls the queue whenever the pointer is over it (the recycled rows
+        are children of the canvas, so per-widget Enter/Leave bindings would keep switching off)."""
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            self.root.unbind_all(seq)
+            self.root.bind_all(seq, self._on_wheel, add="+")
 
     def _on_wheel(self, event) -> None:
-        if self.list_inner.winfo_reqheight() <= self.canvas.winfo_height():
+        canvas = self.view.canvas
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if widget is None or not str(widget).startswith(str(canvas)) or not canvas.winfo_ismapped():
             return
         if event.num == 4:
-            step = -2
+            step = -5
         elif event.num == 5:
-            step = 2
-        else:                                  # Windows: multiples of 120, macOS: small numbers
-            step = -int(event.delta / 120) * 2 if abs(event.delta) >= 120 else -event.delta
-        self.canvas.yview_scroll(step, "units")
+            step = 5
+        elif abs(event.delta) >= 120:          # Windows: multiples of 120
+            step = -int(event.delta / 120) * 5
+        else:                                  # macOS: small numbers, fine-grained
+            step = -event.delta
+        canvas.yview_scroll(step, "units")
 
     def _placeholder(self, show: bool) -> None:
         """Grey hint text inside the empty link field."""
         if show and not self.url_var.get():
             self.placeholder_on = True
-            self.url_var.set(self.placeholder)
+            self.url_var.set(self.placeholder_text)
             self.url_entry.configure(foreground=COLORS[getattr(self, "theme", "light")]["muted"])
         elif not show and self.placeholder_on:
             self.placeholder_on = False
             self.url_var.set("")
             self.url_entry.configure(foreground="")
+
+    def toast(self, text: str, ms: int = 3500) -> None:
+        """A short message at the bottom of the list that fades away by itself (instead of a dialog)."""
+        c = COLORS[self.theme]
+        if self.toast_job is not None:
+            self.root.after_cancel(self.toast_job)
+        self.toast_lbl.configure(text=text, background=c["toast_bg"], foreground=c["toast_fg"])
+        self.toast_lbl.place(in_=self.stack, relx=0.5, rely=1.0, y=-14, anchor="s")
+        self.toast_lbl.lift()
+        self.toast_job = self.root.after(ms, self._hide_toast)
+
+    def _hide_toast(self) -> None:
+        self.toast_job = None
+        self.toast_lbl.place_forget()
+
+    def set_notice(self, key: str, text: str, *, actions=(), busy: bool = False, dismiss: bool = True) -> None:
+        """A bar above the list for things that need attention (setup, update). One shows at a time."""
+        self.notices[key] = {"text": text, "actions": list(actions), "busy": busy, "dismiss": dismiss}
+        self._render_notice()
+
+    def clear_notice(self, key: str) -> None:
+        if self.notices.pop(key, None) is not None:
+            self._render_notice()
+
+    def _render_notice(self) -> None:
+        for child in self.notice.winfo_children():
+            child.destroy()
+        keys = [k for k in self.NOTICE_ORDER if k in self.notices and not (k == "setup" and self._setup_panel_shown)]
+        key = keys[0] if keys else None
+        if key is None:
+            self.notice.grid_remove()
+            self._update_empty()
+            return
+        n = self.notices[key]
+        self.notice.grid()
+        ttk.Label(self.notice, text=n["text"]).pack(side="left")
+        if n["busy"]:
+            bar = ttk.Progressbar(self.notice, mode="indeterminate", length=90)
+            bar.pack(side="left", padx=(12, 0))
+            bar.start(40)
+        if n["dismiss"]:
+            ttk.Button(self.notice, text="×", width=3, command=lambda: self.clear_notice(key)).pack(side="right")
+        for label, command in reversed(n["actions"]):
+            ttk.Button(self.notice, text=label, command=command).pack(side="right", padx=(0, 6))
+        self._update_empty()
 
     def open_settings(self) -> None:
         """Show the settings window (one instance)."""
@@ -1894,12 +2720,14 @@ class App:
             return
         self.settings_win = SettingsDialog(self)
 
+    # ------------------------------------------------------------ what to download
+
     def _on_kind(self) -> None:
-        self.quality_var.set(MODES["mp3" if self.kind_var.get() == "audio" else "video"])
+        self.quality_var.set(quality_label("mp3" if self.kind_var.get() == "audio" else "video"))
         self.sync_mode_options()
 
     def mode_key(self) -> str:
-        for key, label in MODES.items():
+        for key, label in UI_QUALITY.items():
             if label == self.quality_var.get():
                 return key
         return "video"
@@ -1908,9 +2736,9 @@ class App:
         """Offer the qualities of the chosen kind and grey out options without effect in audio mode."""
         kind = self.kind_var.get()
         keys = [k for k in MODES if mode_kind(k) == kind]
-        self.quality_combo.configure(values=[MODES[k] for k in keys])
+        self.quality_combo.configure(values=[quality_label(k) for k in keys])
         if self.mode_key() not in keys:
-            self.quality_var.set(MODES[keys[0]])
+            self.quality_var.set(quality_label(keys[0]))
         audio_only = self.mode_key() in AUDIO_MODES
         self.kind_var.set(mode_kind(self.mode_key()))
         self.also_combo.configure(state="disabled" if audio_only else "readonly")
@@ -1921,20 +2749,32 @@ class App:
             except tk.TclError:
                 self.subs_check = None
 
+    # ------------------------------------------------------------ the download folder
+
+    def _update_folder_label(self) -> None:
+        self.folder_var.set("Save to  " + tilde_path(Path(self.out_var.get() or DEFAULT_OUT), 30))
+
+    def set_out_dir(self, path: str) -> None:
+        self.out_var.set(path)
+        self._update_folder_label()
+        recent = [p for p in load_settings().get("recent_out", []) if p != path][:5]
+        save_settings({"out": path, "recent_out": [path, *recent][:6]})
+
     def pick_dir(self) -> None:
         d = filedialog.askdirectory(initialdir=self.out_var.get() or str(Path.home()))
         if d:
-            self.out_var.set(d)
+            self.set_out_dir(d)
 
-    def log(self, msg: str) -> None:
-        def _append():
-            self.log_box.configure(state="normal")
-            self.log_box.insert("end", str(msg) + "\n")
-            if int(self.log_box.index("end-1c").split(".")[0]) > 3000:
-                self.log_box.delete("1.0", "500.0")
-            self.log_box.see("end")
-            self.log_box.configure(state="disabled")
-        self.ui(_append)
+    def _fill_folder_menu(self) -> None:
+        menu = self.folder_menu
+        menu.delete(0, "end")
+        menu.add_command(label="Change folder …", command=self.pick_dir)
+        menu.add_command(label="Open folder", command=self.open_out_folder)
+        recent = [p for p in load_settings().get("recent_out", []) if p != self.out_var.get()][:5]
+        if recent:
+            menu.add_separator()
+            for p in recent:
+                menu.add_command(label=tilde_path(p, 60), command=lambda p=p: self.set_out_dir(p))
 
     def collect_options(self) -> dict:
         """The download settings of the main window (also what a profile stores)."""
@@ -1950,8 +2790,10 @@ class App:
     def apply_options(self, d: dict) -> None:
         mode = d.get("mode") if d.get("mode") in MODES else self.mode_key()
         self.kind_var.set(mode_kind(mode))
-        self.quality_var.set(MODES[mode])
-        self.out_var.set(d.get("out") or self.out_var.get())
+        self.quality_var.set(quality_label(mode))
+        if d.get("out"):
+            self.out_var.set(d["out"])
+            self._update_folder_label()
         self.cookie_var.set(d.get("cookies") or NO_BROWSER)
         self.also_var.set(d.get("also_audio") or ALSO_AUDIO_NONE)
         for var, key in ((self.subs_var, "subs"), (self.thumb_var, "thumb"), (self.arch_var, "archive"),
@@ -1972,13 +2814,13 @@ class App:
     def save_profile(self) -> None:
         name = self.profile_var.get().strip()
         if not name:
-            messagebox.showinfo("Profile", "Type a name for the profile first.")
+            self.toast("Type a name for the profile first")
             return
         profiles = dict(load_settings().get("profiles", {}))
         profiles[name] = self.collect_options()
         save_settings({"profiles": profiles})
         self._refresh_profile_list(profiles)
-        self.log(f"Profile '{name}' saved.")
+        self.toast(f"Profile '{name}' saved")
 
     def _refresh_profile_list(self, profiles: dict) -> None:
         if self.profile_combo is not None:
@@ -1991,6 +2833,7 @@ class App:
         d = load_settings().get("profiles", {}).get(self.profile_var.get())
         if d:
             self.apply_options(d)
+            self.toast(f"Profile '{self.profile_var.get()}' loaded")
 
     def delete_profile(self) -> None:
         name = self.profile_var.get().strip()
@@ -2056,12 +2899,19 @@ class App:
         if urls:
             self.add_urls(urls)
 
+    def _on_global_paste_menu(self) -> None:
+        urls = extract_urls(self._clipboard())
+        if urls:
+            self.add_urls(urls)
+        else:
+            self.toast("There is no link in the clipboard")
+
     def on_add(self) -> None:
         text = "" if self.placeholder_on else self.url_var.get()
         urls = extract_urls(text)
         if not urls:
             if text.strip():
-                messagebox.showinfo("Add", "That does not look like a link (it must start with http:// or https://).")
+                self.toast("That does not look like a link - it must start with http:// or https://")
             return
         self.url_var.set("")
         self.add_urls(urls)
@@ -2078,49 +2928,60 @@ class App:
     # ------------------------------------------------------------ queue
 
     def add_urls(self, urls: list[str]) -> None:
-        self.tabs.select(0)
-        known = {it.url for it in self.items if it.active}
+        self.select_tab(0)
+        known = {it.url for it in self.items if it.active or it.status == "paused"}
         no_playlist, cookies = self.single_var.get(), self.cookies()   # Tk variables: main thread only
+        added, dup, first = 0, 0, None
         for url in urls:
             if url in known:
+                dup += 1
                 continue
             known.add(url)
             item = Item(url)
-            self._add_card(item)
-            threading.Thread(target=self._info_worker, args=(item, no_playlist, cookies), daemon=True).start()
+            self.items.append(item)
+            first = first or item
+            self.jobs.submit(0, self._info_job, item, no_playlist, cookies)
+            added += 1
+        self._items_changed()
+        if first is not None:
+            self.view.scroll_to(self.items[-1] if added == 1 else first)
+        if dup and not added:
+            self.toast("Already in the queue" if dup == 1 else f"{dup} links are already in the queue")
+        elif added > 1 or dup:
+            self.toast(f"Added {added} links" + (f" ({dup} already in the queue)" if dup else ""))
+
+    def _items_changed(self) -> None:
+        """The list of items changed (added, removed, moved): drop stale selection, redraw, update counters."""
+        ids = {it.id for it in self.items}
+        self.selected &= ids
+        if self.anchor not in ids:
+            self.anchor = None
+        if self.cursor not in ids:
+            self.cursor = None
+        self.view.layout()
         self.update_state()
 
-    def _add_card(self, item: Item) -> None:
-        self.items.append(item)
-        item.card = Card(self, item)
-        item.card.frame.pack(fill="x", pady=(0, 8), padx=(0, 4))
-        item.card.set_thumb()
-        self.update_state()
-
-    def _info_worker(self, item: Item, no_playlist: bool, cookies: str) -> None:
-        with self.info_slots:
-            if item.removed:
-                return
-            if find_ytdlp() is None:
-                info = None
-                for _ in range(60):            # first start: the tools are still being downloaded
-                    time.sleep(1)
-                    if find_ytdlp() is not None or item.removed:
-                        break
-                if find_ytdlp() is not None and not item.removed:
-                    info = fetch_info(item.url, no_playlist=no_playlist, cookies_browser=cookies)
-            else:
-                info = fetch_info(item.url, no_playlist=no_playlist, cookies_browser=cookies)
-            thumb = fetch_thumbnail(info["thumbnail"]) if info and not info["is_playlist"] else None
+    def _info_job(self, item: Item, no_playlist: bool, cookies: str) -> None:
+        """Worker thread: title, channel, duration and thumbnail of a new link."""
+        if item.removed:
+            return
+        if find_ytdlp() is None:
+            self.tools_ready.wait(timeout=180)             # first start: the tools are still being downloaded
+        info = None
+        if find_ytdlp() is not None and not item.removed:
+            info = fetch_info(item.url, no_playlist=no_playlist, cookies_browser=cookies)
+        thumb = fetch_thumbnail(info["thumbnail"]) if info and not info["is_playlist"] else None
         self.ui(lambda: self._info_done(item, info, thumb))
 
     def _info_done(self, item: Item, info: dict | None, thumb) -> None:
         if item.removed:
             return
         if info and info["is_playlist"] and info["entries"]:
-            self._remove_card(item)
+            at = self.items.index(item)
+            self._drop([item])
             chosen = self._pick_playlist(info)
             if chosen:
+                subs = []
                 for e in chosen:
                     sub = Item(e["url"])
                     sub.title = e["title"]
@@ -2128,36 +2989,44 @@ class App:
                     sub.duration = e.get("duration")
                     sub.status = "queued"
                     sub.thumb_url = e.get("thumbnail", "")
-                    self._add_card(sub)
-                    threading.Thread(target=self._thumb_worker, args=(sub, e.get("thumbnail", "")),
-                                     daemon=True).start()
+                    subs.append(sub)
+                self.items[at:at] = subs                   # where the placeholder was
                 self.log(f"Playlist '{info['title']}': {len(chosen)} videos added.")
-            self.update_state()
+            self._items_changed()
             self._autostart()
             return
         if info:
             item.title = info["title"] or item.url
             item.uploader = info["uploader"]
             item.duration = info["duration"]
-            item.thumb = thumb
             item.thumb_url = info["thumbnail"]
+            item.thumb = thumb
+            item.thumb_state = "done" if thumb is not None else "failed"
         else:
             item.uploader = "No preview available - will still try to download"
         item.status = "queued"
-        item.card.set_thumb()
-        item.card.refresh()
+        self.view.touch(item)
         self.update_state()
         self._autostart()
 
-    def _thumb_worker(self, item: Item, url: str) -> None:
-        with self.info_slots:
-            img = fetch_thumbnail(url)
-        if img is not None:
-            def apply():
-                if not item.removed and item.card:
-                    item.thumb = img
-                    item.card.set_thumb()
-            self.ui(apply)
+    def request_thumb(self, item: Item) -> None:
+        """Called when a row shows an item: load its thumbnail if it does not have one yet."""
+        if item.thumb is not None or item.thumb_state is not None or not item.thumb_url or Image is None:
+            return
+        item.thumb_state = "loading"
+        self.jobs.submit(1, self._thumb_job, item)
+
+    def _thumb_job(self, item: Item) -> None:
+        if item.removed:
+            return
+        img = fetch_thumbnail(item.thumb_url)
+
+        def apply() -> None:
+            item.thumb_state = "done" if img is not None else "failed"
+            if img is not None and not item.removed:
+                item.thumb = img
+                self.view.touch(item)
+        self.ui(apply)
 
     def _pick_playlist(self, info: dict) -> list[dict] | None:
         if len(info["entries"]) == 1:
@@ -2170,30 +3039,228 @@ class App:
         if self.auto_var.get() and any(it.status == "queued" for it in self.items):
             self.start_all()
 
-    def _remove_card(self, item: Item) -> None:
-        item.removed = True
-        item.stop.set()
-        if item in self.items:
-            self.items.remove(item)
-        if item.card:
-            item.card.frame.destroy()
-            item.card = None
+    # -- selection and keyboard
 
-    def remove_item(self, item: Item) -> None:
-        self._remove_card(item)
-        self.update_state()
+    def selected_items(self) -> list[Item]:
+        return [it for it in self.items if it.id in self.selected]
+
+    def row_click(self, item: Item, event) -> None:
+        self.view.canvas.focus_set()
+        shift = bool(event.state & 0x1)
+        toggle = bool(event.state & (0x8 if IS_MAC else 0x4))         # Command on macOS, Control elsewhere
+        if shift and self.anchor is not None and any(it.id == self.anchor for it in self.items):
+            self._select_range(self.anchor, item.id)
+        elif toggle:
+            self.selected ^= {item.id}
+            self.anchor = item.id
+        else:
+            self.selected = {item.id}
+            self.anchor = item.id
+        self.cursor = item.id
+        self.view.refresh_rows()
+
+    def _select_range(self, a: int, b: int) -> None:
+        ids = [it.id for it in self.items]
+        i, j = sorted((ids.index(a), ids.index(b)))
+        self.selected = set(ids[i:j + 1])
+
+    def _cursor_index(self) -> int:
+        for i, it in enumerate(self.items):
+            if it.id == self.cursor:
+                return i
+        return -1
+
+    def key_move(self, delta: int, extend: bool = False) -> str:
+        """Up/Down (with Shift: extend the selection); Home/End jump to the ends."""
+        if not self.items:
+            return "break"
+        cur = self._cursor_index()
+        if abs(delta) > 1:
+            i = 0 if delta < 0 else len(self.items) - 1
+        else:
+            i = 0 if cur < 0 else min(max(cur + delta, 0), len(self.items) - 1)
+        item = self.items[i]
+        if extend and self.anchor is not None and any(it.id == self.anchor for it in self.items):
+            self._select_range(self.anchor, item.id)
+        else:
+            self.selected = {item.id}
+            self.anchor = item.id
+        self.cursor = item.id
+        self.view.scroll_to(item)
+        self.view.refresh_rows()
+        return "break"
+
+    def select_all(self) -> None:
+        self.selected = {it.id for it in self.items}
+        self.view.refresh_rows()
+
+    def clear_selection(self) -> None:
+        self.selected = set()
+        self.view.refresh_rows()
+
+    def key_activate(self) -> str:
+        targets = self.selected_items()
+        if len(targets) == 1:
+            self.card_activate(targets[0])
+        return "break"
+
+    def key_remove(self) -> str:
+        targets = self.selected_items()
+        if targets:
+            self.remove_items(targets)
+        return "break"
+
+    def move_selected(self, delta: int) -> None:
+        """Move the selected items up (-1) or down (+1) - downloads start in list order."""
+        ids = self.selected
+        if not ids:
+            return
+        order = range(len(self.items)) if delta < 0 else range(len(self.items) - 1, -1, -1)
+        for i in order:
+            j = i + delta
+            if self.items[i].id in ids and 0 <= j < len(self.items) and self.items[j].id not in ids:
+                self.items[i], self.items[j] = self.items[j], self.items[i]
+        self._items_changed()
+        if self.cursor is not None:
+            cur = next((it for it in self.items if it.id == self.cursor), None)
+            if cur is not None:
+                self.view.scroll_to(cur)
+
+    # -- actions on items
+
+    def _drop(self, items: list[Item]) -> None:
+        for item in items:
+            item.removed = True
+            item.stop.set()
+            if item in self.items:
+                self.items.remove(item)
+
+    def remove_items(self, items: list[Item]) -> None:
+        self._drop(items)
+        self._items_changed()
         self.pump()
 
-    def cancel_item(self, item: Item) -> None:
-        item.stop.set()
+    def remove_item(self, item: Item) -> None:
+        self.remove_items([item])
 
-    def retry_item(self, item: Item) -> None:
+    def cancel_item(self, item: Item) -> None:
+        if item.status == "paused":            # nothing is running: just drop the hold (the partial data stays)
+            item.status = "cancelled"
+            self.view.touch(item)
+            self.update_state()
+        else:
+            item.stop.set()
+
+    def pause_item(self, item: Item) -> None:
+        """Stop the download but keep what has been downloaded: 'Resume' continues from there."""
+        if item.status == "downloading" and not item.pause_requested:
+            item.pause_requested = True
+            item.stop.set()                    # the card turns to 'Paused' when the process has ended
+            self.view.touch(item)
+
+    def resume_item(self, item: Item) -> None:
+        if item.status != "paused":
+            return
+        item.stop = threading.Event()
+        item.pause_requested = False
+        item.status = "queued"
+        item.retry_at = 0.0
+        self.view.touch(item)
+        self.start_item(item)
+
+    def pause_all(self) -> None:
+        """Pause everything that is running and hold the rest of the queue until 'Resume all'."""
+        self.running = False
+        for it in self.items:
+            self.pause_item(it)
+        self.update_state()
+
+    stop_all = pause_all                       # the old name
+
+    def cancel_running(self) -> None:
+        self.running = False
+        for it in self.items:
+            if it.status == "downloading":
+                it.stop.set()
+        self.update_state()
+
+    def start_over(self, items: list[Item]) -> None:
+        """Delete the partial data and download again from the beginning."""
+        freed = 0
+        todo = [it for it in items if it.status in ("paused", "failed", "cancelled")]
+        for it in todo:
+            freed += discard_partial(it.dests)
+            it.dests, it.interrupted, it.resumed = [], False, False
+            self._reset(it)
+        if todo:
+            self.toast(f"Deleted {fmt_size(freed)} of partial data" if freed else "Starting over")
+            self.update_state()
+            self.start_all()
+
+    def toggle_pause(self) -> str:
+        """Space: pause what is running in the selection, resume what is paused."""
+        targets = self.selected_items()
+        for it in targets:
+            if it.status == "downloading":
+                self.pause_item(it)
+            elif it.status == "paused":
+                self.resume_item(it)
+        return "break"
+
+    def _ensure_retry_tick(self) -> None:
+        if self._retry_job is None:
+            self._retry_job = self.root.after(1000, self._retry_tick)
+
+    def _retry_tick(self) -> None:
+        """Once a second while an automatic retry is pending: update the countdown, start it when due."""
+        self._retry_job = None
+        now = time.time()
+        waiting = [it for it in self.items if it.status == "queued" and it.retry_at]
+        for it in waiting:
+            self.view.touch(it)
+        if any(it.retry_at <= now for it in waiting):
+            self.pump()
+        if waiting:
+            self._ensure_retry_tick()
+
+    def _reset(self, item: Item) -> None:
         item.stop = threading.Event()
         item.status, item.pct, item.error = "queued", 0.0, ""
         item.speed = item.eta = item.size = ""
-        item.card.refresh()
-        self.update_state()
-        self.start_all()
+        item.retries, item.retry_at, item.pause_requested = 0, 0.0, False
+        self.view.touch(item)
+
+    def retry_item(self, item: Item) -> None:
+        self.retry_items([item])
+
+    def retry_items(self, items: list[Item]) -> None:
+        todo = [it for it in items if it.status in ("failed", "cancelled")]
+        for it in todo:
+            self._reset(it)
+        if todo:
+            self.update_state()
+            self.start_all()
+
+    def retry_failed(self) -> None:
+        self.retry_items([it for it in self.items if it.status == "failed"])
+
+    def update_and_retry(self, items: list[Item]) -> None:
+        self.on_update_ytdlp(after=lambda: self.retry_items(items))
+
+    def start_item(self, item: Item) -> None:
+        """Start one waiting item right now (even if 'Download all' has not been pressed)."""
+        if item.status != "queued":
+            return
+        if self.tools_busy:
+            self.toast("yt-dlp is being set up - try again in a moment")
+            return
+        if not self.running:
+            self.batch = {"ok": 0, "bad": 0}
+            self.batch_ids = set()
+        self.running = True
+        self.batch_ids.add(item.id)
+        self._launch(item)
+        self.pump()
 
     def show_item(self, item: Item) -> None:
         if item.path and Path(item.path).exists():
@@ -2203,12 +3270,11 @@ class App:
 
     def open_item_options(self, item: Item) -> None:
         if item.status == "downloading":
-            messagebox.showinfo("Options", "Cancel the download first to change its options.")
+            self.toast("Cancel the download first to change its options")
             return
         dialog = ItemDialog(self, item)
         self.root.wait_window(dialog)
-        if item.card:
-            item.card.refresh()
+        self.view.touch(item)
         self.update_state()
 
     def card_activate(self, item: Item) -> None:
@@ -2219,63 +3285,105 @@ class App:
         elif item.status != "downloading":
             self.open_item_options(item)
 
-    def copy_link(self, item: Item) -> None:
+    def copy_links(self, items: list[Item]) -> None:
         self.root.clipboard_clear()
-        self.root.clipboard_append(item.url)
+        self.root.clipboard_append("\n".join(it.url for it in items))
+        self.toast("Link copied" if len(items) == 1 else f"{len(items)} links copied")
 
-    def card_menu(self, item: Item, event) -> None:
+    def card_menu(self, item: Item, event, anchor=None) -> None:
+        """The menu of a row (right click or the '…' button). It works on the whole selection."""
+        if item.id not in self.selected:
+            self.selected, self.anchor, self.cursor = {item.id}, item.id, item.id
+            self.view.refresh_rows()
+        targets = self.selected_items() or [item]
         menu = tk.Menu(self.root, tearoff=0)
-        st = item.status
-        if st in ("queued", "failed", "cancelled"):
-            menu.add_command(label="Options …", command=lambda: self.open_item_options(item))
-        if st == "downloading":
-            menu.add_command(label="Cancel", command=lambda: self.cancel_item(item))
-        if st in ("failed", "cancelled"):
-            menu.add_command(label="Retry", command=lambda: self.retry_item(item))
-        if st in ("done", "skipped"):
-            if item.path and Path(item.path).exists():
-                menu.add_command(label="Open file", command=lambda: open_path(Path(item.path)))
-            menu.add_command(label="Show in folder", command=lambda: self.show_item(item))
+        if len(targets) == 1:
+            st = item.status
+            if st in ("queued", "failed", "cancelled"):
+                menu.add_command(label="Options …", command=lambda: self.open_item_options(item))
+            if st == "queued":
+                menu.add_command(label="Download now", command=lambda: self.start_item(item))
+            if st == "downloading":
+                menu.add_command(label="Pause", command=lambda: self.pause_item(item))
+                menu.add_command(label="Cancel", command=lambda: self.cancel_item(item))
+            if st == "paused":
+                menu.add_command(label="Resume", command=lambda: self.resume_item(item))
+                menu.add_command(label="Cancel", command=lambda: self.cancel_item(item))
+            if st in ("failed", "cancelled"):
+                menu.add_command(label="Retry (continues where it stopped)", command=lambda: self.retry_item(item))
+            if st in ("paused", "failed", "cancelled") and partial_size(item.dests):
+                menu.add_command(label=f"Start over (delete {fmt_size(partial_size(item.dests))} partial data)",
+                                 command=lambda: self.start_over([item]))
+            if st == "failed" and suggests_update(item.error):
+                menu.add_command(label="Update yt-dlp, then retry", command=lambda: self.update_and_retry([item]))
+            if st in ("done", "skipped"):
+                if item.path and Path(item.path).exists():
+                    menu.add_command(label="Open file", command=lambda: open_path(Path(item.path)))
+                menu.add_command(label="Show in folder", command=lambda: self.show_item(item))
+            menu.add_separator()
+            menu.add_command(label="Copy link", command=lambda: self.copy_links([item]))
+            menu.add_command(label="Open link in browser", command=lambda: webbrowser.open(item.url))
+            if item.error and st == "failed":
+                menu.add_command(label="Copy error message", command=lambda: (
+                    self.root.clipboard_clear(), self.root.clipboard_append(item.error)))
+        else:
+            failed = [it for it in targets if it.status in ("failed", "cancelled")]
+            running = [it for it in targets if it.status == "downloading"]
+            paused = [it for it in targets if it.status == "paused"]
+            if failed:
+                menu.add_command(label=f"Retry {len(failed)}", command=lambda: self.retry_items(failed))
+            if running:
+                menu.add_command(label=f"Pause {len(running)}", command=lambda: [self.pause_item(it) for it in running])
+                menu.add_command(label=f"Cancel {len(running)}",
+                                 command=lambda: [self.cancel_item(it) for it in running])
+            if paused:
+                menu.add_command(label=f"Resume {len(paused)}", command=lambda: [self.resume_item(it) for it in paused])
+            menu.add_command(label=f"Copy {len(targets)} links", command=lambda: self.copy_links(targets))
         menu.add_separator()
-        menu.add_command(label="Copy link", command=lambda: self.copy_link(item))
-        menu.add_command(label="Open link in browser", command=lambda: webbrowser.open(item.url))
-        if item.error and st == "failed":
-            menu.add_command(label="Copy error message", command=lambda: (
-                self.root.clipboard_clear(), self.root.clipboard_append(item.error)))
+        menu.add_command(label="Move up", command=lambda: self.move_selected(-1))
+        menu.add_command(label="Move down", command=lambda: self.move_selected(1))
         menu.add_separator()
-        menu.add_command(label="Remove", command=lambda: self.remove_item(item))
+        menu.add_command(label="Remove" if len(targets) == 1 else f"Remove {len(targets)} items",
+                         command=lambda: self.remove_items(targets))
+        if anchor is not None:
+            x, y = anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height()
+        else:
+            x, y = event.x_root, event.y_root
         try:
-            menu.tk_popup(event.x_root, event.y_root)
+            menu.tk_popup(x, y)
         finally:
             menu.grab_release()
 
     def clear_finished(self) -> None:
-        for item in [it for it in self.items if it.finished]:
-            self._remove_card(item)
-        self.update_state()
+        self._drop([it for it in self.items if it.finished])
+        self._items_changed()
 
     def start_all(self) -> None:
         if not self.running:
             self.batch = {"ok": 0, "bad": 0}
+            self.batch_ids = set()
         self.running = True
+        for it in self.items:                  # 'Download all' also resumes paused items and skips retry waits
+            if it.status == "paused":
+                it.stop = threading.Event()
+                it.pause_requested = False
+                it.status = "queued"
+            if it.status == "queued":
+                it.retry_at = 0.0
+                self.view.touch(it)
+        self.batch_ids |= {it.id for it in self.items if it.status in ("queued", "downloading")}
         self.save_options()
         self.pump()
-
-    def stop_all(self) -> None:
-        self.running = False
-        for it in self.items:
-            if it.status == "downloading":
-                it.stop.set()
-        self.update_state()
 
     def pump(self) -> None:
         """Start waiting downloads while there is a free slot; finish the batch when nothing is left."""
         if self.running and not self.tools_busy:
             active = sum(1 for it in self.items if it.status == "downloading")
+            now = time.time()
             for it in self.items:
                 if active >= self.parallel():
                     break
-                if it.status == "queued":
+                if it.status == "queued" and it.retry_at <= now:
                     self._launch(it)
                     active += 1
             if not any(it.active for it in self.items):
@@ -2309,10 +3417,24 @@ class App:
                 opts[key] = ov[key]
         if ov.get("extra"):
             opts["args"] = (opts["args"] + " " + ov["extra"]).strip()
-        item.status, item.pct, item.mode = "downloading", 0.0, opts["mode"]
+        if item.interrupted:
+            self._repair_partial(item)
+        item.status, item.mode = "downloading", opts["mode"]
+        if not item.dests:                     # fresh start; with partial data yt-dlp continues and reports real progress
+            item.pct = 0.0
         item.speed = item.eta = item.size = item.error = ""
-        item.card.refresh()
+        item.retry_at, item.resumed, item.pause_requested = 0.0, False, False
+        self.batch_ids.add(item.id)
+        self.view.touch(item)
         threading.Thread(target=self._download_worker, args=(item, opts), daemon=True).start()
+
+    def _repair_partial(self, item: Item) -> None:
+        """The last run ended uncleanly: fetch the end of the partial files again instead of trusting it."""
+        item.interrupted = False
+        cut = trim_partial_tail(item.dests)
+        if cut:
+            self.log(f"[{shorten(item.title, 28)}] Interrupted earlier - re-fetching the last "
+                     f"{fmt_size(cut)} of the partial file to be safe.")
 
     def _download_worker(self, item: Item, o: dict) -> None:
         audio = o["mode"] in AUDIO_MODES
@@ -2328,11 +3450,12 @@ class App:
                           split_chapters=o["split"], proxy=o["proxy"], name_template=o["name"],
                           extra=extra)
         found: dict = {}
-        state = {"skipped": False, "last": 0.0}
+        state = {"skipped": False, "last": 0.0, "error_open": False}
 
         def refresh_card() -> None:
-            if not item.removed and item.card:
-                item.card.refresh()
+            if not item.removed:
+                self.view.touch(item)
+                self._update_title()
 
         def on_line(line: str) -> None:
             prog = parse_progress(line)
@@ -2345,13 +3468,25 @@ class App:
                     self.ui(refresh_card)
                 return
             track_output_file(found, line, audio)
-            if item.title == item.url and DEST_RE.match(line.strip()):
-                item.title = INTERMEDIATE_RE.sub("", Path(DEST_RE.match(line.strip()).group("path")).name)
+            dest = DEST_RE.match(line.strip())
+            if dest:
+                if dest.group("path") not in item.dests:
+                    item.dests.append(dest.group("path"))
+                    self.ui(self._schedule_queue_save)
+                if item.title == item.url:
+                    item.title = INTERMEDIATE_RE.sub("", Path(dest.group("path")).name)
+                    self.ui(refresh_card)
+            if RESUME_RE.search(line):
+                item.resumed = True
                 self.ui(refresh_card)
             if ARCHIVED_RE.search(line):
                 state["skipped"] = True
             if line.startswith("ERROR"):
-                item.error = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", line)
+                item.error = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", line).strip()
+                state["error_open"] = not item.error           # yt-dlp sometimes puts the message on the next line
+            elif line.strip() and (state.get("error_open") or ("giving up after" in line.lower() and not item.error)):
+                item.error = re.sub(r"^\[[^\]]+\]\s*", "", line.strip())
+                state["error_open"] = False
             self.log(f"[{shorten(item.title, 28)}] {line}" if line.strip() else "")
 
         rc = 1
@@ -2388,61 +3523,97 @@ class App:
                     item.size = item.size.lstrip("~")
                 self._add_history(item)
             self.batch["ok"] += 1
+            item.retries = 0
         elif rc == -1:
-            item.status = "cancelled"
+            item.status = "paused" if item.pause_requested else "cancelled"
+            item.pause_requested = False
         else:
-            item.status = "failed"
-            self.batch["bad"] += 1
-        item.card.refresh()
+            delay = self._auto_retry_delay(item)
+            if delay is None:
+                item.status = "failed"
+                self.batch["bad"] += 1
+            else:                              # network trouble: wait a little, then continue where it stopped
+                item.status = "queued"
+                item.retry_at = time.time() + delay
+                self.log(f"[{shorten(item.title, 28)}] Network problem - retrying in {delay} s "
+                         f"(attempt {item.retries} of {len(AUTO_RETRY_DELAYS)}).")
+                self._ensure_retry_tick()
+        self.view.touch(item)
         self.pump()
+
+    def _auto_retry_delay(self, item: Item) -> "int | None":
+        """Seconds until the next automatic retry, or None if the error is not worth one (or they are used up)."""
+        if not is_transient_error(item.error) or item.retries >= len(AUTO_RETRY_DELAYS):
+            return None
+        delay = AUTO_RETRY_DELAYS[item.retries]
+        item.retries += 1
+        return delay
 
     # ------------------------------------------------------------ state display
 
     def update_state(self) -> None:
         counts = {s: 0 for s in STATUS_ORDER}
+        speed = 0.0
         for it in self.items:
             counts[it.status] += 1
-        waiting = counts["queued"] + counts["fetching"]
-        parts = []
-        if counts["downloading"]:
-            parts.append(f"{counts['downloading']} downloading")
-        if waiting:
-            parts.append(f"{waiting} waiting")
-        if counts["done"] + counts["skipped"]:
-            parts.append(f"{counts['done'] + counts['skipped']} done")
-        if counts["failed"]:
-            parts.append(f"{counts['failed']} failed")
-        self.summary.configure(text="  ·  ".join(parts))
-        self.tabs.tab(0, text=f"Queue ({len(self.items)})" if self.items else "Queue")
+            if it.status == "downloading":
+                speed += parse_speed(it.speed)
+        self.tabbar.set_summary(summary_options(counts, speed))
+        self.tabbar.set_text(0, f"Queue ({len(self.items)})" if self.items else "Queue")
 
-        can_start = counts["queued"] > 0 and not self.tools_busy
-        self.start_btn.configure(state="normal" if can_start and not (self.running and not counts["queued"])
-                                 else "disabled")
-        self.start_btn.configure(text=f"Download all ({counts['queued']})" if counts["queued"] else "Download all")
-        self.stop_btn.configure(state="normal" if counts["downloading"] or self.running else "disabled")
-        self.update_btn.configure(state="disabled" if counts["downloading"] or self.tools_busy else "normal")
-
-        if self.items:
-            self.empty_lbl.place_forget()
+        startable = counts["queued"] + counts["paused"]
+        self.start_btn.configure(
+            state="normal" if startable and not self.tools_busy else "disabled",
+            text=(("Resume all" if counts["paused"] else "Download all") + (f" ({startable})" if startable else "")))
+        if any(it.finished for it in self.items):
+            self.clear_btn.grid()
         else:
-            self.empty_lbl.place(relx=0.5, rely=0.42, anchor="center")
+            self.clear_btn.grid_remove()
+        if counts["downloading"] or self.running:
+            self.stop_btn.grid()
+        else:
+            self.stop_btn.grid_remove()
+        self._update_empty()
+        self._update_title()
         if self.restored:                      # not before the old queue is back, or it would be overwritten
-            self._save_queue()
+            self._schedule_queue_save()
+
+    def _update_title(self) -> None:
+        """While downloading, the window title shows the overall progress (visible in the task bar / Dock)."""
+        batch = [it for it in self.items if it.id in self.batch_ids and it.status != "cancelled"]
+        if self.running and batch:
+            done = sum(100.0 if it.status in ("done", "skipped", "failed") else it.pct for it in batch)
+            title = f"{done / len(batch):.0f}%  ·  {self.base_title}"
+        else:
+            title = self.base_title
+        if self.root.title() != title:
+            self.root.title(title)
 
     # ------------------------------------------------------------ queue on disk, clipboard watcher
 
+    def _schedule_queue_save(self) -> None:
+        if self.save_job is None:
+            self.save_job = self.root.after(400, self._save_queue)
+
     def _save_queue(self) -> None:
         """Keep everything that is not finished successfully, so a restart does not lose the queue."""
+        self.save_job = None
         keep = []
         for it in self.items:
             if it.status in ("done", "skipped"):
                 continue
+            # a download that is running when this is written counts as interrupted if the app never gets to
+            # save it as paused (crash, power loss): the next start repairs its partial files before resuming
+            status = "paused" if it.status in ("downloading", "paused") else (
+                it.status if it.status in ("failed", "cancelled") else "queued")
             keep.append({"url": it.url, "title": it.title, "uploader": it.uploader, "duration": it.duration,
-                         "thumb_url": it.thumb_url, "overrides": it.overrides,
-                         "status": it.status if it.status in ("failed", "cancelled") else "queued"})
+                         "thumb_url": it.thumb_url, "overrides": it.overrides, "status": status,
+                         "pct": it.pct, "size": it.size, "dests": it.dests,
+                         "interrupted": it.status == "downloading" or it.interrupted})
         save_queue(keep)
 
     def _restore_queue(self) -> None:
+        no_playlist, cookies = self.single_var.get(), self.cookies()
         for d in load_queue():
             item = Item(d["url"])
             item.title = d.get("title") or item.url
@@ -2450,25 +3621,31 @@ class App:
             item.duration = d.get("duration")
             item.thumb_url = d.get("thumb_url") or ""
             item.overrides = d.get("overrides") if isinstance(d.get("overrides"), dict) else {}
-            item.status = d.get("status") if d.get("status") in ("failed", "cancelled") else "queued"
+            item.status = d.get("status") if d.get("status") in ("failed", "cancelled", "paused") else "queued"
+            item.pct = float(d.get("pct") or 0)
+            item.size = str(d.get("size") or "")
+            item.dests = [str(x) for x in d.get("dests") or []]
+            item.interrupted = bool(d.get("interrupted"))
             if item.title == item.url and item.status == "queued":       # never got its preview
                 item.status = "fetching"
-                threading.Thread(target=self._info_worker, args=(item, self.single_var.get(), self.cookies()),
-                                 daemon=True).start()
-            self._add_card(item)
-            if item.thumb_url:
-                threading.Thread(target=self._thumb_worker, args=(item, item.thumb_url), daemon=True).start()
+                self.jobs.submit(0, self._info_job, item, no_playlist, cookies)
+            self.items.append(item)
         self.restored = True
         if self.items:
             self.log(f"{len(self.items)} item(s) restored from the last session.")
-        self.update_state()
+        self._items_changed()
+        paused = sum(1 for it in self.items if it.status == "paused")
+        if paused:
+            self.set_notice("restore", f"{paused} download{'s were' if paused > 1 else ' was'} paused when the app "
+                                       "was closed. They continue where they stopped.",
+                            actions=[("Resume all", lambda: (self.clear_notice("restore"), self.start_all()))])
 
     def _clip_watch_toggled(self) -> None:
         if self.clip_watch_var.get():          # what is in the clipboard right now is not "new"
             self.watch_last = self._clipboard().strip()
 
     def _watch_clipboard(self) -> None:
-        """While enabled in the options, every new link copied anywhere is added to the queue."""
+        """While enabled in the settings, every new link copied anywhere is added to the queue."""
         try:
             if self.clip_watch_var.get():
                 clip = self._clipboard().strip()
@@ -2495,28 +3672,60 @@ class App:
 
     def refresh_history(self) -> None:
         self.hist.delete(*self.hist.get_children())
+        needle = self.hist_filter.get().strip().lower()
+        shown = 0
         for i in range(len(self.history) - 1, -1, -1):
             h = self.history[i]
+            if needle and needle not in (h.get("title", "") + " " + h.get("url", "")).lower():
+                continue
             missing = bool(h.get("path")) and not Path(h["path"]).exists()
-            when = time.strftime("%Y-%m-%d  %H:%M", time.localtime(h.get("time", 0)))
-            title = h.get("title", "") + ("   (file missing)" if missing else "")
-            self.hist.insert("", "end", iid=str(i), values=(title, MODES.get(h.get("mode", ""), ""), when),
-                             tags=("missing",) if missing else ())
+            self.hist.insert("", "end", iid=str(i), tags=("missing",) if missing else (),
+                             values=(h.get("title", ""), mode_label(h.get("mode", "")),
+                                     humanize_when(h.get("time", 0)), "missing" if missing else "✓"))
+            shown += 1
+        total = len(self.history)
+        self.hist_count.configure(text=(f"{shown} of {total}" if needle else f"{total} downloads") if total else "")
         self._history_tags()
 
     def _selected_history(self) -> list[dict]:
         return [self.history[int(i)] for i in self.hist.selection()]
+
+    def _hist_menu(self, event) -> None:
+        row = self.hist.identify_row(event.y)
+        if row and row not in self.hist.selection():
+            self.hist.selection_set(row)
+        if not self.hist.selection():
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Open file", command=self.hist_open)
+        menu.add_command(label="Show in folder", command=self.hist_reveal)
+        menu.add_separator()
+        menu.add_command(label="Copy link", command=self.hist_copy)
+        menu.add_command(label="Download again", command=self.hist_again)
+        menu.add_separator()
+        menu.add_command(label="Remove from history", command=self.hist_remove)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def hist_open(self) -> None:
         for h in self._selected_history()[:1]:
             if h.get("path") and Path(h["path"]).exists():
                 open_path(Path(h["path"]))
             else:
-                messagebox.showinfo("History", "The file no longer exists at its old location.")
+                self.toast("The file is no longer at its old location")
 
     def hist_reveal(self) -> None:
         for h in self._selected_history()[:1]:
             reveal_file(Path(h["path"])) if h.get("path") else None
+
+    def hist_copy(self) -> None:
+        urls = [h["url"] for h in self._selected_history() if h.get("url")]
+        if urls:
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(urls))
+            self.toast("Link copied" if len(urls) == 1 else f"{len(urls)} links copied")
 
     def hist_again(self) -> None:
         self.add_urls([h["url"] for h in self._selected_history() if h.get("url")])
@@ -2534,11 +3743,50 @@ class App:
             save_history(self.history)
             self.refresh_history()
 
+    # ------------------------------------------------------------ log
+
+    def log(self, msg: str) -> None:
+        def _append() -> None:
+            line = str(msg)
+            self.log_lines.append(line)
+            needle = self.log_filter.get().strip().lower()
+            if needle and needle not in line.lower():
+                return
+            at_end = self.log_box.yview()[1] >= 0.999                  # do not yank the view while reading
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", line + "\n")
+            if int(self.log_box.index("end-1c").split(".")[0]) > 3000:
+                self.log_box.delete("1.0", "500.0")
+            if at_end:
+                self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+        self.ui(_append)
+
+    def _refilter_log(self) -> None:
+        needle = self.log_filter.get().strip().lower()
+        lines = [ln for ln in self.log_lines if not needle or needle in ln.lower()]
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.insert("end", "\n".join(lines) + ("\n" if lines else ""))
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def copy_log(self) -> None:
+        needle = self.log_filter.get().strip().lower()
+        text = "\n".join(ln for ln in self.log_lines if not needle or needle in ln.lower())
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.toast("Log copied to the clipboard")
+
+    def clear_log(self) -> None:
+        self.log_lines.clear()
+        self._refilter_log()
+
     # ------------------------------------------------------------ menu bar, quitting
 
     def _build_menu(self) -> None:
         """Native menu bar: at the top of the screen on macOS, inside the window on Windows/Linux."""
-        root, mac = self.root, sys.platform == "darwin"
+        root, mac = self.root, IS_MAC
         mod = "Command" if mac else "Control"
         acc = (lambda key: f"⌘{key}") if mac else (lambda key: f"Ctrl+{key}")
         bar = tk.Menu(root, tearoff=0)
@@ -2563,10 +3811,18 @@ class App:
         bar.add_cascade(label="File", menu=file_menu)
 
         queue_menu = tk.Menu(bar, tearoff=0)
-        queue_menu.add_command(label="Download all", accelerator=acc("Return") if not mac else "⌘↩",
+        queue_menu.add_command(label="Download / resume all", accelerator=acc("Return") if not mac else "⌘↩",
                                command=self.start_all)
-        queue_menu.add_command(label="Stop", accelerator=acc("."), command=self.stop_all)
+        queue_menu.add_command(label="Pause all", accelerator=acc("."), command=self.pause_all)
+        queue_menu.add_command(label="Cancel running", command=self.cancel_running)
         queue_menu.add_command(label="Retry failed", command=self.retry_failed)
+        queue_menu.add_separator()
+        queue_menu.add_command(label="Select all", accelerator=acc("A"), command=self.select_all)
+        queue_menu.add_command(label="Remove selected", accelerator="Delete", command=self.key_remove)
+        queue_menu.add_command(label="Move up", accelerator="Alt+↑" if not mac else "⌥↑",
+                               command=lambda: self.move_selected(-1))
+        queue_menu.add_command(label="Move down", accelerator="Alt+↓" if not mac else "⌥↓",
+                               command=lambda: self.move_selected(1))
         queue_menu.add_separator()
         queue_menu.add_command(label="Clear finished", command=self.clear_finished)
         bar.add_cascade(label="Queue", menu=queue_menu)
@@ -2579,7 +3835,7 @@ class App:
         view_menu.add_command(label="Settings …", accelerator=acc(","), command=self.open_settings)
         for i, name in enumerate(("Queue", "History", "Log")):
             view_menu.add_command(label=f"Show {name}", accelerator=acc(str(i + 1)),
-                                  command=lambda i=i: self.tabs.select(i))
+                                  command=lambda i=i: self.select_tab(i))
         bar.add_cascade(label="View", menu=view_menu)
 
         tools_menu = tk.Menu(bar, tearoff=0)
@@ -2605,63 +3861,49 @@ class App:
         bind("o", self.on_import)
         bind("O", self.open_out_folder)
         bind("Return", self.start_all)
-        bind("period", self.stop_all)
+        bind("period", self.pause_all)
         for i in range(3):
-            bind(f"Key-{i + 1}", lambda i=i: self.tabs.select(i))
+            bind(f"Key-{i + 1}", lambda i=i: self.select_tab(i))
         if not mac:                            # on macOS the application menu already provides these
             bind("comma", self.open_settings)
             bind("q", self.on_close)
 
-    def _on_global_paste_menu(self) -> None:
-        urls = extract_urls(self._clipboard())
-        if urls:
-            self.add_urls(urls)
-        else:
-            messagebox.showinfo("Paste links", "There is no link in the clipboard.")
+        # the queue list: keyboard navigation while it has the focus
+        c = self.view.canvas
+        c.bind("<Up>", lambda e: self.key_move(-1))
+        c.bind("<Down>", lambda e: self.key_move(1))
+        c.bind("<Shift-Up>", lambda e: self.key_move(-1, extend=True))
+        c.bind("<Shift-Down>", lambda e: self.key_move(1, extend=True))
+        c.bind("<Home>", lambda e: self.key_move(-2))
+        c.bind("<End>", lambda e: self.key_move(2))
+        c.bind("<Return>", lambda e: self.key_activate())
+        c.bind("<Delete>", lambda e: self.key_remove())
+        c.bind("<BackSpace>", lambda e: self.key_remove())
+        c.bind("<Escape>", lambda e: self.clear_selection())
+        c.bind("<space>", lambda e: self.toggle_pause())
+        c.bind(f"<{mod}-a>", lambda e: (self.select_all(), "break")[1])
+        c.bind("<Alt-Up>" if not mac else "<Option-Up>", lambda e: (self.move_selected(-1), "break")[1])
+        c.bind("<Alt-Down>" if not mac else "<Option-Down>", lambda e: (self.move_selected(1), "break")[1])
 
     def open_out_folder(self) -> None:
         open_folder(Path(self.out_var.get() or DEFAULT_OUT))
 
-    def retry_failed(self) -> None:
-        failed = [it for it in self.items if it.status == "failed"]
-        for it in failed:
-            it.stop = threading.Event()
-            it.status, it.pct, it.error = "queued", 0.0, ""
-            it.speed = it.eta = it.size = ""
-            it.card.refresh()
-        if failed:
-            self.start_all()
-
     def show_about(self) -> None:
-        try:
-            base = find_ytdlp()
-            ytdlp = subprocess.run(base + ["--version"], capture_output=True, text=True, timeout=10,
-                                   **_no_window()).stdout.strip() if base else "not installed yet"
-        except Exception:
-            ytdlp = "unknown"
-        ffmpeg, source = find_ffmpeg()
-        js = find_js_runtime()
-        messagebox.showinfo(
-            f"About {APP_NAME}",
-            f"{APP_NAME} {'(dev)' if __version__ == 'dev' else 'v' + __version__}\n"
-            "A friendly graphical front end for yt-dlp.\n\n"
-            f"yt-dlp: {ytdlp}\n"
-            f"ffmpeg: {source}\n"
-            f"JS engine: {js[1].split(':')[0] if js else 'none'}\n"
-            f"Settings: {data_dir()}\n\n"
-            f"https://github.com/{REPO}")
+        AboutDialog(self)
 
     def on_close(self) -> None:
         """Quit: ask first while downloads run, and stop their yt-dlp/ffmpeg processes."""
         running = [it for it in self.items if it.status == "downloading"]
         if running and not messagebox.askyesno(
-                "Quit", f"{len(running)} download(s) are still running. Quit and cancel them?\n"
-                        "(Partial files are kept - downloading the link again resumes them.)"):
+                "Quit", f"{len(running)} download(s) are still running. Pause them and quit?\n"
+                        "They continue where they stopped the next time you start the app."):
             return
         self.running = False
-        self._save_queue()                     # running items come back as waiting after a restart
         for it in running:
-            it.stop.set()                      # the watcher threads kill the process trees
+            it.status, it.interrupted = "paused", False    # saved as paused - a clean stop, nothing to repair
+            it.pause_requested = True
+            it.stop.set()                                   # the watcher threads kill the process trees
+        self._save_queue()
         try:
             save_settings({"size": f"{self.root.winfo_width()}x{self.root.winfo_height()}"})
         except tk.TclError:
@@ -2673,7 +3915,10 @@ class App:
 
     def set_tools_busy(self, busy: bool, text: str = "") -> None:
         self.tools_busy = busy
-        self.head_status.configure(text=text if busy else "")
+        if busy:
+            self.set_notice("setup", text, busy=True, dismiss=False)
+        else:
+            self.clear_notice("setup")
         self.update_state()
         if not busy:
             self.pump()
@@ -2685,10 +3930,17 @@ class App:
         update_due = (managed_ytdlp().exists()
                       and time.time() - float(self.cfg.get("last_update", 0)) > UPDATE_INTERVAL)
         if not (missing or update_due):
+            self.tools_ready.set()
             return
-        self.set_tools_busy(True, "First start: downloading tools …" if missing else "Checking for updates …")
+        if find_ytdlp() is not None:
+            self.tools_ready.set()             # usable already - only deno or an update is pending
+        self.setup_error = ""
+        self.clear_notice("setup-error")
+        self.set_tools_busy(True, "Setting up: downloading yt-dlp (first start only) …" if missing
+                            else "Checking for yt-dlp updates …")
 
         def work():
+            ok = True
             try:
                 if missing:
                     ensure_tools(self.log)
@@ -2698,13 +3950,20 @@ class App:
                 if ok:
                     save_settings({"last_update": time.time()})
             finally:
-                self.ui(lambda: self.set_tools_busy(False))
+                def done():
+                    self.tools_ready.set()
+                    self.set_tools_busy(False)
+                    if missing and find_ytdlp() is None:
+                        self.setup_error = "Could not download yt-dlp. Check your internet connection."
+                        self.set_notice("setup-error", self.setup_error, dismiss=False,
+                                        actions=[("Try again", self._startup_tools)])
+                self.ui(done)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def on_update_ytdlp(self) -> None:
+    def on_update_ytdlp(self, after=None) -> None:
         if self.tools_busy or any(it.status == "downloading" for it in self.items):
-            messagebox.showinfo("Update yt-dlp", "Please wait until the current downloads have finished.")
+            self.toast("Please wait until the current downloads have finished")
             return
         self.set_tools_busy(True, "Updating yt-dlp …")
 
@@ -2715,7 +3974,12 @@ class App:
                 if find_js_runtime() is None:
                     install_deno(self.log)
             finally:
-                self.ui(lambda: self.set_tools_busy(False))
+                def done():
+                    self.set_tools_busy(False)
+                    self.toast("yt-dlp is up to date")
+                    if after is not None:
+                        after()
+                self.ui(done)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2728,29 +3992,24 @@ class App:
         def work():
             found = check_app_update()
             if found:
-                self.ui(lambda: (self.show_app_update(found), self.tabs.select(0)))
+                self.ui(lambda: (self.show_app_update(found), self.select_tab(0)))
             else:
-                self.ui(lambda: messagebox.showinfo(
-                    "Updates", f"{APP_NAME} is up to date." if __version__ != "dev"
-                    else "This is a development version - the update check is disabled."))
+                self.ui(lambda: self.toast(f"{APP_NAME} is up to date" if __version__ != "dev"
+                                           else "Development version - the update check is disabled"))
         threading.Thread(target=work, daemon=True).start()
 
     def show_app_update(self, update: dict) -> None:
-        self.news_label.configure(text=f"A new version of simple-ytdlp is available: v{update['version']}")
-        self.news_page_btn.configure(command=lambda: webbrowser.open(update["page"]))
+        actions = [("Release page", lambda: webbrowser.open(update["page"]))]
         if can_self_update() and update["asset_url"]:
-            self.news_now_btn.configure(command=lambda: self.run_self_update(update))
-        else:                                  # running as a script, or no file for this platform
-            self.news_now_btn.pack_forget()
-        self.news.grid()
+            actions.insert(0, ("Update now", lambda: self.run_self_update(update)))
+        self.set_notice("update", f"A new version of {APP_NAME} is available: v{update['version']}",
+                        actions=actions)
         self.log(f"New version available: v{update['version']}  ->  {update['page']}")
 
     def run_self_update(self, update: dict) -> None:
         if any(it.status == "downloading" for it in self.items) or self.tools_busy:
-            messagebox.showinfo("Update", "Please wait until the current downloads have finished "
-                                          "(or cancel them), then click 'Update now' again.")
+            self.toast("Please wait until the current downloads have finished (or cancel them)")
             return
-        self.news_now_btn.configure(state="disabled")
         self.set_tools_busy(True, f"Updating {APP_NAME} …")
 
         def work():
@@ -2761,7 +4020,6 @@ class App:
                     self.root.destroy()        # the new version has already been started
                     return
                 self.set_tools_busy(False)
-                self.news_now_btn.configure(state="normal")
                 messagebox.showwarning(
                     "Update failed",
                     "The automatic update did not work (see the log).\n"
@@ -2794,7 +4052,6 @@ def run_gui() -> int:
 # ---------------------------------------------------------------- CLI
 
 def main(argv: list[str] | None = None) -> int:
-    migrate_legacy_data()
     p = argparse.ArgumentParser(
         prog=APP_NAME,
         description="Cross-platform yt-dlp wrapper (CLI + GUI).",
@@ -2819,9 +4076,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="e.g. chrome, firefox, safari - for private/age-restricted videos")
     p.add_argument("--gui", action="store_true", help="Start the graphical interface")
     p.add_argument("--update", action="store_true", help="Install/update yt-dlp and exit")
+    p.add_argument("--make-icons", metavar="DIR", help=argparse.SUPPRESS)      # used by the release build
 
     args, unknown = p.parse_known_args(argv)
 
+    if args.make_icons:
+        print("\n".join(write_icons(args.make_icons)))
+        return 0
+    migrate_legacy_data()
     if args.update:
         return 0 if update_ytdlp() else 1
     if args.gui or (not args.urls and not args.batch_file):
