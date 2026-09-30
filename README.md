@@ -17,8 +17,23 @@ this helps when YouTube changes something and downloads suddenly fail. Once a da
 program also checks silently for a yt-dlp update at startup and installs it.
 
 The interface follows the system theme (light/dark) and can be switched with a button.
-A URL in the clipboard is inserted automatically when you switch back to the window (if the
-URL box is empty), and you get a notification when a run finishes.
+A URL in the clipboard is offered in the link field when you switch back to the window, and you
+get a notification when a run finishes.
+
+### The interface
+
+- **Paste and go:** press Ctrl+V / Cmd+V (in the link field or anywhere in the window) and every
+  link in the clipboard lands in the queue. Text files with one link per line can be imported.
+- **Queue with previews:** each download is a card with thumbnail, title, channel, duration, live
+  progress, speed and ETA. Cancel, retry, remove or show the file per card; up to 4 downloads
+  run in parallel (Options → Parallel).
+- **Playlists:** a playlist link opens a selection list first, so you only add the videos you want.
+- **Video or audio:** pick the kind, then the quality (best, 4K, 1440p, 1080p, 720p, 480p, or
+  mp3 / m4a / opus).
+- **History:** every finished download is kept; open the file, show it in the folder or
+  download it again.
+- **Options:** subtitles, embedded thumbnail, skip already downloaded, folder per channel,
+  SponsorBlock (cuts sponsor segments), speed limit, cookies from a browser, start automatically.
 
 Settings and the downloaded tools live in the user data folder (Windows `%LOCALAPPDATA%\ytdl`,
 macOS `~/Library/Application Support/ytdl`, Linux `~/.local/share/ytdl`).
@@ -60,7 +75,7 @@ After a few minutes everything is available under **Releases**. It can also be s
 manually via **Actions → Build → Run workflow** (result is a downloadable artifact, nothing is
 published). Locally, e.g. on Windows:
 
-    pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect
+    pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect pillow
     pyinstaller --onefile --windowed --name ytdl --collect-all imageio_ffmpeg --collect-all sv_ttk ytdl.py
 
 ## As a script
@@ -103,7 +118,8 @@ Command line:
     uv run ytdl.py -a urls.txt -m mp3 -o ~/Music --archive
     uv run ytdl.py URL --mode video1080 --subs --thumb --by-uploader
 
-Modes: `video` (best quality), `video1080`, `video720`, `mp3`, `m4a`, `opus`.
+Modes: `video` (best quality), `video2160`, `video1440`, `video1080`, `video720`, `video480`,
+`mp3`, `m4a`, `opus`.
 
 Video **and** audio in one go: with a video mode, `--also-audio mp3` (or `m4a` / `opus`)
 keeps the video and additionally saves a separate audio file with the same name. In the
@@ -125,7 +141,7 @@ dropdown in the window.
 
 ## Without uv
 
-Works with an existing Python: `pip install imageio-ffmpeg certifi sv-ttk darkdetect`, then
+Works with an existing Python: `pip install imageio-ffmpeg certifi sv-ttk darkdetect pillow`, then
 `python3 ytdl.py`. The script downloads yt-dlp and deno itself on first start
 (`--update` updates yt-dlp). An already installed ffmpeg is preferred, otherwise the bundled
 one is used. On Linux you may need `sudo apt install python3-tk` for the interface.

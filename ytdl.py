@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect"]
+# dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect", "pillow"]
 # ///
 """
 ytdl.py - cross-platform frontend for yt-dlp (macOS, Linux, Windows).
@@ -14,7 +14,7 @@ Easiest way (only uv needed):
     uv run ytdl.py
     ./ytdl.py                      (macOS/Linux, after chmod +x)
 
-Without uv, using an existing Python (then: pip install imageio-ffmpeg certifi sv-ttk darkdetect):
+Without uv, using an existing Python (then: pip install imageio-ffmpeg certifi sv-ttk darkdetect pillow):
     python3 ytdl.py "https://youtube.com/watch?v=XXXX"
     python3 ytdl.py -a urls.txt --mode mp3
     python3 ytdl.py --gui
@@ -49,8 +49,11 @@ DEFAULT_OUT = Path.home() / "Downloads" / "yt-dlp"
 
 MODES = {
     "video":      "Video - best quality",
+    "video2160":  "Video - max. 4K",
+    "video1440":  "Video - max. 1440p",
     "video1080":  "Video - max. 1080p",
     "video720":   "Video - max. 720p",
+    "video480":   "Video - max. 480p",
     "mp3":        "Audio - mp3",
     "m4a":        "Audio - m4a",
     "opus":       "Audio - opus",
@@ -58,6 +61,7 @@ MODES = {
 AUDIO_MODES = ("mp3", "m4a", "opus")
 ALSO_AUDIO_NONE = "None"
 
+NO_BROWSER = "None"
 BROWSERS = ["", "chrome", "firefox", "safari", "edge", "brave", "chromium", "vivaldi", "opera"]
 
 
@@ -413,7 +417,7 @@ def ffmpeg_hint() -> str:
 
 def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
                archive=False, cookies_browser="", sort_by_uploader=False,
-               no_playlist=False, also_audio="",
+               no_playlist=False, also_audio="", limit_rate="", sponsorblock=False,
                extra: list[str] | None = None) -> list[str]:
     out_dir = Path(out_dir).expanduser()
     tmpl = "%(uploader)s/%(title)s.%(ext)s" if sort_by_uploader else "%(title)s.%(ext)s"
@@ -429,10 +433,9 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
 
     if mode in AUDIO_MODES:
         args += ["-x", "--audio-format", mode, "--audio-quality", "0"]
-    elif mode == "video1080":
-        args += ["-f", "bv*[height<=1080]+ba/b[height<=1080]/b"]
-    elif mode == "video720":
-        args += ["-f", "bv*[height<=720]+ba/b[height<=720]/b"]
+    elif re.fullmatch(r"video\d+", mode):
+        h = mode[len("video"):]
+        args += ["-f", f"bv*[height<={h}]+ba/b[height<={h}]/b"]
     else:
         args += ["-f", "bv*+ba/b"]
 
@@ -451,6 +454,10 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
         args += ["--cookies-from-browser", cookies_browser]
     if no_playlist:
         args += ["--no-playlist"]
+    if limit_rate:
+        args += ["--limit-rate", limit_rate]
+    if sponsorblock:
+        args += ["--sponsorblock-remove", "sponsor,selfpromo,interaction"]
     if extra:
         args += extra
     return args
@@ -511,13 +518,11 @@ def _intermediates(folder: Path) -> set[Path]:
     return {p for p in folder.rglob("*") if p.is_file() and INTERMEDIATE_RE.search(p.name)}
 
 
-def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_flag=None,
-             clean_intermediates: bool = False) -> tuple[int, int]:
-    """Download every URL. clean_intermediates removes the raw stream files that -k leaves
-    behind (only files created by this run, so nothing that was already there is touched)."""
+def prepare_command(args: list[str], log=print) -> tuple[list[str], list[str]] | None:
+    """(yt-dlp command prefix, arguments incl. ffmpeg/JS engine), or None if yt-dlp is unavailable."""
     if not ensure_tools(log):
         log("Could not download yt-dlp. Check your internet connection and try again.")
-        return (0, len(urls))
+        return None
     base = find_ytdlp()
     assert base is not None
 
@@ -532,10 +537,41 @@ def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_fl
         args = args + js
     else:
         log("Note: no JS engine found - high-resolution formats may be missing.")
+    return base, args
 
+
+def download_one(base: list[str], args: list[str], url: str, out_dir: Path, log=print,
+                 stop_flag=None, clean_intermediates: bool = False) -> int:
+    """Download one URL. Returns the yt-dlp exit code (-1 = cancelled). Failed URLs are appended
+    to failed.log; clean_intermediates removes the raw stream files that -k leaves behind (only
+    files created by this run, so nothing that was already there is touched)."""
     out_dir = Path(out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    failed_log = out_dir / "failed.log"
+    before = _intermediates(out_dir) if clean_intermediates else set()
+    rc = _stream(base + args + ["--", url], log, stop_flag)
+    if clean_intermediates:
+        for leftover in _intermediates(out_dir) - before:
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+    if stop_flag is not None and stop_flag.is_set():
+        return -1
+    if rc != 0:
+        log(f"FAILED ({rc}): {url}")
+        with (out_dir / "failed.log").open("a", encoding="utf-8") as fh:
+            fh.write(url + "\n")
+    return rc
+
+
+def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_flag=None,
+             clean_intermediates: bool = False) -> tuple[int, int]:
+    """Download every URL one after another (CLI). Returns (succeeded, failed)."""
+    prepared = prepare_command(args, log)
+    if prepared is None:
+        return (0, len(urls))
+    base, args = prepared
+    out_dir = Path(out_dir).expanduser()
 
     ok = bad = 0
     for i, url in enumerate(urls, 1):
@@ -543,28 +579,155 @@ def download(urls: list[str], args: list[str], out_dir: Path, log=print, stop_fl
             log("-- cancelled --")
             break
         log(f"\n[{i}/{len(urls)}] {url}")
-        before = _intermediates(out_dir) if clean_intermediates else set()
-        rc = _stream(base + args + ["--", url], log, stop_flag)
-        if clean_intermediates:
-            for leftover in _intermediates(out_dir) - before:
-                try:
-                    leftover.unlink()
-                except OSError:
-                    pass
-        if stop_flag is not None and stop_flag.is_set():
+        rc = download_one(base, args, url, out_dir, log, stop_flag, clean_intermediates)
+        if rc == -1:
             break
         if rc == 0:
             ok += 1
         else:
             bad += 1
-            log(f"FAILED ({rc}): {url}")
-            with failed_log.open("a", encoding="utf-8") as fh:
-                fh.write(url + "\n")
 
     log(f"\nDone. {ok} succeeded, {bad} failed.")
     if bad:
-        log(f"List of failures: {failed_log}")
+        log(f"List of failures: {out_dir / 'failed.log'}")
     return (ok, bad)
+
+
+# ---------------------------------------------------------------- Metadata, progress, history
+
+URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+
+def extract_urls(text: str) -> list[str]:
+    """All http(s) URLs in a text, in order, without duplicates."""
+    seen: dict[str, None] = {}
+    for u in URL_RE.findall(text):
+        seen.setdefault(u.rstrip(".,;)"), None)
+    return list(seen)
+
+
+def fmt_duration(seconds) -> str:
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _entry_url(entry: dict) -> str:
+    url = entry.get("webpage_url") or entry.get("url") or ""
+    if url.startswith("http"):
+        return url
+    if entry.get("id") and str(entry.get("ie_key", "")).lower().startswith("youtube"):
+        return "https://www.youtube.com/watch?v=" + entry["id"]
+    return ""
+
+
+def parse_info(data: dict) -> dict:
+    """Reduce yt-dlp's JSON to what the GUI needs (see fetch_info)."""
+    thumb = data.get("thumbnail") or ""
+    if not thumb and data.get("thumbnails"):
+        thumb = (data["thumbnails"][-1] or {}).get("url", "")
+    info = {"title": data.get("title") or "", "uploader": data.get("uploader") or data.get("channel") or "",
+            "duration": data.get("duration"), "thumbnail": thumb, "is_playlist": False, "entries": []}
+    if data.get("_type") == "playlist" or "entries" in data:
+        info["is_playlist"] = True
+        for e in data.get("entries") or []:
+            if not e:
+                continue
+            url = _entry_url(e)
+            if url:
+                thumb = e.get("thumbnail") or ((e.get("thumbnails") or [{}])[-1] or {}).get("url", "")
+                if not thumb and e.get("id") and str(e.get("ie_key", "")).lower().startswith("youtube"):
+                    thumb = f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg"
+                info["entries"].append({"title": e.get("title") or url, "url": url,
+                                        "duration": e.get("duration"), "thumbnail": thumb,
+                                        "uploader": e.get("uploader") or e.get("channel") or ""})
+    return info
+
+
+def fetch_info(url: str, *, no_playlist: bool = False, cookies_browser: str = "",
+               timeout: int = 90) -> dict | None:
+    """Title, channel, duration, thumbnail URL (and the entries of a playlist) for a URL,
+    without downloading anything. None if yt-dlp cannot read the URL."""
+    base = find_ytdlp()
+    if base is None:
+        return None
+    cmd = base + ["--dump-single-json", "--flat-playlist", "--no-warnings", "--skip-download"]
+    cmd += find_js_runtime() or []
+    if cookies_browser:
+        cmd += ["--cookies-from-browser", cookies_browser]
+    if no_playlist:
+        cmd += ["--no-playlist"]
+    try:
+        r = subprocess.run(cmd + ["--", url], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, **_no_window())
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        return parse_info(json.loads(r.stdout))
+    except Exception:
+        return None
+
+
+PROGRESS_RE = re.compile(
+    r"\[download\]\s+(?P<pct>\d+(?:\.\d+)?)%(?:\s+of\s+~?\s*(?P<size>\S+))?(?:\s+in\s+\S+)?"
+    r"(?:\s+at\s+(?P<speed>\S+))?(?:\s+ETA\s+(?P<eta>\S+))?")
+ITEM_RE = re.compile(r"^\s*\[(\d+)/(\d+)\]\s")
+DEST_RE = re.compile(r'^\[download\] Destination: (?P<path>.+)$')
+MERGE_RE = re.compile(r'^\[Merger\] Merging formats into "(?P<path>.+)"$')
+EXTRACT_RE = re.compile(r'^\[ExtractAudio\] Destination: (?P<path>.+)$')
+EXISTS_RE = re.compile(r'^\[download\] (?P<path>.+) has already been downloaded$')
+ARCHIVED_RE = re.compile(r"has already been recorded in the archive")
+
+
+def parse_progress(line: str) -> dict | None:
+    """{"pct", "size", "speed", "eta"} from a yt-dlp progress line (missing parts are ""), or None."""
+    m = PROGRESS_RE.search(line)
+    if not m:
+        return None
+    return {"pct": float(m.group("pct")), "size": m.group("size") or "",
+            "speed": m.group("speed") or "", "eta": m.group("eta") or ""}
+
+
+def track_output_file(found: dict, line: str, audio_mode: bool) -> None:
+    """Remember which file a run produced (found is updated in place; read it with output_file)."""
+    line = line.strip()
+    for key, rx in (("merge", MERGE_RE), ("extract", EXTRACT_RE), ("dest", DEST_RE), ("dest", EXISTS_RE)):
+        m = rx.match(line)
+        if m:
+            path = m.group("path")
+            if key == "extract" and not audio_mode:
+                return                           # the extra audio copy is not "the" result
+            if key == "dest" and INTERMEDIATE_RE.search(path):
+                return
+            found[key] = path
+            return
+
+
+def output_file(found: dict) -> str:
+    return found.get("merge") or found.get("extract") or found.get("dest") or ""
+
+
+HISTORY_FILE = data_dir() / "history.json"
+HISTORY_MAX = 500
+
+
+def load_history() -> list[dict]:
+    try:
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_history(entries: list[dict]) -> None:
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        HISTORY_FILE.write_text(json.dumps(entries[-HISTORY_MAX:], indent=1), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def read_url_file(path: str | Path) -> list[str]:
@@ -585,6 +748,30 @@ def open_folder(path: Path) -> None:
         subprocess.Popen(["open", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path)])
+
+
+def open_path(path: Path) -> None:
+    """Open a file with its default program (a folder is opened in the file manager)."""
+    path = Path(path).expanduser()
+    if os.name == "nt":
+        os.startfile(str(path))               # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+def reveal_file(path: Path) -> None:
+    """Show a file selected in the file manager (falls back to opening its folder)."""
+    path = Path(path).expanduser()
+    if not path.exists():
+        open_folder(path.parent)
+    elif os.name == "nt":
+        subprocess.Popen(["explorer", "/select,", str(path)])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path.parent)])
 
 
 # ---------------------------------------------------------------- GUI
@@ -627,354 +814,1167 @@ def looks_like_url(text: str) -> bool:
     return bool(text) and "\n" not in text and re.match(r"https?://\S+$", text) is not None
 
 
-PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
-ITEM_RE = re.compile(r"^\s*\[(\d+)/(\d+)\]\s")
+try:
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import ttk, filedialog, messagebox
+except ImportError:                            # checked again in run_gui() with a helpful message
+    tk = None
+
+try:                                           # thumbnails; without Pillow the cards just show a placeholder
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = ImageTk = None
+
+try:                                           # modern theme; without sv-ttk the default Tk look stays
+    import sv_ttk
+except ImportError:
+    sv_ttk = None
+
+THUMB_SIZE = (128, 72)
+
+# Status colours that stay readable on both the light and the dark theme.
+COLORS = {
+    "light": {"ok": "#1e8e4e", "bad": "#c93030", "muted": "#6b6b6b", "thumb": "#dcdcdc",
+              "text_bg": "#ffffff", "text_fg": "#1a1a1a", "text_border": "#c8c8c8", "accent": "#0067c0"},
+    "dark":  {"ok": "#5fd38d", "bad": "#ff7b7b", "muted": "#a0a0a0", "thumb": "#3a3a3a",
+              "text_bg": "#2b2b2b", "text_fg": "#e6e6e6", "text_border": "#4a4a4a", "accent": "#60cdff"},
+}
+
+STATUS_ORDER = ("downloading", "queued", "fetching", "failed", "cancelled", "done", "skipped")
 
 
-def run_gui() -> int:
+def shorten(text: str, limit: int) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def fmt_size(num: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if num < 1024 or unit == "GiB":
+            return f"{num:.0f} B" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024
+    return ""
+
+
+def mode_kind(mode: str) -> str:
+    return "audio" if mode in AUDIO_MODES else "video"
+
+
+def fetch_thumbnail(url: str):
+    """Download a thumbnail and crop it to THUMB_SIZE (a PIL image), or None."""
+    if Image is None or not url:
+        return None
     try:
-        import tkinter as tk
-        from tkinter import ttk, filedialog, messagebox
-    except ImportError:
-        print("Tkinter is not installed.")
-        print("Linux:  sudo apt install python3-tk   (or python3-tkinter)")
-        return 1
+        import io
+        req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+        with urllib.request.urlopen(req, timeout=15, context=_ssl_context()) as r:
+            img = Image.open(io.BytesIO(r.read(4_000_000))).convert("RGB")
+        w, h = THUMB_SIZE
+        scale = max(w / img.width, h / img.height)
+        img = img.resize((max(w, round(img.width * scale)), max(h, round(img.height * scale))))
+        left, top = (img.width - w) // 2, (img.height - h) // 2
+        return img.crop((left, top, left + w, top + h))
+    except Exception:
+        return None
 
-    cfg = load_settings()
-    cleanup_old_versions()                     # leftovers of a previous self-update
 
-    root = tk.Tk()
-    root.title("yt-dlp Downloader" + ("" if __version__ == "dev" else f"  v{__version__}"))
-    root.geometry("820x740")
-    root.minsize(700, 600)
+class Item:
+    """One download in the queue."""
+    _counter = 0
 
-    try:                                       # modern theme; without sv-ttk the default Tk look stays
-        import sv_ttk
-    except ImportError:
-        sv_ttk = None
+    def __init__(self, url: str):
+        Item._counter += 1
+        self.id = Item._counter
+        self.url = url
+        self.title = url
+        self.uploader = ""
+        self.duration = None
+        self.thumb = None                      # PIL image, set by the info thread
+        self.status = "fetching"               # fetching queued downloading done skipped failed cancelled
+        self.pct = 0.0
+        self.speed = self.eta = self.size = ""
+        self.path = ""
+        self.error = ""
+        self.mode = ""
+        self.stop = threading.Event()
+        self.removed = False
+        self.card: "Card | None" = None
 
-    def system_theme() -> str:
-        try:
-            import darkdetect
-            return "dark" if darkdetect.isDark() else "light"
-        except Exception:
-            return "light"
+    @property
+    def active(self) -> bool:
+        return self.status in ("fetching", "queued", "downloading")
 
-    theme = (cfg.get("theme") or system_theme()) if sv_ttk is not None else "light"
-    text_widgets: list = []
+    @property
+    def finished(self) -> bool:
+        return self.status in ("done", "skipped", "failed", "cancelled")
 
-    def apply_theme(name: str) -> None:
-        nonlocal theme
-        theme = name
+
+class Card:
+    """The row of one Item in the queue: thumbnail, title, progress and action buttons."""
+
+    def __init__(self, app: "App", item: Item):
+        self.app, self.item = app, item
+        self._buttons_for = None
+        self.photo = None
+        card_style = "Card.TFrame" if sv_ttk is not None else "TFrame"
+        self.frame = ttk.Frame(app.list_inner, style=card_style, padding=10)
+        self.frame.columnconfigure(1, weight=1)
+
+        self.thumb_box = tk.Frame(self.frame, width=THUMB_SIZE[0], height=THUMB_SIZE[1])
+        self.thumb_box.grid(row=0, column=0, rowspan=3, sticky="n", padx=(0, 12))
+        self.thumb_box.grid_propagate(False)
+        self.thumb_box.pack_propagate(False)
+        self.thumb_lbl = tk.Label(self.thumb_box, text="▶", borderwidth=0)
+        self.thumb_lbl.pack(fill="both", expand=True)
+
+        self.title_lbl = ttk.Label(self.frame, style="CardTitle.TLabel", anchor="w")
+        self.title_lbl.grid(row=0, column=1, sticky="ew")
+        self.meta_lbl = ttk.Label(self.frame, style="Muted.TLabel", anchor="w")
+        self.meta_lbl.grid(row=1, column=1, sticky="ew", pady=(1, 6))
+
+        self.bar = ttk.Progressbar(self.frame, maximum=100)
+        self.bar.grid(row=2, column=1, sticky="ew", pady=(0, 4))
+        self.status_lbl = ttk.Label(self.frame, anchor="w")
+        self.status_lbl.grid(row=3, column=1, sticky="ew")
+
+        self.btn_box = ttk.Frame(self.frame)
+        self.btn_box.grid(row=0, column=2, rowspan=4, sticky="ne", padx=(12, 0))
+        self.refresh()
+
+    def _set_buttons(self, specs) -> None:
+        for child in self.btn_box.winfo_children():
+            child.destroy()
+        for text, command in specs:
+            ttk.Button(self.btn_box, text=text, command=command, width=8).pack(pady=(0, 4), anchor="e")
+
+    def refresh(self) -> None:
+        it, app = self.item, self.app
+        colors = COLORS[app.theme]
+        self.title_lbl.configure(text=shorten(it.title, 110))
+        meta = "  ·  ".join(x for x in (it.uploader, fmt_duration(it.duration)) if x)
+        self.meta_lbl.configure(text=meta or (it.url if it.title != it.url else ""))
+        self.thumb_box.configure(background=colors["thumb"])
+        self.thumb_lbl.configure(background=colors["thumb"], foreground=colors["muted"])
+
+        st = it.status
+        if st == "fetching":
+            text, color = "Loading info …", colors["muted"]
+        elif st == "queued":
+            text, color = "Waiting", colors["muted"]
+        elif st == "downloading":
+            parts = [f"{it.pct:.0f}%"]
+            if it.size:
+                parts.append(it.size)
+            if it.speed and it.speed != "Unknown":
+                parts.append(it.speed)
+            if it.eta and it.eta != "Unknown":
+                parts.append(f"ETA {it.eta}")
+            text, color = "   ·   ".join(parts), colors["accent"]
+            if it.pct >= 100:
+                text, color = "Processing …", colors["accent"]
+        elif st == "done":
+            text, color = "✓ Done" + (f"   ·   {it.size}" if it.size else ""), colors["ok"]
+        elif st == "skipped":
+            text, color = "✓ Already downloaded", colors["ok"]
+        elif st == "failed":
+            text, color = "✗ Failed" + (f"   ·   {shorten(it.error, 90)}" if it.error else ""), colors["bad"]
+        else:
+            text, color = "Cancelled", colors["muted"]
+        self.status_lbl.configure(text=text, foreground=color)
+
+        if st == "fetching":
+            if str(self.bar.cget("mode")) != "indeterminate":
+                self.bar.configure(mode="indeterminate")
+                self.bar.start(15)
+            self.bar.grid()
+        elif st in ("queued", "downloading"):
+            if str(self.bar.cget("mode")) == "indeterminate":
+                self.bar.stop()
+                self.bar.configure(mode="determinate")
+            self.bar["value"] = it.pct
+            self.bar.grid()
+        else:
+            self.bar.stop()
+            self.bar.grid_remove()
+
+        if self._buttons_for != st:
+            self._buttons_for = st
+            remove = ("Remove", lambda: app.remove_item(it))
+            if st == "downloading":
+                self._set_buttons([("Cancel", lambda: app.cancel_item(it))])
+            elif st in ("done", "skipped"):
+                self._set_buttons([("Show", lambda: app.show_item(it)), remove])
+            elif st in ("failed", "cancelled"):
+                self._set_buttons([("Retry", lambda: app.retry_item(it)), remove])
+            else:
+                self._set_buttons([remove])
+
+    def set_thumb(self) -> None:
+        if ImageTk is None or self.item.thumb is None:
+            return
+        self.photo = ImageTk.PhotoImage(self.item.thumb)
+        self.thumb_lbl.configure(image=self.photo, text="")
+
+
+class PlaylistDialog(tk.Toplevel if tk else object):
+    """Pick the videos of a playlist. After it closes, .result is the chosen entries (or None)."""
+
+    def __init__(self, parent, title: str, entries: list[dict], colors: dict):
+        super().__init__(parent)
+        self.result = None
+        self.entries = entries
+        self.checked = [True] * len(entries)
+        self.title("Select videos")
+        self.geometry("620x520")
+        self.minsize(460, 320)
+        self.transient(parent)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        head = ttk.Frame(self, padding=(14, 12, 14, 4))
+        head.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(head, text=shorten(title or "Playlist", 70), style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(head, text=f"{len(entries)} videos - click a row to (de)select it",
+                  style="Muted.TLabel").pack(anchor="w")
+
+        self.tree = ttk.Treeview(self, show="tree", selectmode="none")
+        self.tree.column("#0", width=520, stretch=True)
+        self.tree.grid(row=1, column=0, sticky="nsew", padx=(14, 0), pady=6)
+        sb = ttk.Scrollbar(self, command=self.tree.yview)
+        sb.grid(row=1, column=1, sticky="ns", padx=(0, 14), pady=6)
+        self.tree.configure(yscrollcommand=sb.set)
+        for i in range(len(entries)):
+            self.tree.insert("", "end", iid=str(i))
+            self._render(i)
+        self.tree.bind("<Button-1>", self._toggle)
+
+        foot = ttk.Frame(self, padding=(14, 4, 14, 12))
+        foot.grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Button(foot, text="All", command=lambda: self._set_all(True)).pack(side="left")
+        ttk.Button(foot, text="None", command=lambda: self._set_all(False)).pack(side="left", padx=6)
+        self.add_btn = ttk.Button(foot, command=self._accept,
+                                  style="Accent.TButton" if sv_ttk is not None else "TButton")
+        self.add_btn.pack(side="right")
+        ttk.Button(foot, text="Cancel", command=self.destroy).pack(side="right", padx=6)
+        self._update_count()
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()                # centre over the main window
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.grab_set()
+        self.focus_set()
+
+    def _render(self, i: int) -> None:
+        e = self.entries[i]
+        dur = fmt_duration(e.get("duration"))
+        box = "☑" if self.checked[i] else "☐"
+        self.tree.item(str(i), text=f"  {box}   {i + 1:>3}.  {shorten(e['title'], 58)}" + (f"   ({dur})" if dur else ""))
+
+    def _toggle(self, event) -> str:
+        row = self.tree.identify_row(event.y)
+        if row:
+            i = int(row)
+            self.checked[i] = not self.checked[i]
+            self._render(i)
+            self._update_count()
+        return "break"
+
+    def _set_all(self, value: bool) -> None:
+        self.checked = [value] * len(self.entries)
+        for i in range(len(self.entries)):
+            self._render(i)
+        self._update_count()
+
+    def _update_count(self) -> None:
+        n = sum(self.checked)
+        self.add_btn.configure(text=f"Add {n} to queue", state="normal" if n else "disabled")
+
+    def _accept(self) -> None:
+        self.result = [e for e, c in zip(self.entries, self.checked) if c]
+        self.destroy()
+
+
+class App:
+    """The main window: link input, download queue, history and log."""
+
+    def __init__(self, root):
+        self.root = root
+        self.cfg = load_settings()
+        self.items: list[Item] = []
+        self.running = False                   # True after "Download all" until the queue is empty
+        self.tools_busy = False                # yt-dlp is being installed/updated
+        self.batch = {"ok": 0, "bad": 0}
+        self.info_slots = threading.Semaphore(3)
+        self.history = load_history()
+        self.text_widgets: list = []
+        self.last_clip = ""
+        self.placeholder = "Paste a video or playlist link and press Enter"
+        self.placeholder_on = False
+
+        default = system_theme()
+        self.theme = (self.cfg.get("theme") or default) if sv_ttk is not None else "light"
+
+        root.title("ytdl" + ("" if __version__ == "dev" else f"  v{__version__}"))
+        root.geometry("920x780")
+        root.minsize(780, 580)
+
+        self._fonts()
+        self._build()
+        self.apply_theme(self.theme)
+        self.sync_mode_options()
+        self.refresh_history()
+        self.update_state()
+
+        root.bind("<FocusIn>", self._on_focus)
+        root.bind("<<Paste>>", self._on_global_paste)
+        self.log(("ytdl " + ("(dev)" if __version__ == "dev" else f"v{__version__}"))
+                 + f" ready. Output folder: {self.out_var.get()}")
+        if find_ffmpeg()[1] == "none":
+            self.log("Note: " + ffmpeg_hint())
+        if Image is None:
+            self.log("Note: Pillow is not installed - no thumbnails (pip install pillow).")
+
+        self._startup_tools()
+        threading.Thread(target=self._check_app_update, daemon=True).start()
+
+    # ------------------------------------------------------------ styling
+
+    def _fonts(self) -> None:
+        base = tkfont.nametofont("TkDefaultFont")
+        size = abs(int(base.cget("size"))) or 10
+        self.font_title = tkfont.Font(family=base.cget("family"), size=size + 1, weight="bold")
+        self.font_big = tkfont.Font(family=base.cget("family"), size=size + 8, weight="bold")
+        self.font_small = tkfont.Font(family=base.cget("family"), size=max(size - 1, 8))
+
+    def apply_theme(self, name: str) -> None:
+        self.theme = name
         if sv_ttk is not None:
             sv_ttk.set_theme(name)
-        dark = name == "dark"
-        for w in text_widgets:                 # ttk themes do not cover tk.Text
-            w.configure(background="#2b2b2b" if dark else "#ffffff",
-                        foreground="#e6e6e6" if dark else "#1a1a1a",
-                        insertbackground="#e6e6e6" if dark else "#1a1a1a",
-                        highlightbackground="#4a4a4a" if dark else "#c8c8c8",
-                        highlightcolor="#60cdff" if dark else "#0067c0")
+        c = COLORS[name]
+        style = ttk.Style()                    # style settings belong to one theme -> set them after switching
+        style.configure("CardTitle.TLabel", font=self.font_title)
+        style.configure("Big.TLabel", font=self.font_big)
+        style.configure("Muted.TLabel", font=self.font_small, foreground=c["muted"])
+        for w in self.text_widgets:            # ttk themes do not cover tk.Text
+            w.configure(background=c["text_bg"], foreground=c["text_fg"], insertbackground=c["text_fg"],
+                        highlightbackground=c["text_border"], highlightcolor=c["accent"])
+        bg = self.root.tk.eval("ttk::style lookup TFrame -background") or c["text_bg"]
+        self.canvas.configure(background=bg)
+        self.empty_lbl.configure(background=bg, foreground=c["muted"])
+        for it in self.items:
+            if it.card:
+                it.card.refresh()
+        self._history_tags()
 
-    pad = {"padx": 8, "pady": 5}
-    main = ttk.Frame(root, padding=14)
-    main.pack(fill="both", expand=True)
-    main.columnconfigure(0, weight=1)
+    def toggle_theme(self) -> None:
+        self.apply_theme("light" if self.theme == "dark" else "dark")
+        save_settings({"theme": self.theme})
 
-    head = ttk.Frame(main)
-    head.grid(row=0, column=0, columnspan=2, sticky="ew")
-    ttk.Label(head, text="URLs (one per line):").pack(side="left")
-    def toggle_theme() -> None:
-        apply_theme("light" if theme == "dark" else "dark")
-        save_settings({"theme": theme})
+    # ------------------------------------------------------------ layout
 
-    if sv_ttk is not None:                     # without sv-ttk, toggling would only recolor the text boxes
-        ttk.Button(head, text="Light/Dark", command=toggle_theme).pack(side="right")
-    ttk.Button(head, text="From clipboard",
-               command=lambda: paste_clipboard(force=True)).pack(side="right", padx=6)
+    def _build(self) -> None:
+        root, cfg = self.root, self.cfg
+        accent = "Accent.TButton" if sv_ttk is not None else "TButton"
+        switch = "Switch.TCheckbutton" if sv_ttk is not None else "TCheckbutton"
+        tool = "Toggle.TButton" if sv_ttk is not None else "TButton"
 
-    url_box = tk.Text(main, height=7, wrap="none", relief="flat", borderwidth=0,
-                      highlightthickness=1, padx=6, pady=6)
-    text_widgets.append(url_box)
-    url_box.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 10))
-    main.rowconfigure(1, weight=1)
+        main = ttk.Frame(root, padding=(18, 14, 18, 12))
+        main.pack(fill="both", expand=True)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(4, weight=1)
 
-    last_clip = {"text": ""}
+        # header
+        head = ttk.Frame(main)
+        head.grid(row=0, column=0, sticky="ew")
+        ttk.Label(head, text="ytdl", style="Big.TLabel").pack(side="left")
+        ttk.Label(head, text="  yt-dlp made comfortable", style="Muted.TLabel").pack(side="left", pady=(8, 0))
+        if sv_ttk is not None:
+            ttk.Button(head, text="☀ / ☾", width=6, command=self.toggle_theme).pack(side="right")
+        self.update_btn = ttk.Button(head, text="Update yt-dlp", command=self.on_update_ytdlp)
+        self.update_btn.pack(side="right", padx=8)
+        self.head_status = ttk.Label(head, text="", style="Muted.TLabel")
+        self.head_status.pack(side="right", padx=8)
 
-    def paste_clipboard(force: bool = False) -> None:
-        """Insert a URL from the clipboard (automatically only when the box is empty)."""
-        try:
-            clip = root.clipboard_get().strip()
-        except tk.TclError:
+        # link input
+        add = ttk.Frame(main)
+        add.grid(row=1, column=0, sticky="ew", pady=(14, 8))
+        add.columnconfigure(0, weight=1)
+        self.url_var = tk.StringVar()
+        self.url_entry = ttk.Entry(add, textvariable=self.url_var, font=self.font_title)
+        self.url_entry.grid(row=0, column=0, sticky="ew", ipady=5)
+        self.url_entry.bind("<Return>", lambda e: self.on_add())
+        self.url_entry.bind("<<Paste>>", self._on_entry_paste)
+        self.url_entry.bind("<FocusIn>", lambda e: self._placeholder(False))
+        self.url_entry.bind("<FocusOut>", lambda e: self._placeholder(True))
+        ttk.Button(add, text="Add", style=accent, command=self.on_add, width=8).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(add, text="Import list …", command=self.on_import).grid(row=0, column=2, padx=(8, 0))
+        self._placeholder(True)
+
+        # mode / folder / options toggle
+        bar = ttk.Frame(main)
+        bar.grid(row=2, column=0, sticky="ew")
+        bar.columnconfigure(3, weight=1)
+        mode = cfg.get("mode", "video")
+        if mode not in MODES:
+            mode = "video"
+        self.kind_var = tk.StringVar(value=mode_kind(mode))
+        kinds = ttk.Frame(bar)
+        kinds.grid(row=0, column=0, sticky="w")
+        for text, value in (("Video", "video"), ("Audio", "audio")):
+            ttk.Radiobutton(kinds, text=text, value=value, variable=self.kind_var, style=tool,
+                            command=self._on_kind, width=7).pack(side="left", padx=(0, 4))
+        self.quality_var = tk.StringVar(value=MODES[mode])
+        self.quality_combo = ttk.Combobox(bar, textvariable=self.quality_var, state="readonly", width=19)
+        self.quality_combo.grid(row=0, column=1, padx=8)
+        self.quality_combo.bind("<<ComboboxSelected>>", lambda e: self.sync_mode_options())
+        ttk.Label(bar, text="Save to").grid(row=0, column=2, padx=(10, 6))
+        self.out_var = tk.StringVar(value=cfg.get("out") or str(DEFAULT_OUT))
+        ttk.Entry(bar, textvariable=self.out_var).grid(row=0, column=3, sticky="ew")
+        ttk.Button(bar, text="Browse …", command=self.pick_dir).grid(row=0, column=4, padx=(6, 0))
+        self.opts_open = tk.BooleanVar(value=cfg.get("options_open", False))
+        self.opts_btn = ttk.Button(bar, command=self._toggle_options, width=11)
+        self.opts_btn.grid(row=0, column=5, padx=(8, 0))
+
+        # collapsible options
+        self.opts = ttk.Frame(main, padding=(0, 10, 0, 0))
+        self.opts.grid(row=3, column=0, sticky="ew")
+        self.subs_var = tk.BooleanVar(value=cfg.get("subs", False))
+        self.thumb_var = tk.BooleanVar(value=cfg.get("thumb", False))
+        self.arch_var = tk.BooleanVar(value=cfg.get("archive", True))
+        self.uploader_var = tk.BooleanVar(value=cfg.get("uploader", False))
+        self.single_var = tk.BooleanVar(value=cfg.get("single", True))
+        self.sponsor_var = tk.BooleanVar(value=cfg.get("sponsorblock", False))
+        self.auto_var = tk.BooleanVar(value=cfg.get("autostart", False))
+        switches = (("Subtitles (en/de)", self.subs_var), ("Embed thumbnail", self.thumb_var),
+                    ("Skip already downloaded", self.arch_var), ("Folder per channel", self.uploader_var),
+                    ("Single video only (no playlist)", self.single_var),
+                    ("Remove sponsor segments", self.sponsor_var),
+                    ("Start right after adding", self.auto_var))
+        self.subs_check = None
+        for i, (text, var) in enumerate(switches):
+            check = ttk.Checkbutton(self.opts, text=text, variable=var, style=switch)
+            check.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 22), pady=3)
+            if var is self.subs_var:
+                self.subs_check = check
+        extra = ttk.Frame(self.opts)
+        extra.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.cookie_var = tk.StringVar(value=cfg.get("cookies") or NO_BROWSER)
+        self.also_var = tk.StringVar(value=cfg.get("also_audio") or ALSO_AUDIO_NONE)
+        self.limit_var = tk.StringVar(value=cfg.get("limit", ""))
+        self.parallel_var = tk.StringVar(value=str(cfg.get("parallel", 2)))
+        ttk.Label(extra, text="Cookies from").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(extra, textvariable=self.cookie_var, values=[NO_BROWSER, *BROWSERS[1:]],
+                     state="readonly", width=10).grid(row=0, column=1, padx=(6, 18))
+        ttk.Label(extra, text="Also save audio as").grid(row=0, column=2, sticky="w")
+        self.also_combo = ttk.Combobox(extra, textvariable=self.also_var, values=[ALSO_AUDIO_NONE, *AUDIO_MODES],
+                                       state="readonly", width=8)
+        self.also_combo.grid(row=0, column=3, padx=(6, 18))
+        ttk.Label(extra, text="Speed limit").grid(row=0, column=4, sticky="w")
+        ttk.Entry(extra, textvariable=self.limit_var, width=7).grid(row=0, column=5, padx=(6, 2))
+        ttk.Label(extra, text="(e.g. 2M)", style="Muted.TLabel").grid(row=0, column=6, padx=(0, 18))
+        ttk.Label(extra, text="Parallel").grid(row=0, column=7, sticky="w")
+        ttk.Spinbox(extra, textvariable=self.parallel_var, from_=1, to=4, width=3,
+                    state="readonly").grid(row=0, column=8, padx=(6, 0))
+        self._apply_options_visibility()
+
+        # tabs
+        self.tabs = ttk.Notebook(main)
+        self.tabs.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        self._build_queue_tab()
+        self._build_history_tab()
+        self._build_log_tab()
+
+        # footer
+        foot = ttk.Frame(main)
+        foot.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        self.summary = ttk.Label(foot, text="", style="Muted.TLabel")
+        self.summary.pack(side="left")
+        self.start_btn = ttk.Button(foot, text="Download all", style=accent, command=self.start_all)
+        self.start_btn.pack(side="right")
+        self.stop_btn = ttk.Button(foot, text="Stop", command=self.stop_all)
+        self.stop_btn.pack(side="right", padx=6)
+        ttk.Button(foot, text="Clear finished", command=self.clear_finished).pack(side="right")
+        ttk.Button(foot, text="Open folder",
+                   command=lambda: open_folder(Path(self.out_var.get() or DEFAULT_OUT))).pack(side="right", padx=6)
+
+        # update banner (only shown when a newer release exists)
+        card_style = "Card.TFrame" if sv_ttk is not None else "TFrame"
+        self.news = ttk.Frame(main, style=card_style, padding=(12, 8))
+        self.news.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+        self.news_label = ttk.Label(self.news, text="")
+        self.news_label.pack(side="left")
+        self.news_page_btn = ttk.Button(self.news, text="Release page")
+        self.news_page_btn.pack(side="right")
+        self.news_now_btn = ttk.Button(self.news, text="Update now")
+        self.news_now_btn.pack(side="right", padx=6)
+        self.news.grid_remove()
+
+    def _build_queue_tab(self) -> None:
+        tab = ttk.Frame(self.tabs, padding=(0, 10, 0, 0))
+        self.tabs.add(tab, text="Queue")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(tab, highlightthickness=0, borderwidth=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(tab, orient="vertical", command=self.canvas.yview)
+        vsb.grid(row=0, column=1, sticky="ns", padx=(6, 0))
+        self.canvas.configure(yscrollcommand=vsb.set)
+        self.list_inner = ttk.Frame(self.canvas)
+        self.list_window = self.canvas.create_window((0, 0), window=self.list_inner, anchor="nw")
+        self.list_inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.list_window, width=e.width))
+        for widget in (self.canvas, self.list_inner):
+            widget.bind("<Enter>", self._bind_wheel)
+            widget.bind("<Leave>", self._unbind_wheel)
+        self.empty_lbl = tk.Label(
+            self.canvas, justify="center", borderwidth=0, font=self.font_title,
+            text="Nothing here yet.\n\nPaste a link above (or just press Ctrl+V / Cmd+V anywhere in this window).\n"
+                 "Playlists let you pick the videos first.")
+
+    def _build_history_tab(self) -> None:
+        tab = ttk.Frame(self.tabs, padding=(0, 10, 0, 0))
+        self.tabs.add(tab, text="History")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        self.hist = ttk.Treeview(tab, columns=("title", "mode", "when"), show="headings", selectmode="extended")
+        for col, text, width, stretch in (("title", "Title", 480, True), ("mode", "Format", 170, False),
+                                          ("when", "Downloaded", 140, False)):
+            self.hist.heading(col, text=text, anchor="w")
+            self.hist.column(col, width=width, stretch=stretch, anchor="w")
+        self.hist.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(tab, command=self.hist.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.hist.configure(yscrollcommand=sb.set)
+        self.hist.bind("<Double-1>", lambda e: self.hist_open())
+        row = ttk.Frame(tab)
+        row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(row, text="Open file", command=self.hist_open).pack(side="left")
+        ttk.Button(row, text="Show in folder", command=self.hist_reveal).pack(side="left", padx=6)
+        ttk.Button(row, text="Download again", command=self.hist_again).pack(side="left")
+        ttk.Button(row, text="Clear history", command=self.hist_clear).pack(side="right")
+        ttk.Button(row, text="Remove", command=self.hist_remove).pack(side="right", padx=6)
+
+    def _build_log_tab(self) -> None:
+        tab = ttk.Frame(self.tabs, padding=(0, 10, 0, 0))
+        self.tabs.add(tab, text="Log")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        self.log_box = tk.Text(tab, wrap="none", state="disabled", relief="flat", borderwidth=0,
+                               highlightthickness=1, padx=8, pady=8, font=self.font_small)
+        self.text_widgets.append(self.log_box)
+        self.log_box.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(tab, command=self.log_box.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.log_box.configure(yscrollcommand=sb.set)
+
+    # ------------------------------------------------------------ small helpers
+
+    def _bind_wheel(self, _e=None) -> None:
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
+        self.root.bind_all("<Button-4>", self._on_wheel)
+        self.root.bind_all("<Button-5>", self._on_wheel)
+
+    def _unbind_wheel(self, _e=None) -> None:
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.unbind_all(seq)
+
+    def _on_wheel(self, event) -> None:
+        if self.list_inner.winfo_reqheight() <= self.canvas.winfo_height():
             return
-        if not looks_like_url(clip):
-            if force:
-                messagebox.showinfo("Clipboard", "There is no URL in the clipboard.")
-            return
-        current = url_box.get("1.0", "end")
-        if clip in current or (not force and (current.strip() or clip == last_clip["text"])):
-            return
-        last_clip["text"] = clip
-        url_box.insert("end", ("\n" if current.strip() else "") + clip)
+        if event.num == 4:
+            step = -2
+        elif event.num == 5:
+            step = 2
+        else:                                  # Windows: multiples of 120, macOS: small numbers
+            step = -int(event.delta / 120) * 2 if abs(event.delta) >= 120 else -event.delta
+        self.canvas.yview_scroll(step, "units")
 
-    root.bind("<FocusIn>", lambda e: paste_clipboard() if e.widget is root else None)
+    def _placeholder(self, show: bool) -> None:
+        """Grey hint text inside the empty link field."""
+        if show and not self.url_var.get():
+            self.placeholder_on = True
+            self.url_var.set(self.placeholder)
+            self.url_entry.configure(foreground=COLORS[getattr(self, "theme", "light")]["muted"])
+        elif not show and self.placeholder_on:
+            self.placeholder_on = False
+            self.url_var.set("")
+            self.url_entry.configure(foreground="")
 
-    opts = ttk.Frame(main)
-    opts.grid(row=2, column=0, columnspan=2, sticky="ew")
-    opts.columnconfigure(1, weight=1)
+    def _toggle_options(self) -> None:
+        self.opts_open.set(not self.opts_open.get())
+        self._apply_options_visibility()
+        save_settings({"options_open": self.opts_open.get()})
 
-    ttk.Label(opts, text="Mode:").grid(row=0, column=0, sticky="w", **pad)
-    mode_var = tk.StringVar(value=MODES.get(cfg.get("mode", ""), MODES["video"]))
-    mode_combo = ttk.Combobox(opts, textvariable=mode_var, values=list(MODES.values()),
-                              state="readonly")
-    mode_combo.grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+    def _apply_options_visibility(self) -> None:
+        if self.opts_open.get():
+            self.opts.grid()
+            self.opts_btn.configure(text="Options ▴")
+        else:
+            self.opts.grid_remove()
+            self.opts_btn.configure(text="Options ▾")
 
-    ttk.Label(opts, text="Output folder:").grid(row=1, column=0, sticky="w", **pad)
-    out_var = tk.StringVar(value=cfg.get("out") or str(DEFAULT_OUT))
-    ttk.Entry(opts, textvariable=out_var).grid(row=1, column=1, sticky="ew", **pad)
+    def _on_kind(self) -> None:
+        self.quality_var.set(MODES["mp3" if self.kind_var.get() == "audio" else "video"])
+        self.sync_mode_options()
 
-    def pick_dir():
-        d = filedialog.askdirectory(initialdir=out_var.get() or str(Path.home()))
-        if d:
-            out_var.set(d)
-
-    ttk.Button(opts, text="Browse ...", command=pick_dir).grid(row=1, column=2, **pad)
-
-    ttk.Label(opts, text="Cookies from browser:").grid(row=2, column=0, sticky="w", **pad)
-    cookie_var = tk.StringVar(value=cfg.get("cookies", ""))
-    ttk.Combobox(opts, textvariable=cookie_var, values=BROWSERS,
-                 state="readonly", width=14).grid(row=2, column=1, sticky="w", **pad)
-
-    ttk.Label(opts, text="Also save audio as:").grid(row=3, column=0, sticky="w", **pad)
-    also_var = tk.StringVar(value=cfg.get("also_audio") or ALSO_AUDIO_NONE)
-    also_row = ttk.Frame(opts)
-    also_row.grid(row=3, column=1, columnspan=2, sticky="w", **pad)
-    also_combo = ttk.Combobox(also_row, textvariable=also_var, values=[ALSO_AUDIO_NONE, *AUDIO_MODES],
-                              state="readonly", width=14)
-    also_combo.pack(side="left")
-    ttk.Label(also_row, text="  (video modes: keeps the video and adds a separate audio file)",
-              foreground="gray").pack(side="left")
-
-    checks = ttk.Frame(main)
-    checks.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 8))
-    subs_var = tk.BooleanVar(value=cfg.get("subs", False))
-    thumb_var = tk.BooleanVar(value=cfg.get("thumb", False))
-    arch_var = tk.BooleanVar(value=cfg.get("archive", True))
-    uploader_var = tk.BooleanVar(value=cfg.get("uploader", False))
-    single_var = tk.BooleanVar(value=cfg.get("single", True))
-    subs_check = None
-    for i, (text, var) in enumerate((("Subtitles (en/de)", subs_var),
-                                     ("Embed thumbnail", thumb_var),
-                                     ("Archive (skip already downloaded)", arch_var),
-                                     ("Sort into folders by channel", uploader_var),
-                                     ("Single video only (no playlist)", single_var))):
-        check = ttk.Checkbutton(checks, text=text, variable=var)
-        check.grid(row=i // 3, column=i % 3, sticky="w", padx=6, pady=3)
-        if var is subs_var:
-            subs_check = check
-
-    def sync_mode_options(*_) -> None:
-        """Grey out options that have no effect in the selected mode."""
-        audio_only = mode_key() in AUDIO_MODES
-        also_combo.configure(state="disabled" if audio_only else "readonly")   # audio already is the output
-        subs_check.configure(state="disabled" if audio_only else "normal")     # cannot embed subs in audio
-
-    mode_combo.bind("<<ComboboxSelected>>", sync_mode_options)
-
-    btns = ttk.Frame(main)
-    btns.grid(row=4, column=0, columnspan=2, sticky="ew")
-    start_btn = ttk.Button(btns, text="Start download")
-    start_btn.pack(side="left")
-    stop_btn = ttk.Button(btns, text="Cancel", state="disabled")
-    stop_btn.pack(side="left", padx=6)
-    ttk.Button(btns, text="Open download folder",
-               command=lambda: open_folder(Path(out_var.get() or DEFAULT_OUT))).pack(side="left")
-    update_btn = ttk.Button(btns, text="Update yt-dlp")
-    update_btn.pack(side="right")
-
-    status_var = tk.StringVar(value="")
-    ttk.Label(main, textvariable=status_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
-    bar = ttk.Progressbar(main, maximum=100)
-    bar.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(2, 0))
-
-    log_box = tk.Text(main, height=14, wrap="none", state="disabled", relief="flat",
-                      borderwidth=0, highlightthickness=1, padx=6, pady=6)
-    text_widgets.append(log_box)
-    apply_theme(theme)
-    log_box.grid(row=7, column=0, sticky="nsew", pady=(8, 0))
-    main.rowconfigure(7, weight=2)
-    sb = ttk.Scrollbar(main, command=log_box.yview)
-    sb.grid(row=7, column=1, sticky="ns", pady=(8, 0))
-    log_box.configure(yscrollcommand=sb.set)
-
-    news = ttk.Frame(main)                     # update hint, only shown when a newer release exists
-    news.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-    news_label = ttk.Label(news, text="")
-    news_label.pack(side="left")
-    news_page_btn = ttk.Button(news, text="Release page")
-    news_page_btn.pack(side="right")
-    news_now_btn = ttk.Button(news, text="Update now")
-    news_now_btn.pack(side="right", padx=6)
-    news.grid_remove()
-
-    def show_app_update(update: dict) -> None:
-        news_label.configure(text=f"A new version of ytdl is available: v{update['version']}")
-        news_page_btn.configure(command=lambda: webbrowser.open(update["page"]))
-        if can_self_update() and update["asset_url"]:
-            news_now_btn.configure(command=lambda: run_self_update(update))
-        else:                                  # running as a script, or no file for this platform
-            news_now_btn.pack_forget()
-        news.grid()
-        gui_log(f"New version available: v{update['version']}  ->  {update['page']}")
-
-    def run_self_update(update: dict) -> None:
-        if str(start_btn.cget("state")) == "disabled":
-            messagebox.showinfo("Update", "Please wait until the current job has finished "
-                                          "(or cancel it), then click 'Update now' again.")
-            return
-        news_now_btn.configure(state="disabled")
-        set_busy(True)
-        stop_btn.configure(state="disabled")
-        status_var.set("Updating ytdl ...")
-
-        def work():
-            done = install_app_update(update, gui_log)
-            def finish():
-                if done:
-                    root.destroy()             # the new version has already been started
-                else:
-                    set_busy(False)
-                    status_var.set("")
-                    news_now_btn.configure(state="normal")
-                    messagebox.showwarning(
-                        "Update failed",
-                        "The automatic update did not work (see the log).\n"
-                        "Use 'Release page' to download the new version manually.")
-            root.after(0, finish)
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def gui_log(msg: str) -> None:
-        def _append():
-            m = PROGRESS_RE.search(str(msg))
-            if m:
-                bar["value"] = float(m.group(1))
-            m = ITEM_RE.match(str(msg))
-            if m:
-                status_var.set(f"Download {m.group(1)} of {m.group(2)}")
-                bar["value"] = 0
-            log_box.configure(state="normal")
-            log_box.insert("end", str(msg) + "\n")
-            log_box.see("end")
-            log_box.configure(state="disabled")
-        root.after(0, _append)
-
-    stop_flag = threading.Event()
-
-    def mode_key() -> str:
-        for k, v in MODES.items():
-            if v == mode_var.get():
-                return k
+    def mode_key(self) -> str:
+        for key, label in MODES.items():
+            if label == self.quality_var.get():
+                return key
         return "video"
 
-    sync_mode_options()                        # apply the stored mode right at startup
+    def sync_mode_options(self, *_) -> None:
+        """Offer the qualities of the chosen kind and grey out options without effect in audio mode."""
+        kind = self.kind_var.get()
+        keys = [k for k in MODES if mode_kind(k) == kind]
+        self.quality_combo.configure(values=[MODES[k] for k in keys])
+        if self.mode_key() not in keys:
+            self.quality_var.set(MODES[keys[0]])
+        audio_only = self.mode_key() in AUDIO_MODES
+        self.kind_var.set(mode_kind(self.mode_key()))
+        self.also_combo.configure(state="disabled" if audio_only else "readonly")
+        self.subs_check.configure(state="disabled" if audio_only else "normal")
 
-    def set_busy(busy: bool) -> None:
-        start_btn.configure(state="disabled" if busy else "normal")
-        update_btn.configure(state="disabled" if busy else "normal")
-        stop_btn.configure(state="normal" if busy else "disabled")
+    def pick_dir(self) -> None:
+        d = filedialog.askdirectory(initialdir=self.out_var.get() or str(Path.home()))
+        if d:
+            self.out_var.set(d)
 
-    def on_start():
-        urls = [l.strip() for l in url_box.get("1.0", "end").splitlines() if l.strip()]
-        urls = [u for u in urls if not u.startswith("#")]
-        if not urls:
-            messagebox.showwarning("No URLs", "Please enter at least one URL.")
+    def log(self, msg: str) -> None:
+        def _append():
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", str(msg) + "\n")
+            if int(self.log_box.index("end-1c").split(".")[0]) > 3000:
+                self.log_box.delete("1.0", "500.0")
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+        self.root.after(0, _append)
+
+    def save_options(self) -> None:
+        save_settings({"mode": self.mode_key(), "out": self.out_var.get(), "cookies": self.cookies(),
+                       "subs": self.subs_var.get(), "thumb": self.thumb_var.get(),
+                       "archive": self.arch_var.get(), "uploader": self.uploader_var.get(),
+                       "single": self.single_var.get(), "also_audio": self.also_var.get(),
+                       "sponsorblock": self.sponsor_var.get(), "autostart": self.auto_var.get(),
+                       "limit": self.limit_var.get().strip(), "parallel": self.parallel(),
+                       "theme": self.theme})
+
+    def cookies(self) -> str:
+        value = self.cookie_var.get()
+        return "" if value == NO_BROWSER else value
+
+    def parallel(self) -> int:
+        try:
+            return min(4, max(1, int(self.parallel_var.get())))
+        except ValueError:
+            return 1
+
+    def limit_rate(self) -> str:
+        value = self.limit_var.get().strip()
+        return value if re.fullmatch(r"\d+(\.\d+)?[KkMmGg]?", value) else ""
+
+    # ------------------------------------------------------------ clipboard & input
+
+    def _clipboard(self) -> str:
+        try:
+            return self.root.clipboard_get()
+        except tk.TclError:
+            return ""
+
+    def _on_focus(self, event) -> None:
+        """Back in the window with a new link in the clipboard: offer it in the empty link field."""
+        if event.widget is not self.root:
             return
-        save_settings({"mode": mode_key(), "out": out_var.get(), "cookies": cookie_var.get(),
-                       "subs": subs_var.get(), "thumb": thumb_var.get(), "archive": arch_var.get(),
-                       "uploader": uploader_var.get(), "single": single_var.get(),
-                       "also_audio": also_var.get(), "theme": theme})
-        stop_flag.clear()
-        set_busy(True)
-        bar["value"] = 0
-        status_var.set("")
-        out_dir = Path(out_var.get() or DEFAULT_OUT)
-        mode = mode_key()
-        also_audio = "" if also_var.get() == ALSO_AUDIO_NONE else also_var.get()
-        args = build_args(mode, out_dir, subs=subs_var.get(), thumb=thumb_var.get(),
-                          archive=arch_var.get(), cookies_browser=cookie_var.get(),
-                          sort_by_uploader=uploader_var.get(), no_playlist=single_var.get(),
-                          also_audio=also_audio)
+        clip = self._clipboard().strip()
+        if not looks_like_url(clip) or clip == self.last_clip:
+            return
+        if self.url_var.get() and not self.placeholder_on:
+            return
+        if any(it.url == clip for it in self.items):
+            return
+        self.last_clip = clip
+        self.placeholder_on = False
+        self.url_var.set(clip)
+        self.url_entry.configure(foreground="")
+
+    def _on_entry_paste(self, _event) -> str | None:
+        urls = extract_urls(self._clipboard())
+        if not urls:
+            return None                        # not a link: normal text paste
+        self.placeholder_on = False
+        self.url_entry.configure(foreground="")
+        self.url_var.set("")
+        self.add_urls(urls)
+        return "break"
+
+    def _on_global_paste(self, _event) -> None:
+        if isinstance(self.root.focus_get(), (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox, ttk.Spinbox)):
+            return
+        urls = extract_urls(self._clipboard())
+        if urls:
+            self.add_urls(urls)
+
+    def on_add(self) -> None:
+        text = "" if self.placeholder_on else self.url_var.get()
+        urls = extract_urls(text)
+        if not urls:
+            if text.strip():
+                messagebox.showinfo("Add", "That does not look like a link (it must start with http:// or https://).")
+            return
+        self.url_var.set("")
+        self.add_urls(urls)
+
+    def on_import(self) -> None:
+        path = filedialog.askopenfilename(title="Text file with one link per line",
+                                          filetypes=[("Text", "*.txt *.list"), ("All files", "*.*")])
+        if path:
+            try:
+                self.add_urls(read_url_file(path))
+            except OSError as e:
+                messagebox.showerror("Import", str(e))
+
+    # ------------------------------------------------------------ queue
+
+    def add_urls(self, urls: list[str]) -> None:
+        self.tabs.select(0)
+        known = {it.url for it in self.items if it.active}
+        no_playlist, cookies = self.single_var.get(), self.cookies()   # Tk variables: main thread only
+        for url in urls:
+            if url in known:
+                continue
+            known.add(url)
+            item = Item(url)
+            self._add_card(item)
+            threading.Thread(target=self._info_worker, args=(item, no_playlist, cookies), daemon=True).start()
+        self.update_state()
+
+    def _add_card(self, item: Item) -> None:
+        self.items.append(item)
+        item.card = Card(self, item)
+        item.card.frame.pack(fill="x", pady=(0, 8), padx=(0, 4))
+        item.card.set_thumb()
+        self.update_state()
+
+    def _info_worker(self, item: Item, no_playlist: bool, cookies: str) -> None:
+        with self.info_slots:
+            if item.removed:
+                return
+            if find_ytdlp() is None:
+                info = None
+                for _ in range(60):            # first start: the tools are still being downloaded
+                    time.sleep(1)
+                    if find_ytdlp() is not None or item.removed:
+                        break
+                if find_ytdlp() is not None and not item.removed:
+                    info = fetch_info(item.url, no_playlist=no_playlist, cookies_browser=cookies)
+            else:
+                info = fetch_info(item.url, no_playlist=no_playlist, cookies_browser=cookies)
+            thumb = fetch_thumbnail(info["thumbnail"]) if info and not info["is_playlist"] else None
+        self.root.after(0, lambda: self._info_done(item, info, thumb))
+
+    def _info_done(self, item: Item, info: dict | None, thumb) -> None:
+        if item.removed:
+            return
+        if info and info["is_playlist"] and info["entries"]:
+            self._remove_card(item)
+            chosen = self._pick_playlist(info)
+            if chosen:
+                for e in chosen:
+                    sub = Item(e["url"])
+                    sub.title = e["title"]
+                    sub.uploader = e.get("uploader") or info["uploader"]
+                    sub.duration = e.get("duration")
+                    sub.status = "queued"
+                    self._add_card(sub)
+                    threading.Thread(target=self._thumb_worker, args=(sub, e.get("thumbnail", "")),
+                                     daemon=True).start()
+                self.log(f"Playlist '{info['title']}': {len(chosen)} videos added.")
+            self.update_state()
+            self._autostart()
+            return
+        if info:
+            item.title = info["title"] or item.url
+            item.uploader = info["uploader"]
+            item.duration = info["duration"]
+            item.thumb = thumb
+        else:
+            item.uploader = "No preview available - will still try to download"
+        item.status = "queued"
+        item.card.set_thumb()
+        item.card.refresh()
+        self.update_state()
+        self._autostart()
+
+    def _thumb_worker(self, item: Item, url: str) -> None:
+        with self.info_slots:
+            img = fetch_thumbnail(url)
+        if img is not None:
+            def apply():
+                if not item.removed and item.card:
+                    item.thumb = img
+                    item.card.set_thumb()
+            self.root.after(0, apply)
+
+    def _pick_playlist(self, info: dict) -> list[dict] | None:
+        if len(info["entries"]) == 1:
+            return info["entries"]
+        dialog = PlaylistDialog(self.root, info["title"], info["entries"], COLORS[self.theme])
+        self.root.wait_window(dialog)
+        return dialog.result
+
+    def _autostart(self) -> None:
+        if self.auto_var.get() and any(it.status == "queued" for it in self.items):
+            self.start_all()
+
+    def _remove_card(self, item: Item) -> None:
+        item.removed = True
+        item.stop.set()
+        if item in self.items:
+            self.items.remove(item)
+        if item.card:
+            item.card.frame.destroy()
+            item.card = None
+
+    def remove_item(self, item: Item) -> None:
+        self._remove_card(item)
+        self.update_state()
+        self.pump()
+
+    def cancel_item(self, item: Item) -> None:
+        item.stop.set()
+
+    def retry_item(self, item: Item) -> None:
+        item.stop = threading.Event()
+        item.status, item.pct, item.error = "queued", 0.0, ""
+        item.speed = item.eta = item.size = ""
+        item.card.refresh()
+        self.update_state()
+        self.start_all()
+
+    def show_item(self, item: Item) -> None:
+        if item.path and Path(item.path).exists():
+            reveal_file(Path(item.path))
+        else:
+            open_folder(Path(self.out_var.get() or DEFAULT_OUT))
+
+    def clear_finished(self) -> None:
+        for item in [it for it in self.items if it.finished]:
+            self._remove_card(item)
+        self.update_state()
+
+    def start_all(self) -> None:
+        if not self.running:
+            self.batch = {"ok": 0, "bad": 0}
+        self.running = True
+        self.save_options()
+        self.pump()
+
+    def stop_all(self) -> None:
+        self.running = False
+        for it in self.items:
+            if it.status == "downloading":
+                it.stop.set()
+        self.update_state()
+
+    def pump(self) -> None:
+        """Start waiting downloads while there is a free slot; finish the batch when nothing is left."""
+        if self.running and not self.tools_busy:
+            active = sum(1 for it in self.items if it.status == "downloading")
+            for it in self.items:
+                if active >= self.parallel():
+                    break
+                if it.status == "queued":
+                    self._launch(it)
+                    active += 1
+            if not any(it.active for it in self.items):
+                self.running = False
+                self._batch_done()
+        self.update_state()
+
+    def _batch_done(self) -> None:
+        ok, bad = self.batch["ok"], self.batch["bad"]
+        if ok or bad:
+            summary = f"{ok} succeeded" + (f", {bad} failed" if bad else "")
+            self.log("Done. " + summary)
+            notify("ytdl", "Done: " + summary, self.root)
+
+    def snapshot(self) -> dict:
+        return {"mode": self.mode_key(), "out": Path(self.out_var.get() or DEFAULT_OUT).expanduser(),
+                "subs": self.subs_var.get(), "thumb": self.thumb_var.get(), "archive": self.arch_var.get(),
+                "cookies": self.cookies(), "uploader": self.uploader_var.get(),
+                "single": self.single_var.get(), "sponsor": self.sponsor_var.get(),
+                "also": "" if self.also_var.get() == ALSO_AUDIO_NONE else self.also_var.get(),
+                "limit": self.limit_rate()}
+
+    def _launch(self, item: Item) -> None:
+        opts = self.snapshot()
+        item.status, item.pct, item.mode = "downloading", 0.0, opts["mode"]
+        item.speed = item.eta = item.size = item.error = ""
+        item.card.refresh()
+        threading.Thread(target=self._download_worker, args=(item, opts), daemon=True).start()
+
+    def _download_worker(self, item: Item, o: dict) -> None:
+        audio = o["mode"] in AUDIO_MODES
+        args = build_args(o["mode"], o["out"], subs=o["subs"], thumb=o["thumb"], archive=o["archive"],
+                          cookies_browser=o["cookies"], sort_by_uploader=o["uploader"],
+                          no_playlist=o["single"], also_audio=o["also"], limit_rate=o["limit"],
+                          sponsorblock=o["sponsor"])
+        found: dict = {}
+        state = {"skipped": False, "last": 0.0}
+
+        def refresh_card() -> None:
+            if not item.removed and item.card:
+                item.card.refresh()
+
+        def on_line(line: str) -> None:
+            prog = parse_progress(line)
+            if prog:
+                item.pct, item.size = prog["pct"], prog["size"] or item.size
+                item.speed, item.eta = prog["speed"], prog["eta"]
+                now = time.monotonic()
+                if now - state["last"] > 0.15 or prog["pct"] >= 100:
+                    state["last"] = now
+                    self.root.after(0, refresh_card)
+                return
+            track_output_file(found, line, audio)
+            if item.title == item.url and DEST_RE.match(line.strip()):
+                item.title = INTERMEDIATE_RE.sub("", Path(DEST_RE.match(line.strip()).group("path")).name)
+                self.root.after(0, refresh_card)
+            if ARCHIVED_RE.search(line):
+                state["skipped"] = True
+            if line.startswith("ERROR"):
+                item.error = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", line)
+            self.log(f"[{shorten(item.title, 28)}] {line}" if line.strip() else "")
+
+        rc = 1
+        try:
+            prepared = prepare_command(args, self.log)
+            if prepared is None:
+                item.error = "yt-dlp is not available (offline?)"
+            else:
+                base, args = prepared
+                rc = download_one(base, args, item.url, o["out"], on_line, item.stop,
+                                  clean_intermediates=bool(o["also"]) and not audio)
+        except Exception as e:                 # never leave a card stuck on "downloading"
+            item.error = str(e)
+            self.log(f"ERROR: {e}")
+        path = output_file(found)
+        self.root.after(0, lambda: self._download_done(item, rc, path, state["skipped"]))
+
+    def _download_done(self, item: Item, rc: int, path: str, skipped: bool) -> None:
+        if item.removed:
+            self.pump()
+            return
+        item.path = path
+        if rc == 0:
+            item.pct = 100.0
+            if skipped and not path:
+                item.status = "skipped"
+            else:
+                item.status = "done"
+                try:
+                    item.size = fmt_size(Path(path).stat().st_size)
+                except OSError:
+                    item.size = item.size.lstrip("~")
+                self._add_history(item)
+            self.batch["ok"] += 1
+        elif rc == -1:
+            item.status = "cancelled"
+        else:
+            item.status = "failed"
+            self.batch["bad"] += 1
+        item.card.refresh()
+        self.pump()
+
+    # ------------------------------------------------------------ state display
+
+    def update_state(self) -> None:
+        counts = {s: 0 for s in STATUS_ORDER}
+        for it in self.items:
+            counts[it.status] += 1
+        waiting = counts["queued"] + counts["fetching"]
+        parts = []
+        if counts["downloading"]:
+            parts.append(f"{counts['downloading']} downloading")
+        if waiting:
+            parts.append(f"{waiting} waiting")
+        if counts["done"] + counts["skipped"]:
+            parts.append(f"{counts['done'] + counts['skipped']} done")
+        if counts["failed"]:
+            parts.append(f"{counts['failed']} failed")
+        self.summary.configure(text="  ·  ".join(parts))
+        self.tabs.tab(0, text=f"Queue ({len(self.items)})" if self.items else "Queue")
+
+        can_start = counts["queued"] > 0 and not self.tools_busy
+        self.start_btn.configure(state="normal" if can_start and not (self.running and not counts["queued"])
+                                 else "disabled")
+        self.start_btn.configure(text=f"Download all ({counts['queued']})" if counts["queued"] else "Download all")
+        self.stop_btn.configure(state="normal" if counts["downloading"] or self.running else "disabled")
+        self.update_btn.configure(state="disabled" if counts["downloading"] or self.tools_busy else "normal")
+
+        if self.items:
+            self.empty_lbl.place_forget()
+        else:
+            self.empty_lbl.place(relx=0.5, rely=0.42, anchor="center")
+
+    # ------------------------------------------------------------ history
+
+    def _history_tags(self) -> None:
+        self.hist.tag_configure("missing", foreground=COLORS[self.theme]["muted"])
+
+    def _add_history(self, item: Item) -> None:
+        self.history.append({"title": item.title, "url": item.url, "path": item.path, "mode": item.mode,
+                             "time": time.time(), "uploader": item.uploader})
+        save_history(self.history)
+        self.refresh_history()
+
+    def refresh_history(self) -> None:
+        self.hist.delete(*self.hist.get_children())
+        for i in range(len(self.history) - 1, -1, -1):
+            h = self.history[i]
+            missing = bool(h.get("path")) and not Path(h["path"]).exists()
+            when = time.strftime("%Y-%m-%d  %H:%M", time.localtime(h.get("time", 0)))
+            title = h.get("title", "") + ("   (file missing)" if missing else "")
+            self.hist.insert("", "end", iid=str(i), values=(title, MODES.get(h.get("mode", ""), ""), when),
+                             tags=("missing",) if missing else ())
+        self._history_tags()
+
+    def _selected_history(self) -> list[dict]:
+        return [self.history[int(i)] for i in self.hist.selection()]
+
+    def hist_open(self) -> None:
+        for h in self._selected_history()[:1]:
+            if h.get("path") and Path(h["path"]).exists():
+                open_path(Path(h["path"]))
+            else:
+                messagebox.showinfo("History", "The file no longer exists at its old location.")
+
+    def hist_reveal(self) -> None:
+        for h in self._selected_history()[:1]:
+            reveal_file(Path(h["path"])) if h.get("path") else None
+
+    def hist_again(self) -> None:
+        self.add_urls([h["url"] for h in self._selected_history() if h.get("url")])
+
+    def hist_remove(self) -> None:
+        drop = {int(i) for i in self.hist.selection()}
+        self.history = [h for i, h in enumerate(self.history) if i not in drop]
+        save_history(self.history)
+        self.refresh_history()
+
+    def hist_clear(self) -> None:
+        if self.history and messagebox.askyesno("History", "Remove all entries from the history?\n"
+                                                          "(Downloaded files are not touched.)"):
+            self.history = []
+            save_history(self.history)
+            self.refresh_history()
+
+    # ------------------------------------------------------------ tools & updates
+
+    def set_tools_busy(self, busy: bool, text: str = "") -> None:
+        self.tools_busy = busy
+        self.head_status.configure(text=text if busy else "")
+        self.update_state()
+        if not busy:
+            self.pump()
+
+    def _startup_tools(self) -> None:
+        """Fetch missing tools, otherwise check for a yt-dlp update once a day (YouTube changes often;
+        an outdated yt-dlp is the most common reason downloads fail)."""
+        missing = find_ytdlp() is None or find_js_runtime() is None
+        update_due = (managed_ytdlp().exists()
+                      and time.time() - float(self.cfg.get("last_update", 0)) > UPDATE_INTERVAL)
+        if not (missing or update_due):
+            return
+        self.set_tools_busy(True, "First start: downloading tools …" if missing else "Checking for updates …")
 
         def work():
-            try:
-                ok, bad = download(urls, args, out_dir, gui_log, stop_flag,
-                                   clean_intermediates=also_audio and mode not in AUDIO_MODES)
-                summary = f"{ok} succeeded, {bad} failed"
-                root.after(0, lambda: status_var.set("Done: " + summary))
-                if not stop_flag.is_set():
-                    root.after(0, lambda: notify("ytdl", "Done: " + summary, root))
-            finally:
-                root.after(0, lambda: set_busy(False))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def on_update():
-        set_busy(True)
-        stop_btn.configure(state="disabled")
-
-        def work():
-            try:
-                if update_ytdlp(gui_log):
-                    save_settings({"last_update": time.time()})
-                if find_js_runtime() is None:
-                    install_deno(gui_log)
-            finally:
-                root.after(0, lambda: set_busy(False))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    start_btn.configure(command=on_start)
-    update_btn.configure(command=on_update)
-    stop_btn.configure(command=lambda: (stop_flag.set(), gui_log("Cancelling ...")))
-
-    gui_log(("ytdl " + ("(dev)" if __version__ == "dev" else f"v{__version__}"))
-            + f" ready. Output folder: {out_var.get()}")
-    _, _src = find_ffmpeg()
-    if _src == "none":
-        gui_log("Note: " + ffmpeg_hint())
-
-    # At startup, in the background: fetch missing tools, otherwise check for yt-dlp updates once a day
-    # (YouTube changes often; an outdated yt-dlp is the most common reason downloads fail).
-    missing = find_ytdlp() is None or find_js_runtime() is None
-    update_due = (managed_ytdlp().exists()
-                  and time.time() - float(cfg.get("last_update", 0)) > UPDATE_INTERVAL)
-    if missing or update_due:
-        set_busy(True)
-        stop_btn.configure(state="disabled")
-        status_var.set("Checking for updates ..." if not missing else "First start: downloading tools ...")
-
-        def startup():
             try:
                 if missing:
-                    ensure_tools(gui_log)
+                    ensure_tools(self.log)
                     ok = find_ytdlp() is not None
                 else:
-                    ok = update_ytdlp(gui_log)
+                    ok = update_ytdlp(self.log)
                 if ok:
                     save_settings({"last_update": time.time()})
             finally:
-                root.after(0, lambda: (set_busy(False), status_var.set("")))
+                self.root.after(0, lambda: self.set_tools_busy(False))
 
-        threading.Thread(target=startup, daemon=True).start()
+        threading.Thread(target=work, daemon=True).start()
 
-    def app_update_check():                    # newer ytdl release on GitHub? (silent if not)
+    def on_update_ytdlp(self) -> None:
+        self.set_tools_busy(True, "Updating yt-dlp …")
+
+        def work():
+            try:
+                if update_ytdlp(self.log):
+                    save_settings({"last_update": time.time()})
+                if find_js_runtime() is None:
+                    install_deno(self.log)
+            finally:
+                self.root.after(0, lambda: self.set_tools_busy(False))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _check_app_update(self) -> None:       # newer ytdl release on GitHub? (silent if not)
         found = check_app_update()
         if found:
-            root.after(0, lambda: show_app_update(found))
+            self.root.after(0, lambda: self.show_app_update(found))
 
-    threading.Thread(target=app_update_check, daemon=True).start()
+    def show_app_update(self, update: dict) -> None:
+        self.news_label.configure(text=f"A new version of ytdl is available: v{update['version']}")
+        self.news_page_btn.configure(command=lambda: webbrowser.open(update["page"]))
+        if can_self_update() and update["asset_url"]:
+            self.news_now_btn.configure(command=lambda: self.run_self_update(update))
+        else:                                  # running as a script, or no file for this platform
+            self.news_now_btn.pack_forget()
+        self.news.grid()
+        self.log(f"New version available: v{update['version']}  ->  {update['page']}")
 
+    def run_self_update(self, update: dict) -> None:
+        if any(it.status == "downloading" for it in self.items) or self.tools_busy:
+            messagebox.showinfo("Update", "Please wait until the current downloads have finished "
+                                          "(or cancel them), then click 'Update now' again.")
+            return
+        self.news_now_btn.configure(state="disabled")
+        self.set_tools_busy(True, "Updating ytdl …")
+
+        def work():
+            done = install_app_update(update, self.log)
+
+            def finish():
+                if done:
+                    self.root.destroy()        # the new version has already been started
+                    return
+                self.set_tools_busy(False)
+                self.news_now_btn.configure(state="normal")
+                messagebox.showwarning(
+                    "Update failed",
+                    "The automatic update did not work (see the log).\n"
+                    "Use 'Release page' to download the new version manually.")
+            self.root.after(0, finish)
+
+        threading.Thread(target=work, daemon=True).start()
+
+
+def system_theme() -> str:
+    try:
+        import darkdetect
+        return "dark" if darkdetect.isDark() else "light"
+    except Exception:
+        return "light"
+
+
+def run_gui() -> int:
+    if tk is None:
+        print("Tkinter is not installed.")
+        print("Linux:  sudo apt install python3-tk   (or python3-tkinter)")
+        return 1
+    cleanup_old_versions()                     # leftovers of a previous self-update
+    root = tk.Tk()
+    App(root)
     root.mainloop()
     return 0
 

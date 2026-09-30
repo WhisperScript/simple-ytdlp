@@ -42,7 +42,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y python3-tk
 
       - name: Dependencies
-        run: python -m pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect
+        run: python -m pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect pillow
 
       - name: Build (Windows/Linux - single file)
         if: ${{ !startsWith(matrix.name, 'macos') }}
