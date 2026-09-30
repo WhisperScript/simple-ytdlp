@@ -137,7 +137,7 @@ class VirtualList(GuiCase):
         v = app.view
         self.assertLessEqual(len(v.bound) + len(v.free), 20)
         self.assertEqual(v._region[3], 1000 * mod.ROW_H - mod.CARD_GAP)
-        ys = sorted(int(v.canvas.coords(r.win)[1]) for r in v.bound.values())
+        ys = sorted(r.y0 for r in v.bound.values())
         self.assertTrue(all(y % mod.ROW_H == 0 for y in ys))
         self.assertEqual(ys, sorted(set(ys)))
 
@@ -235,7 +235,11 @@ class CardLayout(GuiCase):
         app._items_changed()
         pump(100)
         row = app.view.row_for(it)
-        self.assertLessEqual(row.card.winfo_reqheight(), mod.CARD_H - 4)
+        card = row.geo["card"]
+        for part in ("title", "meta", "status", "primary", "more", "thumb", "strip"):
+            box = row.geo[part]
+            self.assertTrue(card[1] <= box[1] and box[3] <= card[3], f"{part} {box} leaves the card {card}")
+        self.assertLess(row.geo["status"][2], row.geo["primary"][0], "the text runs into the buttons")
         self.assertTrue(row.badge.winfo_ismapped())
         self.assertEqual(row.badge.cget("text"), "1:01")
         self.assertEqual(row.strip.cget("background"), mod.COLORS["dark"]["accent"])
@@ -251,6 +255,72 @@ class CardLayout(GuiCase):
         self.assertIn("Age-restricted", row.status.cget("text"))
         self.assertEqual(row.primary.cget("text"), "Retry")
         self.assertEqual(row.strip.cget("background"), mod.COLORS["dark"]["bad"])
+
+
+class CardMouse(GuiCase):
+    """Clicks on the drawn cards: the buttons answer, the rest of the card selects."""
+
+    def setUp(self):
+        super().setUp()
+        self.item = mk(1, "downloading")
+        app.items.append(self.item)
+        app._items_changed()
+        pump(100)
+        self.row = app.view.row_for(self.item)
+        self.canvas = app.view.canvas
+
+    def at(self, part, dx=0.5, dy=0.5):
+        x0, y0, x1, y1 = self.row.geo[part]
+        return int(x0 + (x1 - x0) * dx - self.canvas.canvasx(0)), int(y0 + (y1 - y0) * dy - self.canvas.canvasy(0))
+
+    def point(self, xy):
+        self.canvas.event_generate("<Motion>", x=xy[0], y=xy[1])
+        self.canvas.update()
+
+    def press_release(self, down, up=None):
+        self.point(down)
+        self.canvas.event_generate("<ButtonPress-1>", x=down[0], y=down[1])
+        if up:
+            self.point(up)
+        self.canvas.event_generate("<ButtonRelease-1>", x=(up or down)[0], y=(up or down)[1])
+        self.canvas.update()
+
+    def test_the_primary_button_acts_and_does_not_select_the_card(self):
+        with mock.patch.object(app, "pause_item") as pause:
+            self.press_release(self.at("primary"))
+        pause.assert_called_once_with(self.item)
+        self.assertFalse(app.selected)
+
+    def test_releasing_outside_the_button_does_nothing(self):
+        with mock.patch.object(app, "pause_item") as pause:
+            self.press_release(self.at("primary"), up=self.at("title"))
+        pause.assert_not_called()
+
+    def test_clicking_the_card_selects_it_and_the_right_button_opens_the_menu(self):
+        self.point(self.at("title"))
+        self.canvas.event_generate("<ButtonPress-1>", x=self.at("title")[0], y=self.at("title")[1])
+        self.assertEqual(app.selected, {self.item.id})
+        with mock.patch.object(app, "card_menu") as menu:
+            xy = self.at("meta", 0.9)
+            self.point(xy)
+            self.canvas.event_generate("<Button-2>" if mod.IS_MAC else "<Button-3>", x=xy[0], y=xy[1])
+        menu.assert_called_once()
+
+    def test_the_more_button_opens_the_menu_below_itself(self):
+        with mock.patch.object(app, "card_menu") as menu:
+            self.press_release(self.at("more"))
+        self.assertIs(menu.call_args.kwargs["anchor"].row, self.row)
+
+    def test_loading_cards_animate_their_bar(self):
+        app._drop(list(app.items))
+        loading = mod.Item(U("loading1"))
+        app.items.append(loading)
+        app._items_changed()
+        pump(200)
+        row = app.view.row_for(loading)
+        first = self.canvas.coords(row.i_busy)
+        pump(300)
+        self.assertNotEqual(first, self.canvas.coords(row.i_busy))
 
 
 # ----------------------------------------------------------------------------- selection and keyboard
@@ -450,6 +520,71 @@ class Feedback(GuiCase):
         pump(30)
         self.assertEqual(app.toast_lbl.cget("text"), "Already in the queue")
         self.assertEqual(len(app.items), 1)
+
+    def finished(self, url, name="f.mp4", exists=True):
+        item = mod.Item(url)
+        item.added_mode, item.status, item.path = app.mode_key(), "done", str(self.out / name)
+        if exists:
+            (self.out / name).write_bytes(b"x")
+        app.items.append(item)
+        app._items_changed()
+        return item
+
+    def test_another_link_to_the_same_video_jumps_to_its_card(self):
+        done = self.finished("https://www.youtube.com/watch?v=dupVID00001")
+        app.add_urls(["https://youtu.be/dupVID00001?si=abc", "https://x.test/other"])
+        pump(30)
+        self.assertEqual(len(app.items), 2, "the same video must not get a second card")
+        self.assertEqual(app.selected, {done.id})
+        app.add_urls(["https://youtu.be/dupVID00001"])
+        self.assertEqual(app.toast_lbl.cget("text"), "Already downloaded")
+
+    def test_the_same_video_in_another_format_is_another_download(self):
+        self.finished("https://youtu.be/fmtVID00001")
+        app.kind_var.set("audio")
+        app._on_kind()
+        app.add_urls(["https://youtu.be/fmtVID00001"])
+        self.assertEqual(len(app.items), 2)
+        self.assertEqual(app.items[1].added_mode, "mp3")
+        self.assertNotIn("name", app.items[1].overrides, "video and mp3 do not share a file name")
+
+    def test_another_quality_of_the_same_video_gets_its_own_file_name(self):
+        app.quality_var.set(mod.quality_label("video1080"))
+        app.sync_mode_options()
+        app.add_urls(["https://youtu.be/qltVID00001"])
+        app.quality_var.set(mod.quality_label("video720"))
+        app.sync_mode_options()
+        app.add_urls(["https://youtu.be/qltVID00001"])
+        self.assertEqual(len(app.items), 2)
+        self.assertEqual(app.items[1].overrides["name"], "%(title)s [Up to 720p]")
+        self.assertIn("file named by quality", mod.overrides_summary(app.items[1].overrides))
+
+    def test_a_finished_download_whose_file_is_gone_is_downloaded_again(self):
+        gone = self.finished("https://youtu.be/gonVID00001", exists=False)
+        app.add_urls(["https://youtu.be/gonVID00001"])
+        self.assertEqual(len(app.items), 1)
+        self.assertIsNot(app.items[0], gone)
+        self.assertNotIn("Already", app.toast_lbl.cget("text"))
+
+    def test_history_skips_a_video_that_is_still_on_disk_but_not_one_that_was_deleted(self):
+        (self.out / "h.mp4").write_bytes(b"x")
+        app.history = [{"title": "H", "url": "https://youtu.be/hisVID00001", "path": str(self.out / "h.mp4"),
+                        "mode": "video", "time": time.time()},
+                       {"title": "G", "url": "https://youtu.be/hisVID00002", "path": str(self.out / "nope.mp4"),
+                        "mode": "video", "time": time.time()}]
+        app.arch_var.set(True)
+        app.add_urls(["https://youtu.be/hisVID00001"])
+        self.assertEqual(app.items, [])
+        self.assertIn("History", app.toast_lbl.cget("text"))
+        app.add_urls(["https://youtu.be/hisVID00002"])
+        self.assertEqual(len(app.items), 1, "the file was deleted: download it again")
+        app.arch_var.set(False)
+        app.add_urls(["https://youtu.be/hisVID00001"])
+        self.assertEqual(len(app.items), 2, "with the setting off it is always added")
+
+    def test_yt_dlps_own_archive_is_not_used_by_the_window(self):
+        app.arch_var.set(True)
+        self.assertIs(app.snapshot()["archive"], False)
 
     def test_notices_by_priority(self):
         app.set_notice("update", "New version", actions=[("Release page", lambda: None)])

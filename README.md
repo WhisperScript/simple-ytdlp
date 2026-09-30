@@ -123,6 +123,7 @@ nothing is fetched twice. **Pause all** and **Resume all** do the same for the w
 ### More
 
 - **Many links at once:** paste as many as you like; they wait in line and download two at a time (up to four in the settings).
+- **Same video twice?** A video is in the list once per format - paste it again and the app jumps to its card (a failed one is retried). Want it as MP3 or in another quality? That is a new download, saved under its own file name. Deleted the file? Paste the link again and it downloads again. ("Skip already downloaded" in the settings only skips videos that are in the History *and* still on your disk.)
 - **Finished?** You get a notification when everything is done.
 - **Light or dark:** follows your system; change it under **View → Theme**.
 - **Everything in one place:** the **Settings …** button has subtitles, speed limit, file names, proxy and more.
@@ -157,6 +158,14 @@ picks another one, **Open folder** shows it.
 Some videos are only shown to logged-in users. Open **Settings …**, choose the browser you are logged in with under
 **Cookies from browser**, then press **Retry** on the card. The app only reads the login from your browser to
 ask the website for the video.
+</details>
+
+<details>
+<summary><b>A card says "ffprobe is missing"</b></summary>
+
+Some downloads (for example videos that come in separate picture and sound streams) need a second helper tool,
+ffprobe. Use **Tools → Get ffmpeg tools** (about 150 MB, once; Windows and Linux), then press **Retry**. On a Mac:
+`brew install ffmpeg`.
 </details>
 
 <details>
