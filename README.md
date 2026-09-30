@@ -30,19 +30,19 @@ get a notification when a run finishes.
   link in the clipboard lands in the queue. Text files with one link per line can be imported.
 - **Queue with previews:** each download is a card with thumbnail, title, channel, duration, live
   progress, speed and ETA. Cancel, retry, remove or show the file per card; up to 4 downloads
-  run in parallel (Options → Parallel).
+  run in parallel (Settings → Parallel downloads).
 - **Playlists:** a playlist link opens a selection list first, so you only add the videos you want.
 - **Video or audio:** pick the kind, then the quality (best, 4K, 1440p, 1080p, 720p, 480p, or
   mp3 / m4a / opus).
 - **History:** every finished download is kept; open the file, show it in the folder or
   download it again.
-- **Per item:** right-click a card (or double-click it, or use **Options**) to change just that
+- **Per item:** right-click a card (or double-click it, or the **Options** button) to change just that
   download: video/audio quality, an exact format picked from the real format list (video + audio
   rows are combined), only a part of the video (start/end, optionally an exact re-encoded cut),
   chapters (embed markers, one file per chapter) and extra yt-dlp arguments. "Apply to all
   waiting" copies the choices to the rest of the queue. The menu also copies the link, opens it
   in the browser and shows finished files.
-- **Options (whole queue):** subtitles with your own languages, embedded thumbnail, skip already
+- **Settings (whole queue):** the *Settings …* button (Cmd/Ctrl+comma) opens a window sorted by topic: subtitles with your own languages, embedded thumbnail, skip already
   downloaded, folder per channel, file name template, SponsorBlock, chapters, speed limit, proxy,
   cookies from a browser, extra yt-dlp arguments, parallel downloads, start automatically.
 - **Profiles:** save the current settings under a name ("Music", "Archive", …) and load them

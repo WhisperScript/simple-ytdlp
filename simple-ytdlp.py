@@ -531,11 +531,11 @@ def fmt_clock(seconds: float) -> str:
 
 FRIENDLY_ERRORS = [
     (r"confirm your age|age-restricted|age restricted",
-     "Age-restricted - pick your browser under Options > Cookies from"),
+     "Age-restricted - pick your browser under Settings > Cookies from browser"),
     (r"private video|this video is private",
-     "Private video - sign in in your browser and pick it under Options > Cookies from"),
+     "Private video - sign in in your browser and pick it under Settings > Cookies from browser"),
     (r"not a bot|sign in to confirm",
-     "YouTube wants a login - use Options > Cookies from, or update yt-dlp"),
+     "YouTube wants a login - use Settings > Cookies from browser, or update yt-dlp"),
     (r"http error 429|too many requests",
      "Rate limited (HTTP 429) - wait a few minutes, lower Parallel, or use cookies"),
     (r"not available in your country|geo.?restrict|blocked it in your country",
@@ -1126,7 +1126,7 @@ class Card:
 
         self.bar = ttk.Progressbar(self.frame, maximum=100)
         self.bar.grid(row=2, column=1, sticky="ew", pady=(0, 4))
-        self.status_lbl = ttk.Label(self.frame, anchor="w")
+        self.status_lbl = ttk.Label(self.frame, anchor="w", wraplength=560, justify="left")
         self.status_lbl.grid(row=3, column=1, sticky="ew")
 
         self.btn_box = ttk.Frame(self.frame)
@@ -1181,7 +1181,7 @@ class Card:
         elif st == "skipped":
             text, color = "✓ Already downloaded", colors["ok"]
         elif st == "failed":
-            text, color = ("✗ Failed" + (f"   ·   {shorten(friendly_error(it.error), 90)}" if it.error else ""),
+            text, color = ("✗ Failed" + (f"   ·   {shorten(friendly_error(it.error), 160)}" if it.error else ""),
                            colors["bad"])
         else:
             text, color = "Cancelled", colors["muted"]
@@ -1328,7 +1328,7 @@ class ItemDialog(tk.Toplevel if tk else object):
 
         ttk.Label(body, text="Download as").grid(row=2, column=0, sticky="w", pady=4)
         self.mode_var = tk.StringVar(value=MODES.get(o.get("mode", ""), self.DEFAULT_MODE))
-        ttk.Combobox(body, textvariable=self.mode_var, state="readonly", width=28,
+        ttk.Combobox(body, textvariable=self.mode_var, state="readonly", width=36,
                      values=[self.DEFAULT_MODE, *MODES.values()]).grid(row=2, column=1, columnspan=3, sticky="w")
 
         ttk.Label(body, text="Exact format").grid(row=3, column=0, sticky="w", pady=4)
@@ -1478,6 +1478,96 @@ class ItemDialog(tk.Toplevel if tk else object):
         self.destroy()
 
 
+class SettingsDialog(tk.Toplevel if tk else object):
+    """All settings of the download queue, grouped by topic. The widgets edit the variables of the
+    App directly, so changes apply immediately; they are stored when the window is closed."""
+
+    def __init__(self, app: "App"):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Settings")
+        self.transient(app.root)
+        self.resizable(False, False)
+        switch = "Switch.TCheckbutton" if sv_ttk is not None else "TCheckbutton"
+        body = ttk.Frame(self, padding=16)
+        body.grid(row=0, column=0)
+
+        def section(title: str, row: int) -> ttk.Frame:
+            box = ttk.LabelFrame(body, text=title, padding=(12, 8, 12, 10))
+            box.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+            box.columnconfigure(1, weight=1)
+            return box
+
+        def field(box, row: int, label: str, widget, hint: str = "") -> None:
+            ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", pady=3, padx=(0, 12))
+            widget.grid(row=row, column=1, sticky="w", pady=3)
+            if hint:
+                ttk.Label(box, text=hint, style="Muted.TLabel").grid(row=row, column=2, sticky="w", padx=(8, 0))
+
+        def toggles(box, items) -> None:
+            for i, (text, var) in enumerate(items):
+                check = ttk.Checkbutton(box, text=text, variable=var, style=switch)
+                check.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 28), pady=3)
+                if var is app.subs_var:
+                    app.subs_check = check
+
+        general = section("Downloads", 0)
+        toggles(general, (("Skip already downloaded", app.arch_var), ("Single video only (no playlist)", app.single_var),
+                          ("Folder per channel", app.uploader_var), ("Start right after adding", app.auto_var),
+                          ("Watch the clipboard for links", app.clip_watch_var)))
+        speed = ttk.Frame(general)
+        speed.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(speed, text="Parallel downloads").pack(side="left")
+        ttk.Spinbox(speed, textvariable=app.parallel_var, from_=1, to=4, width=3,
+                    state="readonly").pack(side="left", padx=(8, 24))
+        ttk.Label(speed, text="Speed limit").pack(side="left")
+        ttk.Entry(speed, textvariable=app.limit_var, width=7).pack(side="left", padx=(8, 4))
+        ttk.Label(speed, text="e.g. 2M", style="Muted.TLabel").pack(side="left")
+
+        extras = section("Video and audio extras", 1)
+        toggles(extras, (("Subtitles", app.subs_var), ("Embed thumbnail", app.thumb_var),
+                         ("Embed chapters", app.chapters_var), ("Remove sponsor segments", app.sponsor_var)))
+        field(extras, 2, "Subtitle languages", ttk.Entry(extras, textvariable=app.sub_langs_var, width=14),
+              "e.g. en,de or all")
+
+        net = section("Login and network", 2)
+        field(net, 0, "Cookies from browser",
+              ttk.Combobox(net, textvariable=app.cookie_var, values=[NO_BROWSER, *BROWSERS[1:]],
+                           state="readonly", width=12), "for private or age-restricted videos")
+        field(net, 1, "Proxy", ttk.Entry(net, textvariable=app.proxy_var, width=30), "e.g. http://host:8080")
+
+        adv = section("Advanced", 3)
+        field(adv, 0, "File name", ttk.Entry(adv, textvariable=app.name_var, width=30), "default: %(title)s")
+        field(adv, 1, "Extra yt-dlp arguments", ttk.Entry(adv, textvariable=app.args_var, width=30))
+
+        prof = section("Profiles", 4)
+        row = ttk.Frame(prof)
+        row.grid(row=0, column=0, columnspan=3, sticky="w")
+        app.profile_combo = ttk.Combobox(row, textvariable=app.profile_var, width=20,
+                                         values=sorted(load_settings().get("profiles", {})))
+        app.profile_combo.pack(side="left")
+        app.profile_combo.bind("<<ComboboxSelected>>", lambda e: app.load_profile())
+        ttk.Button(row, text="Save", command=app.save_profile).pack(side="left", padx=6)
+        ttk.Button(row, text="Delete", command=app.delete_profile).pack(side="left")
+        ttk.Label(prof, text="Pick a profile to load it. Type a new name and press Save to store the current "
+                             "settings\n(quality, folder and everything above) under it.",
+                  style="Muted.TLabel", justify="left").grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ttk.Button(body, text="Close", command=self.close, width=10).grid(row=5, column=0, sticky="e")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        app.sync_mode_options()                # e.g. subtitles are greyed out in audio mode
+        self.update_idletasks()
+        x = app.root.winfo_rootx() + max((app.root.winfo_width() - self.winfo_width()) // 2, 0)
+        y = app.root.winfo_rooty() + 40
+        self.geometry(f"+{x}+{y}")
+
+    def close(self) -> None:
+        self.app.subs_check = None
+        self.app.save_options()
+        self.destroy()
+
+
 class App:
     """The main window: link input, download queue, history and log."""
 
@@ -1584,7 +1674,6 @@ class App:
     def _build(self) -> None:
         root, cfg = self.root, self.cfg
         accent = "Accent.TButton" if sv_ttk is not None else "TButton"
-        switch = "Switch.TCheckbutton" if sv_ttk is not None else "TCheckbutton"
         tool = "Toggle.TButton" if sv_ttk is not None else "TButton"
 
         main = ttk.Frame(root, padding=(18, 14, 18, 12))
@@ -1649,13 +1738,12 @@ class App:
         ttk.Entry(bar, textvariable=self.out_var).grid(row=1, column=1, columnspan=3, sticky="ew",
                                                        padx=(8, 0), pady=(8, 0))
         ttk.Button(bar, text="Browse …", command=self.pick_dir).grid(row=1, column=4, padx=(8, 0), pady=(8, 0))
-        self.opts_open = tk.BooleanVar(value=cfg.get("options_open", False))
-        self.opts_btn = ttk.Button(bar, command=self._toggle_options, width=11)
-        self.opts_btn.grid(row=0, column=4, padx=(8, 0))
+        ttk.Button(bar, text="Settings …", command=self.open_settings, width=11).grid(row=0, column=4, padx=(8, 0))
 
-        # collapsible options
-        self.opts = ttk.Frame(main, padding=(0, 10, 0, 0))
-        self.opts.grid(row=3, column=0, sticky="ew")
+        # settings (edited in the settings window, see SettingsDialog)
+        self.settings_win = None
+        self.subs_check = None
+        self.profile_combo = None
         self.subs_var = tk.BooleanVar(value=cfg.get("subs", False))
         self.thumb_var = tk.BooleanVar(value=cfg.get("thumb", False))
         self.arch_var = tk.BooleanVar(value=cfg.get("archive", True))
@@ -1666,64 +1754,14 @@ class App:
         self.chapters_var = tk.BooleanVar(value=cfg.get("chapters", False))
         self.clip_watch_var = tk.BooleanVar(value=False)                   # never on at startup
         self.clip_watch_var.trace_add("write", lambda *_: self._clip_watch_toggled())
-        switches = (("Subtitles", self.subs_var), ("Embed thumbnail", self.thumb_var),
-                    ("Skip already downloaded", self.arch_var), ("Folder per channel", self.uploader_var),
-                    ("Single video only (no playlist)", self.single_var),
-                    ("Remove sponsor segments", self.sponsor_var),
-                    ("Embed chapters", self.chapters_var), ("Start right after adding", self.auto_var),
-                    ("Watch the clipboard for links", self.clip_watch_var))
-        self.subs_check = None
-        for i, (text, var) in enumerate(switches):
-            check = ttk.Checkbutton(self.opts, text=text, variable=var, style=switch)
-            check.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 22), pady=3)
-            if var is self.subs_var:
-                self.subs_check = check
-        extra = ttk.Frame(self.opts)
-        extra.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.cookie_var = tk.StringVar(value=cfg.get("cookies") or NO_BROWSER)
+        self.limit_var = tk.StringVar(value=cfg.get("limit", ""))
+        self.parallel_var = tk.StringVar(value=str(cfg.get("parallel", 2)))
         self.sub_langs_var = tk.StringVar(value=cfg.get("sub_langs", "en,de"))
         self.name_var = tk.StringVar(value=cfg.get("name", ""))
         self.proxy_var = tk.StringVar(value=cfg.get("proxy", ""))
         self.args_var = tk.StringVar(value=cfg.get("args", ""))
-        self.cookie_var = tk.StringVar(value=cfg.get("cookies") or NO_BROWSER)
-        self.limit_var = tk.StringVar(value=cfg.get("limit", ""))
-        self.parallel_var = tk.StringVar(value=str(cfg.get("parallel", 2)))
-        ttk.Label(extra, text="Cookies from").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(extra, textvariable=self.cookie_var, values=[NO_BROWSER, *BROWSERS[1:]],
-                     state="readonly", width=10).grid(row=0, column=1, padx=(6, 18))
-        ttk.Label(extra, text="Speed limit").grid(row=0, column=2, sticky="w")
-        ttk.Entry(extra, textvariable=self.limit_var, width=7).grid(row=0, column=3, padx=(6, 2))
-        ttk.Label(extra, text="(e.g. 2M)", style="Muted.TLabel").grid(row=0, column=4, padx=(0, 18))
-        ttk.Label(extra, text="Parallel").grid(row=0, column=5, sticky="w")
-        ttk.Spinbox(extra, textvariable=self.parallel_var, from_=1, to=4, width=3,
-                    state="readonly").grid(row=0, column=6, padx=(6, 0))
-
-        more = ttk.Frame(self.opts)
-        more.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        more.columnconfigure(5, weight=1)
-        ttk.Label(more, text="Subtitle languages").grid(row=0, column=0, sticky="w")
-        ttk.Entry(more, textvariable=self.sub_langs_var, width=10).grid(row=0, column=1, padx=(6, 18))
-        ttk.Label(more, text="File name").grid(row=0, column=2, sticky="w")
-        ttk.Entry(more, textvariable=self.name_var, width=22).grid(row=0, column=3, padx=(6, 2))
-        ttk.Label(more, text="(default %(title)s)", style="Muted.TLabel").grid(row=0, column=4, padx=(0, 18))
-        ttk.Label(more, text="Proxy").grid(row=0, column=5, sticky="e")
-        ttk.Entry(more, textvariable=self.proxy_var, width=22).grid(row=0, column=6, padx=(6, 0))
-        ttk.Label(more, text="Extra yt-dlp arguments").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Entry(more, textvariable=self.args_var).grid(row=1, column=2, columnspan=5, sticky="ew",
-                                                         padx=(6, 0), pady=(8, 0))
-
-        prof = ttk.Frame(self.opts)
-        prof.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Label(prof, text="Profile").pack(side="left")
         self.profile_var = tk.StringVar(value="")
-        self.profile_combo = ttk.Combobox(prof, textvariable=self.profile_var, width=18,
-                                          values=sorted(cfg.get("profiles", {})))
-        self.profile_combo.pack(side="left", padx=6)
-        self.profile_combo.bind("<<ComboboxSelected>>", lambda e: self.load_profile())
-        ttk.Button(prof, text="Save", command=self.save_profile).pack(side="left")
-        ttk.Button(prof, text="Delete", command=self.delete_profile).pack(side="left", padx=6)
-        ttk.Label(prof, text="Type a name and press Save to keep the current settings under it.",
-                  style="Muted.TLabel").pack(side="left", padx=8)
-        self._apply_options_visibility()
 
         # tabs
         self.tabs = ttk.Notebook(main)
@@ -1848,21 +1886,13 @@ class App:
             self.url_var.set("")
             self.url_entry.configure(foreground="")
 
-    def _toggle_options(self) -> None:
-        self.opts_open.set(not self.opts_open.get())
-        self._options_changed()
-
-    def _options_changed(self) -> None:
-        self._apply_options_visibility()
-        save_settings({"options_open": self.opts_open.get()})
-
-    def _apply_options_visibility(self) -> None:
-        if self.opts_open.get():
-            self.opts.grid()
-            self.opts_btn.configure(text="Options ▴")
-        else:
-            self.opts.grid_remove()
-            self.opts_btn.configure(text="Options ▾")
+    def open_settings(self) -> None:
+        """Show the settings window (one instance)."""
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.deiconify()
+            self.settings_win.lift()
+            return
+        self.settings_win = SettingsDialog(self)
 
     def _on_kind(self) -> None:
         self.quality_var.set(MODES["mp3" if self.kind_var.get() == "audio" else "video"])
@@ -1885,7 +1915,11 @@ class App:
         self.kind_var.set(mode_kind(self.mode_key()))
         self.also_combo.configure(state="disabled" if audio_only else "readonly")
         self.also_lbl.configure(foreground=COLORS[self.theme]["muted"] if audio_only else "")
-        self.subs_check.configure(state="disabled" if audio_only else "normal")
+        if self.subs_check is not None:
+            try:
+                self.subs_check.configure(state="disabled" if audio_only else "normal")
+            except tk.TclError:
+                self.subs_check = None
 
     def pick_dir(self) -> None:
         d = filedialog.askdirectory(initialdir=self.out_var.get() or str(Path.home()))
@@ -1943,8 +1977,15 @@ class App:
         profiles = dict(load_settings().get("profiles", {}))
         profiles[name] = self.collect_options()
         save_settings({"profiles": profiles})
-        self.profile_combo.configure(values=sorted(profiles))
+        self._refresh_profile_list(profiles)
         self.log(f"Profile '{name}' saved.")
+
+    def _refresh_profile_list(self, profiles: dict) -> None:
+        if self.profile_combo is not None:
+            try:
+                self.profile_combo.configure(values=sorted(profiles))
+            except tk.TclError:
+                self.profile_combo = None      # the settings window is closed
 
     def load_profile(self) -> None:
         d = load_settings().get("profiles", {}).get(self.profile_var.get())
@@ -1957,7 +1998,7 @@ class App:
         if name in profiles and messagebox.askyesno("Profile", f"Delete the profile '{name}'?"):
             del profiles[name]
             save_settings({"profiles": profiles})
-            self.profile_combo.configure(values=sorted(profiles))
+            self._refresh_profile_list(profiles)
             self.profile_var.set("")
 
     def cookies(self) -> str:
@@ -2507,7 +2548,7 @@ class App:
             app_menu = tk.Menu(bar, name="apple", tearoff=0)
             app_menu.add_command(label=f"About {APP_NAME}", command=self.show_about)
             bar.add_cascade(menu=app_menu)
-            root.createcommand("tk::mac::ShowPreferences", self._toggle_options)
+            root.createcommand("tk::mac::ShowPreferences", self.open_settings)
             root.createcommand("tk::mac::Quit", self.on_close)
 
         file_menu = tk.Menu(bar, tearoff=0)
@@ -2535,8 +2576,7 @@ class App:
             view_menu.add_radiobutton(label=label, value=value, variable=self.theme_mode,
                                       command=self.set_theme_mode, state="normal" if sv_ttk else "disabled")
         view_menu.add_separator()
-        view_menu.add_checkbutton(label="Show options", variable=self.opts_open, accelerator=acc(","),
-                                  command=self._options_changed)
+        view_menu.add_command(label="Settings …", accelerator=acc(","), command=self.open_settings)
         for i, name in enumerate(("Queue", "History", "Log")):
             view_menu.add_command(label=f"Show {name}", accelerator=acc(str(i + 1)),
                                   command=lambda i=i: self.tabs.select(i))
@@ -2569,7 +2609,7 @@ class App:
         for i in range(3):
             bind(f"Key-{i + 1}", lambda i=i: self.tabs.select(i))
         if not mac:                            # on macOS the application menu already provides these
-            bind("comma", self._toggle_options)
+            bind("comma", self.open_settings)
             bind("q", self.on_close)
 
     def _on_global_paste_menu(self) -> None:
