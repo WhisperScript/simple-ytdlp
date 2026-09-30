@@ -213,7 +213,7 @@ def _release_asset_name() -> str | None:
     if os.name == "nt":
         return "ytdl-windows.zip"
     if sys.platform == "darwin":
-        return "ytdl-macos.zip" if _machine() == "arm64" else None   # only Apple Silicon is built
+        return "ytdl-macos.zip" if _machine() == "arm64" else "ytdl-macos-intel.zip"
     return "ytdl-linux.tar.gz"
 
 

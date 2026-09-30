@@ -8,6 +8,7 @@ Under **Releases** there is one program per system — nothing to install, just 
 |---|---|---|
 | Windows | `ytdl-windows.zip` | Double-click `ytdl.exe`. On the SmartScreen warning: "More info → Run anyway". |
 | macOS (Apple Silicon) | `ytdl-macos.zip` | Unpack, then **right-click ytdl.app → Open**. If it is blocked: `xattr -dr com.apple.quarantine ytdl.app` |
+| macOS (Intel) | `ytdl-macos-intel.zip` | Same as above. |
 | Linux | `ytdl-linux.tar.gz` | `tar xzf ytdl-linux.tar.gz && ./ytdl` |
 
 On first start the program downloads yt-dlp and deno automatically (internet required,
