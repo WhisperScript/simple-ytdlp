@@ -179,6 +179,10 @@ def managed_deno() -> Path:
     return BIN_DIR / _exe("deno")
 
 
+def managed_ffmpeg() -> Path:
+    return BIN_DIR / _exe("ffmpeg")
+
+
 _tools_lock = threading.Lock()
 
 
@@ -220,6 +224,55 @@ def install_deno(log=print) -> bool:
             log(f"ERROR downloading deno: {e}")
             return False
         log("deno ready.")
+        return True
+
+
+def ffmpeg_build_name() -> str | None:
+    """File name of the matching full ffmpeg build (with ffprobe) of yt-dlp/FFmpeg-Builds, None if there is none."""
+    machine = platform.machine().lower()
+    arm = machine in ("arm64", "aarch64")
+    if os.name == "nt":
+        return f"ffmpeg-master-latest-win{'arm64' if arm else '64'}-gpl.zip"
+    if sys.platform.startswith("linux"):
+        return f"ffmpeg-master-latest-linux{'arm64' if arm else '64'}-gpl.tar.xz"
+    return None                                # macOS: brew install ffmpeg
+
+
+def install_ffmpeg(log=print) -> bool:
+    """Download a full ffmpeg (ffmpeg + ffprobe, about 150 MB) into the tools folder. The bundled ffmpeg has no
+    ffprobe, which some downloads (merging HLS streams, ...) need."""
+    name = ffmpeg_build_name()
+    if name is None:
+        log(ffmpeg_hint())
+        return False
+    with _tools_lock:
+        archive = BIN_DIR / name
+        log("Downloading ffmpeg with ffprobe (about 150 MB, one time) ...")
+        try:
+            _fetch("https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/" + name, archive, log)
+            wanted = {_exe("ffmpeg"), _exe("ffprobe")}
+            if name.endswith(".zip"):
+                with zipfile.ZipFile(archive) as zf:
+                    for member in zf.namelist():
+                        if Path(member).name in wanted and "/bin/" in member:
+                            (BIN_DIR / Path(member).name).write_bytes(zf.read(member))
+            else:
+                import tarfile
+                with tarfile.open(archive) as tf:
+                    for member in tf:
+                        if Path(member.name).name in wanted and "/bin/" in member.name and member.isfile():
+                            with tf.extractfile(member) as src, (BIN_DIR / Path(member.name).name).open("wb") as dst:
+                                shutil.copyfileobj(src, dst)
+            archive.unlink(missing_ok=True)
+            for exe in wanted:
+                _make_executable(BIN_DIR / exe)
+            if not (BIN_DIR / _exe("ffprobe")).exists():
+                raise RuntimeError("the download does not contain ffprobe")
+        except Exception as e:
+            archive.unlink(missing_ok=True)
+            log(f"ERROR downloading ffmpeg: {e}")
+            return False
+        log("ffmpeg ready.")
         return True
 
 
@@ -398,10 +451,12 @@ def find_ytdlp() -> list[str] | None:
 
 
 def find_ffmpeg() -> tuple[str | None, str]:
-    """(path, source) of the ffmpeg to use. source: system | bundled | none."""
+    """(path, source) of the ffmpeg to use. source: system | managed (downloaded, with ffprobe) | bundled | none."""
     exe = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if exe:
         return exe, "system"
+    if managed_ffmpeg().exists():
+        return str(managed_ffmpeg()), "managed"
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe(), "bundled"
@@ -551,13 +606,18 @@ FRIENDLY_ERRORS = [
      "Video unavailable (removed, private or blocked)"),
     (r"unsupported url", "This link is not supported by yt-dlp"),
     (r"requested format is not available", "That format is not offered for this video - choose another"),
-    (r"ffmpeg.*(not found|not installed)|ffprobe.*(not found|not installed)", "ffmpeg is missing"),
+    (r"ffprobe.*(not found|not installed)", "ffprobe is missing - Tools > Get ffmpeg tools, then Retry"),
+    (r"ffmpeg.*(not found|not installed)", "ffmpeg is missing"),
     (r"premieres in|live event will begin|will begin in", "The live stream or premiere has not started yet"),
     (r"giving up after|got error: downloaded \d+ bytes",
      "The connection keeps dropping - what was downloaded is kept, Retry continues from there"),
     (r"unable to download|getaddrinfo|name resolution|timed out|connection (reset|refused)",
      "Network problem - check your connection"),
 ]
+
+
+def needs_ffprobe(text: str) -> bool:
+    return bool(re.search(r"ffprobe.*(not found|not installed)", text or "", re.I))
 
 
 def suggests_update(text: str) -> bool:
@@ -692,7 +752,7 @@ def prepare_command(args: list[str], log=print) -> tuple[list[str], list[str]] |
     assert base is not None
 
     ffmpeg, source = find_ffmpeg()
-    if source == "bundled":
+    if source in ("bundled", "managed"):
         args = args + ["--ffmpeg-location", ffmpeg]
     elif source == "none":
         log("WARNING: " + ffmpeg_hint())
@@ -3300,6 +3360,27 @@ class App:
     def update_and_retry(self, items: list[Item]) -> None:
         self.on_update_ytdlp(after=lambda: self.retry_items(items))
 
+    def get_ffmpeg_tools(self, after=None) -> None:
+        """Download ffmpeg + ffprobe (macOS: explain brew)."""
+        if ffmpeg_build_name() is None:
+            messagebox.showinfo("ffmpeg tools", ffmpeg_hint())
+            return
+        if self.tools_busy or any(it.status == "downloading" for it in self.items):
+            self.toast("Please wait until the current downloads have finished")
+            return
+        self.set_tools_busy(True, "Downloading ffmpeg with ffprobe (about 150 MB, one time) …")
+
+        def work():
+            ok = install_ffmpeg(self.log)
+
+            def done():
+                self.set_tools_busy(False)
+                self.toast("ffmpeg tools are ready" if ok else "Could not download ffmpeg - see the Log")
+                if ok and after is not None:
+                    after()
+            self.ui(done)
+        threading.Thread(target=work, daemon=True).start()
+
     def start_item(self, item: Item) -> None:
         """Start one waiting item right now (even if 'Download all' has not been pressed)."""
         if item.status != "queued":
@@ -3367,6 +3448,9 @@ class App:
             if st in ("paused", "failed", "cancelled") and partial_size(item.dests):
                 menu.add_command(label=f"Start over (delete {fmt_size(partial_size(item.dests))} partial data)",
                                  command=lambda: self.start_over([item]))
+            if st == "failed" and needs_ffprobe(item.error):
+                menu.add_command(label="Get ffmpeg tools, then retry",
+                                 command=lambda: self.get_ffmpeg_tools(after=lambda: self.retry_items([item])))
             if st == "failed" and suggests_update(item.error):
                 menu.add_command(label="Update yt-dlp, then retry", command=lambda: self.update_and_retry([item]))
             if st in ("done", "skipped"):
@@ -3893,6 +3977,7 @@ class App:
 
         tools_menu = tk.Menu(bar, tearoff=0)
         tools_menu.add_command(label="Update yt-dlp", command=self.on_update_ytdlp)
+        tools_menu.add_command(label="Get ffmpeg tools (ffmpeg + ffprobe) …", command=self.get_ffmpeg_tools)
         tools_menu.add_command(label=f"Check for {APP_NAME} updates …", command=self.check_app_update_manually)
         tools_menu.add_separator()
         tools_menu.add_command(label="Open settings folder", command=lambda: open_folder(data_dir()))

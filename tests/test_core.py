@@ -362,6 +362,21 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class FfmpegTools(unittest.TestCase):
+    def test_ffprobe_errors_are_recognised(self):
+        err = "ERROR: Postprocessing: ffprobe and ffmpeg not found. Please install or provide the path using --ffmpeg-location"
+        self.assertTrue(app.needs_ffprobe(err))
+        self.assertIn("ffprobe is missing", app.friendly_error(err))
+        self.assertEqual(app.friendly_error("ffmpeg not found"), "ffmpeg is missing")
+        self.assertFalse(app.needs_ffprobe("ffmpeg not found"))
+
+    def test_managed_ffmpeg_is_used_with_its_folder(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(app, "BIN_DIR", Path(tmp)), \
+                mock.patch.object(app.shutil, "which", lambda name: None):
+            (Path(tmp) / app._exe("ffmpeg")).write_bytes(b"x")
+            self.assertEqual(app.find_ffmpeg(), (str(Path(tmp) / app._exe("ffmpeg")), "managed"))
+
+
 class SameVideo(unittest.TestCase):
     def test_youtube_links_to_one_video_share_a_key(self):
         same = ["https://www.youtube.com/watch?v=abc123XYZ_-", "https://youtu.be/abc123XYZ_-?si=tracking",
