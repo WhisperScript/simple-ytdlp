@@ -1323,11 +1323,13 @@ COLORS = {
     "light": {"bg": "#fafafa", "border": "#e7e7e7", "ok": "#167a3f", "bad": "#c93030", "muted": "#6b6b6b",
               "thumb": "#e3e3e3", "text_bg": "#ffffff", "text_fg": "#1a1a1a", "text_border": "#c8c8c8",
               "accent": "#0067c0", "warn": "#996400", "toast_bg": "#323232", "toast_fg": "#ffffff",
-              "tip_bg": "#fffbe6"},
+              "tip_bg": "#fffbe6", "track": "#c4c4c4", "btn": "#fdfdfd", "btn_line": "#d9d9d9",
+              "hover": "#f2f2f2", "down": "#e8e8e8"},
     "dark":  {"bg": "#1c1c1c", "border": "#2f2f2f", "ok": "#5fd38d", "bad": "#ff7b7b", "muted": "#a0a0a0",
               "thumb": "#2f2f2f", "text_bg": "#2b2b2b", "text_fg": "#e6e6e6", "text_border": "#4a4a4a",
               "accent": "#60cdff", "warn": "#f0b45a", "toast_bg": "#e6e6e6", "toast_fg": "#1c1c1c",
-              "tip_bg": "#2f2f2f"},
+              "tip_bg": "#2f2f2f", "track": "#555555", "btn": "#2a2a2a", "btn_line": "#343434",
+              "hover": "#353535", "down": "#232323"},
 }
 STATUS_COLOR = {"fetching": "muted", "queued": "muted", "downloading": "accent", "paused": "warn", "done": "ok",
                 "skipped": "ok", "failed": "bad", "cancelled": "muted"}
@@ -1524,84 +1526,158 @@ class Jobs:
                 pass
 
 
+class CanvasTip(Tooltip):
+    """A Tooltip for something drawn on a canvas (found by its tag)."""
+
+    def __init__(self, canvas, tag, text, delay: int = 550):
+        self.widget, self.text, self.delay = canvas, text, delay
+        self.tip = None
+        self.job = None
+        canvas.tag_bind(tag, "<Enter>", self._enter, add="+")
+        canvas.tag_bind(tag, "<Leave>", self._hide, add="+")
+        canvas.tag_bind(tag, "<ButtonPress>", self._hide, add="+")
+
+
+def rounded_image(w: int, h: int, fill: str, line: str, radius: int, *, ring: str = "", inset: int = 0):
+    """A rounded box with a 1 px border as a PhotoImage, `inset` px of transparent margin around it (or, with
+    `ring`, a ring of that colour filling the margin). Smooth edges by drawing large and shrinking; without
+    Pillow a plain box."""
+    if Image is None or ImageTk is None:
+        img = tk.PhotoImage(width=w, height=h)
+        if ring:
+            img.put(ring, to=(0, 0, w, h))
+        img.put(line, to=(inset, inset, w - inset, h - inset))
+        img.put(fill, to=(inset + 1, inset + 1, w - inset - 1, h - inset - 1))
+        return img
+    S = 3
+    big = Image.new("RGBA", (w * S, h * S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(big)
+    if ring:
+        d.rounded_rectangle((0, 0, w * S - 1, h * S - 1), (radius + inset) * S, fill=ring)
+    i = inset * S
+    d.rounded_rectangle((i, i, w * S - 1 - i, h * S - 1 - i), radius * S, fill=line)
+    d.rounded_rectangle((i + S, i + S, w * S - 1 - i - S, h * S - 1 - i - S), max(radius - 1, 1) * S, fill=fill)
+    return ImageTk.PhotoImage(big.resize((w, h), Image.LANCZOS))
+
+
+class Part:
+    """What a Row draws on the canvas, with the few widget methods the rest of the program (menus, tests)
+    uses: cget("text"/"background"), its place on the screen and whether it is shown."""
+
+    def __init__(self, row: "Row", kind: str):
+        self.row, self.kind = row, kind
+
+    def cget(self, key: str):
+        return self.row.look.get(self.kind, {}).get(key, "")
+
+    def _box(self):
+        return self.row.geo.get(self.kind, (0, 0, 0, 0))
+
+    def winfo_rootx(self) -> int:
+        c = self.row.canvas
+        return int(c.winfo_rootx() + self._box()[0] - c.canvasx(0))
+
+    def winfo_rooty(self) -> int:
+        c = self.row.canvas
+        return int(c.winfo_rooty() + self._box()[1] - c.canvasy(0))
+
+    def winfo_width(self) -> int:
+        b = self._box()
+        return int(b[2] - b[0])
+
+    def winfo_height(self) -> int:
+        b = self._box()
+        return int(b[3] - b[1])
+
+    def winfo_reqheight(self) -> int:
+        return self.winfo_height()
+
+    def winfo_ismapped(self) -> bool:
+        return self.kind in self.row.geo and self.row.item is not None and self.kind not in self.row.hidden
+
+
 class Row:
-    """The widgets of one visible queue row: status strip, thumbnail, text, progress and buttons.
-    Rows are recycled while scrolling - bind() points a row at another Item."""
+    """One queue card, drawn directly on the list's canvas (status strip, thumbnail, text, progress bar and two
+    buttons). The canvas double-buffers, so scrolling does not tear the way a stack of child widgets does
+    (visible on Windows). Rows are recycled while scrolling - bind() points a row at another Item."""
 
     PRIMARY = {"fetching": "Remove", "queued": "Download", "downloading": "Pause", "paused": "Resume",
                "done": "Show", "skipped": "Show", "failed": "Retry", "cancelled": "Retry"}
+    _count = 0
+    BTN_W, MORE_W, BTN_H, PAD = 114, 51, 30, 12        # primary button, "..." button, their height, card padding
+    TEXT_X = 166                                       # where the text starts (after strip and thumbnail)
+    TEXT_RIGHT = 12 + 114 + 6 + 51 + 12 - 2            # what the buttons and gaps take at the right
 
     def __init__(self, app: "App", canvas):
+        Row._count += 1
         self.app, self.canvas = app, canvas
+        self.tag = f"row{Row._count}"
         self.item: Item | None = None
+        self.width, self.y0 = 10, 0
         self.photo = None
         self.thumb_key = None
-        self.width = 10
         self.bar_mode = "determinate"
-        self._text: dict = {}                  # label -> (font, full text), re-fitted when the label gets wider/narrower
-        self._label_w: dict = {}
-        c = COLORS[app.theme]
+        self.phase = 0
+        self.hover = self.down = None
+        self.geo: dict = {}                            # part -> (x0, y0, x1, y1) on the canvas
+        self.look: dict = {}                           # part -> {"text": ..., "background": ...}
+        self.hidden: set = set()
+        t, C = self.tag, canvas
+        self.i_card = C.create_image(0, 0, anchor="nw", tags=(t,))
+        self.i_strip = C.create_rectangle(0, 0, 0, 0, outline="", tags=(t,))
+        self.i_thumb = C.create_image(0, 0, anchor="nw", tags=(t,))
+        self.i_badge_bg = C.create_rectangle(0, 0, 0, 0, fill="#000000", outline="", tags=(t,))
+        self.i_badge = C.create_text(0, 0, font=app.font_badge, fill="#ffffff", anchor="center", tags=(t,))
+        self.i_title = C.create_text(0, 0, font=app.font_title, anchor="nw", tags=(t, t + "title"))
+        self.i_meta = C.create_text(0, 0, font=app.font_small, anchor="nw", tags=(t,))
+        self.i_status = C.create_text(0, 0, font=app.font_status, anchor="nw", tags=(t, t + "status"))
+        self.i_track = C.create_line(0, 0, 0, 0, width=1, tags=(t,))
+        self.i_fill = C.create_rectangle(0, 0, 0, 0, outline="", tags=(t,))
+        self.i_busy = C.create_rectangle(0, 0, 0, 0, outline="", tags=(t,))
+        self.i_primary = C.create_image(0, 0, anchor="nw", tags=(t + "p", t))
+        self.i_primary_t = C.create_text(0, 0, font=app.font_status, anchor="center", tags=(t + "p", t))
+        self.i_more = C.create_image(0, 0, anchor="nw", tags=(t + "m", t))
+        self.i_more_t = C.create_text(0, 0, font=app.font_status, anchor="center", text="…", tags=(t + "m", t))
+        C.itemconfigure(t, state="hidden")
+        self.outer, self.card, self.strip, self.thumb_box = (Part(self, k) for k in ("outer", "card", "strip", "thumb"))
+        self.title, self.meta, self.status, self.badge = (Part(self, k) for k in ("title", "meta", "status", "badge"))
+        self.primary, self.more = Part(self, "primary"), Part(self, "more")
 
-        self.outer = tk.Frame(canvas, background=c["bg"], borderwidth=0, highlightthickness=0)   # selection ring
-        self.win = canvas.create_window(0, 0, anchor="nw", window=self.outer, width=self.width, height=CARD_H,
-                                        state="hidden")
-        self.card = ttk.Frame(self.outer, style="Card.TFrame" if sv_ttk is not None else "TFrame",
-                              padding=(10, 8, 10, 8))
-        self.card.pack(fill="both", expand=True, padx=2, pady=2)
-        self.card.columnconfigure(2, weight=1)
-        self.card.rowconfigure(0, weight=1)
-
-        self.strip = tk.Frame(self.card, width=4, borderwidth=0, highlightthickness=0)
-        self.strip.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=3)
-
-        self.thumb_box = tk.Frame(self.card, width=THUMB_SIZE[0], height=THUMB_SIZE[1], background=c["bg"],
-                                  borderwidth=0, highlightthickness=0)
-        self.thumb_box.grid(row=0, column=1, sticky="w", padx=(0, 12))
-        self.thumb_box.grid_propagate(False)
-        self.thumb_lbl = tk.Label(self.thumb_box, borderwidth=0, background=c["bg"], foreground=c["muted"],
-                                  text="▶")
-        self.thumb_lbl.place(x=0, y=0, relwidth=1, relheight=1)
-        self.badge = tk.Label(self.thumb_box, font=app.font_badge, padx=4, pady=0, borderwidth=0,
-                              background="#000000", foreground="#ffffff")
-
-        body = ttk.Frame(self.card)
-        body.grid(row=0, column=2, sticky="ew")            # centred vertically: the card row is the tall one
-        body.columnconfigure(0, weight=1)
-        self.title = ttk.Label(body, style="CardTitle.TLabel", anchor="w", width=1)
-        self.title.grid(row=0, column=0, sticky="ew")
-        self.meta = ttk.Label(body, style="Muted.TLabel", anchor="w", width=1)
-        self.meta.grid(row=1, column=0, sticky="ew")
-        self.status = ttk.Label(body, style="CardStatus.TLabel", anchor="w", width=1)
-        self.status.grid(row=2, column=0, sticky="ew")
-        self.bar = ttk.Progressbar(body, maximum=100, length=10)
-        self.bar.grid(row=3, column=0, sticky="ew", pady=(4, 0))
-
-        btns = ttk.Frame(self.card)
-        btns.grid(row=0, column=3, padx=(12, 0))
-        self.primary = ttk.Button(btns, width=10, command=self._primary_click)
-        self.primary.pack(side="left")
-        self.more = ttk.Button(btns, text="…", width=3, command=self._more_click)
-        self.more.pack(side="left", padx=(6, 0))
-
-        for label in (self.title, self.meta, self.status):
-            label.bind("<Configure>", lambda e, w=label: self._refit(w))
-        Tooltip(self.title, self._tip_title)
-        Tooltip(self.status, lambda: self.item.error if self.item and self.item.status == "failed" else "")
-        Tooltip(self.more, "More actions (or right-click the row)")
-        self._bind_click(self.outer)
-
-    # -- events
-
-    def _bind_click(self, widget) -> None:
-        """Click selects, double click opens, right click shows the menu - on everything except the buttons."""
         secondary = ("<Button-2>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)
-        widget.bind("<Button-1>", lambda e: self.app.row_click(self.item, e))
-        widget.bind("<Double-Button-1>", lambda e: self.app.card_activate(self.item))
+        C.tag_bind(t, "<Button-1>", lambda e: self.app.row_click(self.item, e))
+        C.tag_bind(t, "<Double-Button-1>", lambda e: self.app.card_activate(self.item))
         for seq in secondary:
-            widget.bind(seq, lambda e: self.app.card_menu(self.item, e))
-        for child in widget.winfo_children():
-            if not isinstance(child, ttk.Button):
-                self._bind_click(child)
+            C.tag_bind(t, seq, lambda e: self.app.card_menu(self.item, e))
+        for kind in ("p", "m"):                        # the buttons come first in an item's tags: they answer first
+            name = "primary" if kind == "p" else "more"
+            C.tag_bind(t + kind, "<Enter>", lambda e, n=name: self._hover(n))
+            C.tag_bind(t + kind, "<Leave>", lambda e: self._hover(None))
+            C.tag_bind(t + kind, "<ButtonPress-1>", lambda e, n=name: self._press(n))
+            C.tag_bind(t + kind, "<ButtonRelease-1>", lambda e, n=name: self._release(n))
+            C.tag_bind(t + kind, "<Double-Button-1>", lambda e: "break")
+        CanvasTip(C, t + "title", self._tip_title)
+        CanvasTip(C, t + "status", lambda: self.item.error if self.item and self.item.status == "failed" else "")
+        CanvasTip(C, t + "m", "More actions (or right-click the row)")
+
+    # -- buttons
+
+    def _hover(self, name) -> None:
+        self.hover = name
+        self.canvas.configure(cursor="hand2" if name else "")
+        self._buttons()
+
+    def _press(self, name) -> str:
+        self.down = name
+        self._buttons()
+        return "break"
+
+    def _release(self, name) -> str:
+        fire = self.down == name and self.hover == name
+        self.down = None
+        self._buttons()
+        if fire and self.item is not None:
+            (self._primary_click if name == "primary" else self._more_click)()
+        return "break"
 
     def _primary_click(self) -> None:
         it, app = self.item, self.app
@@ -1619,39 +1695,33 @@ class Row:
         it = self.item
         return f"{it.title}\n{it.url}" if it and it.title != it.url else (it.url if it else "")
 
-    # -- text that must not be cut by the widget edge
-
-    def _set_text(self, label, font, text: str) -> None:
-        self._text[label] = (font, text)
-        self._fit(label)
-
-    def _fit(self, label) -> None:
-        font, text = self._text[label]
-        width = label.winfo_width()
-        if width <= 10:                                    # not laid out yet: estimate from the row width
-            width = max(self.width - 340, 120)
-        label.configure(text=fit_text(font.measure, text, width - 4))
-
-    def _refit(self, label) -> None:
-        width = label.winfo_width()
-        if label in self._text and abs(width - self._label_w.get(label, 0)) >= 2:
-            self._label_w[label] = width
-            self._fit(label)
+    def _buttons(self) -> None:
+        if self.item is None:
+            return
+        c = COLORS[self.app.theme]
+        for name, item_id, w in (("primary", self.i_primary, self.BTN_W), ("more", self.i_more, self.MORE_W)):
+            state = "down" if self.down == name and self.hover == name else ("hover" if self.hover == name else "btn")
+            self.canvas.itemconfigure(item_id, image=self.app.box_image(w, self.BTN_H, c, state))
 
     # -- binding to an item
 
     def bind(self, item: Item) -> None:
         self.item = item
         self.thumb_key = None
-        self.canvas.itemconfigure(self.win, state="normal")
+        self.down = self.hover = None
+        self.canvas.itemconfigure(self.tag, state="normal")
         self.refresh()
         self.app.request_thumb(item)
 
     def unbind(self) -> None:
         self.item = None
-        self.bar.stop()
-        self.bar_mode = "determinate"
-        self.canvas.itemconfigure(self.win, state="hidden")
+        self.canvas.itemconfigure(self.tag, state="hidden")
+
+    def place(self, y0: int, width: int) -> None:
+        if (y0, width) != (self.y0, self.width):
+            self.y0, self.width = y0, width
+            if self.item is not None:
+                self.refresh()
 
     def status_text(self, it: Item) -> str:
         st = it.status
@@ -1687,63 +1757,123 @@ class Row:
         kept = partial_size(it.dests)
         return "Cancelled" + (f"  ·  {fmt_size(kept)} kept" if kept else "")
 
+    # -- drawing
+
     def refresh(self) -> None:
-        it, app = self.item, self.app
+        it, app, C = self.item, self.app, self.canvas
         if it is None:
             return
         c = COLORS[app.theme]
+        w, y0 = self.width, self.y0
         color = c[STATUS_COLOR[it.status]]
-        self.strip.configure(background=color)
-        self.outer.configure(background=c["accent"] if it.id in app.selected else c["bg"])
-        self._set_text(self.title, app.font_title, it.title)
+        selected = it.id in app.selected
+        self.geo, self.look, self.hidden = {}, {}, set()
+        self.geo["outer"] = (0, y0, w, y0 + CARD_H)
+        self.geo["card"] = (2, y0 + 2, w - 2, y0 + CARD_H - 2)
+        self.look["outer"] = {"background": c["accent"] if selected else c["bg"]}
+        C.itemconfigure(self.i_card, image=app.card_image(w, c, selected))
+        C.coords(self.i_card, 0, y0)
+        # status strip and thumbnail
+        self.geo["strip"] = (12, y0 + 13, 16, y0 + 79)
+        self.look["strip"] = {"background": color}
+        C.coords(self.i_strip, *self.geo["strip"])
+        C.itemconfigure(self.i_strip, fill=color)
+        self.geo["thumb"] = (26, y0 + 10, 26 + THUMB_SIZE[0], y0 + 10 + THUMB_SIZE[1])
+        C.coords(self.i_thumb, 26, y0 + 10)
+        self._refresh_thumb(it, c)
+        # text block, centred in the 72 px the thumbnail takes
+        th, mh, sh = app.line_h["title"], app.line_h["small"], app.line_h["status"]
+        has_bar = it.status in ("fetching", "downloading", "paused")
+        block = th + mh + sh + (11 if has_bar else 0)
+        top = y0 + 10 + (THUMB_SIZE[1] - block) // 2
+        tw = max(w - self.TEXT_X - self.TEXT_RIGHT - 12, 40)
         meta = "  ·  ".join(x for x in (it.uploader, ("⚙ " + overrides_summary(it.overrides)) if it.overrides else "")
-                            if x)
-        self._set_text(self.meta, app.font_small, meta or (it.url if it.title != it.url else ""))
-        self._set_text(self.status, app.font_status, self.status_text(it))
-        self.status.configure(foreground=color)
-        self._refresh_bar(it)
-        self.primary.configure(text=self.PRIMARY[it.status])
-        self._refresh_thumb(it)
+                            if x) or (it.url if it.title != it.url else "")
+        for kind, item_id, font, text, yy, fg in (
+                ("title", self.i_title, app.font_title, it.title, top, c["text_fg"]),
+                ("meta", self.i_meta, app.font_small, meta, top + th, c["muted"]),
+                ("status", self.i_status, app.font_status, self.status_text(it), top + th + mh, color)):
+            shown = fit_text(font.measure, text, tw - 4)
+            self.look[kind] = {"text": shown}
+            self.geo[kind] = (self.TEXT_X, yy, self.TEXT_X + tw, yy + {"title": th, "meta": mh, "status": sh}[kind])
+            C.coords(item_id, self.TEXT_X, yy)
+            C.itemconfigure(item_id, text=shown, fill=fg)
+        self._refresh_bar(it, c, tw, top + th + mh + sh + 4 + 3, has_bar)
+        # buttons
+        bx = w - 2 - 10
+        more_x0, prim_x0 = bx - self.MORE_W, bx - self.MORE_W - 6 - self.BTN_W
+        by = y0 + (CARD_H - self.BTN_H) // 2
+        self.geo["primary"] = (prim_x0, by, prim_x0 + self.BTN_W, by + self.BTN_H)
+        self.geo["more"] = (more_x0, by, more_x0 + self.MORE_W, by + self.BTN_H)
+        label = self.PRIMARY[it.status]
+        self.look["primary"], self.look["more"] = {"text": label}, {"text": "…"}
+        C.coords(self.i_primary, prim_x0, by)
+        C.coords(self.i_more, more_x0, by)
+        C.coords(self.i_primary_t, prim_x0 + self.BTN_W / 2, by + self.BTN_H / 2)
+        C.coords(self.i_more_t, more_x0 + self.MORE_W / 2, by + self.BTN_H / 2)
+        C.itemconfigure(self.i_primary_t, text=label, fill=c["text_fg"])
+        C.itemconfigure(self.i_more_t, fill=c["text_fg"])
+        self._buttons()
 
-    def _refresh_bar(self, it: Item) -> None:
+    def _refresh_bar(self, it: Item, c: dict, tw: int, yc: float, has_bar: bool) -> None:
+        C = self.canvas
+        if not has_bar:
+            for i in (self.i_track, self.i_fill, self.i_busy):
+                C.itemconfigure(i, state="hidden")
+            self.bar_mode = "determinate"
+            return
+        x0, x1 = self.TEXT_X, self.TEXT_X + tw
+        C.coords(self.i_track, x0, yc, x1, yc)
+        C.itemconfigure(self.i_track, state="normal", fill=c["track"])
         if it.status == "fetching":
-            if self.bar_mode != "indeterminate":
-                self.bar.configure(mode="indeterminate")
-                self.bar.start(40)
-                self.bar_mode = "indeterminate"
-            self.bar.grid()
-        elif it.status in ("downloading", "paused"):
-            if self.bar_mode == "indeterminate":
-                self.bar.stop()
-                self.bar.configure(mode="determinate")
-                self.bar_mode = "determinate"
-            self.bar["value"] = it.pct
-            self.bar.grid()
+            self.bar_mode = "indeterminate"
+            C.itemconfigure(self.i_fill, state="hidden")
+            C.itemconfigure(self.i_busy, state="normal", fill=c["accent"])
+            self.animate()
         else:
-            if self.bar_mode == "indeterminate":
-                self.bar.stop()
-                self.bar.configure(mode="determinate")
-                self.bar_mode = "determinate"
-            self.bar.grid_remove()
+            self.bar_mode = "determinate"
+            C.itemconfigure(self.i_busy, state="hidden")
+            C.coords(self.i_fill, x0, yc - 1.5, x0 + tw * max(min(it.pct, 100), 0) / 100, yc + 1.5)
+            C.itemconfigure(self.i_fill, state="normal", fill=c["accent"])
 
-    def _refresh_thumb(self, it: Item) -> None:
-        c = COLORS[self.app.theme]
-        self.thumb_box.configure(background=c["bg"])
-        self.thumb_lbl.configure(background=c["bg"], foreground=c["muted"])
+    def animate(self) -> None:
+        """One step of the moving bar of a card that is still loading its info."""
+        if self.item is None or self.bar_mode != "indeterminate":
+            return
+        self.phase = (self.phase + 6) % (self.width + 90)
+        tw = max(self.width - self.TEXT_X - self.TEXT_RIGHT - 12, 40)
+        yc = float(self.canvas.coords(self.i_track)[1])
+        x0 = self.TEXT_X + min(max(self.phase * tw / (tw + 90) - 60, 0), tw)
+        x1 = self.TEXT_X + min(max(self.phase * tw / (tw + 90), 0), tw)
+        self.canvas.coords(self.i_busy, x0, yc - 1.5, x1, yc + 1.5)
+
+    def _refresh_thumb(self, it: Item, c: dict) -> None:
+        C = self.canvas
         image = it.thumb if it.thumb is not None else self.app.placeholder()
         key = (id(image), self.app.theme)
         if image is not None and ImageTk is not None:
             if key != self.thumb_key:
                 self.photo = ImageTk.PhotoImage(image)
-                self.thumb_lbl.configure(image=self.photo, text="")
+                C.itemconfigure(self.i_thumb, image=self.photo)
                 self.thumb_key = key
+            C.itemconfigure(self.i_thumb, state="normal")
         else:
-            self.thumb_lbl.configure(image="", text="▶")
+            C.itemconfigure(self.i_thumb, state="hidden")
+        x0, y0, x1, y1 = self.geo["thumb"]
         if it.duration:
-            self.badge.configure(text=fmt_duration(it.duration))
-            self.badge.place(relx=1, rely=1, x=-5, y=-5, anchor="se")
+            text = fmt_duration(it.duration)
+            bw = self.app.font_badge.measure(text) + 10
+            bh = self.app.line_h["badge"] + 2
+            C.coords(self.i_badge_bg, x1 - 5 - bw, y1 - 5 - bh, x1 - 5, y1 - 5)
+            C.coords(self.i_badge, x1 - 5 - bw / 2, y1 - 5 - bh / 2)
+            C.itemconfigure(self.i_badge, text=text, state="normal")
+            C.itemconfigure(self.i_badge_bg, state="normal")
+            self.look["badge"] = {"text": text}
+            self.geo["badge"] = (x1 - 5 - bw, y1 - 5 - bh, x1 - 5, y1 - 5)
         else:
-            self.badge.place_forget()
+            C.itemconfigure(self.i_badge, state="hidden")
+            C.itemconfigure(self.i_badge_bg, state="hidden")
+            self.hidden.add("badge")
 
 
 class QueueList:
@@ -1763,6 +1893,7 @@ class QueueList:
         self.bound: dict[int, Row] = {}
         self.width = 400
         self._job = None
+        self._busy_job = None
         self._scrollbar_shown = True
         self._region = None                    # last scroll region / first visible fraction: only react to changes,
         self._top = None                       # or setting the region would trigger the scrollbar callback forever
@@ -1810,13 +1941,22 @@ class QueueList:
             if row is None:
                 row = self.free.pop() if self.free else Row(self.app, self.canvas)
                 self.bound[iid] = row
-                row.width = w
-                self.canvas.itemconfigure(row.win, width=w)
+                row.y0, row.width = i * ROW_H, w
                 row.bind(items[i])
-            elif row.width != w:
-                row.width = w
-                self.canvas.itemconfigure(row.win, width=w)
-            self.canvas.coords(row.win, 0, i * ROW_H)
+            else:
+                row.place(i * ROW_H, w)
+        self._busy()
+
+    def _busy(self) -> None:
+        """Keep the moving bars of cards that are still loading their info going (one timer for all)."""
+        if self._busy_job is None and any(r.bar_mode == "indeterminate" for r in self.bound.values()):
+            self._busy_job = self.canvas.after(40, self._busy_tick)
+
+    def _busy_tick(self) -> None:
+        self._busy_job = None
+        for row in self.bound.values():
+            row.animate()
+        self._busy()
 
     def row_for(self, item: Item) -> "Row | None":
         return self.bound.get(item.id)
@@ -1825,6 +1965,7 @@ class QueueList:
         row = self.bound.get(item.id)
         if row is not None:
             row.refresh()
+            self._busy()
 
     def refresh_rows(self) -> None:
         for row in self.bound.values():
@@ -2360,6 +2501,7 @@ class App:
         self._setup_panel_shown = False
         self.setup_error = ""
         self._placeholders: dict = {}
+        self._boxes: dict = {}                 # rendered card and button images
 
         self.theme_mode = tk.StringVar(value=self.cfg.get("theme") or "system")    # system | light | dark
         if self.theme_mode.get() not in ("system", "light", "dark"):
@@ -2435,6 +2577,23 @@ class App:
         self.font_title, self.font_status, self.font_small = make(1, "bold"), make(0), make(-2)
         self.font_badge, self.font_big, self.font_entry = make(-3, "bold"), make(8, "bold"), make(1)
         self.font_tab = make(0, "bold")
+        self.line_h = {"title": self.font_title.metrics("linespace"), "small": self.font_small.metrics("linespace"),
+                       "status": self.font_status.metrics("linespace"), "badge": self.font_badge.metrics("linespace")}
+
+    def card_image(self, w: int, c: dict, selected: bool):
+        """The card's background (with its selection ring), cached per width and theme."""
+        key = ("card", self.theme, w, selected)
+        if key not in self._boxes:
+            self._boxes[key] = rounded_image(w, CARD_H, c["bg"], c["border"], 6, inset=2,
+                                             ring=c["accent"] if selected else "")
+        return self._boxes[key]
+
+    def box_image(self, w: int, h: int, c: dict, state: str):
+        """A button face (state: btn | hover | down), cached."""
+        key = ("box", self.theme, w, h, state)
+        if key not in self._boxes:
+            self._boxes[key] = rounded_image(w, h, c[state], c["btn_line"], 5)
+        return self._boxes[key]
 
     def placeholder(self):
         """The grey thumbnail stand-in for the current theme."""
