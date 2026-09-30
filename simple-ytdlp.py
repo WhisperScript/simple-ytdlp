@@ -28,6 +28,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import ssl
@@ -430,9 +431,14 @@ def ffmpeg_hint() -> str:
 def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
                archive=False, cookies_browser="", sort_by_uploader=False,
                no_playlist=False, also_audio="", limit_rate="", sponsorblock=False,
+               sub_langs="en,de", format_override="", section="", exact_cut=False,
+               embed_chapters=False, split_chapters=False, proxy="", name_template="",
                extra: list[str] | None = None) -> list[str]:
     out_dir = Path(out_dir).expanduser()
-    tmpl = "%(uploader)s/%(title)s.%(ext)s" if sort_by_uploader else "%(title)s.%(ext)s"
+    name = name_template.strip() or "%(title)s"
+    if "%(ext)s" not in name:
+        name += ".%(ext)s"
+    tmpl = ("%(uploader)s/" if sort_by_uploader else "") + name
 
     args = [
         "-o", str(out_dir / tmpl),
@@ -443,19 +449,24 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
         "--progress",
     ]
 
+    if format_override:
+        args += ["-f", format_override]
+    elif mode not in AUDIO_MODES:
+        m = re.fullmatch(r"video(\d+)", mode)
+        if m:
+            h = m.group(1)
+            args += ["-f", f"bv*[height<={h}]+ba/b[height<={h}]/b"]
+        else:
+            args += ["-f", "bv*+ba/b"]
     if mode in AUDIO_MODES:
         args += ["-x", "--audio-format", mode, "--audio-quality", "0"]
-    elif re.fullmatch(r"video\d+", mode):
-        h = mode[len("video"):]
-        args += ["-f", f"bv*[height<={h}]+ba/b[height<={h}]/b"]
-    else:
-        args += ["-f", "bv*+ba/b"]
 
     if also_audio and mode not in AUDIO_MODES:   # keep the video AND save a separate audio file
         args += ["-x", "--audio-format", also_audio, "--audio-quality", "0", "-k"]
 
     if subs and mode not in AUDIO_MODES:      # subtitles cannot be embedded in audio files
-        args += ["--write-subs", "--write-auto-subs", "--sub-langs", "en,de", "--embed-subs",
+        langs = sub_langs if re.fullmatch(r"[A-Za-z0-9_.*,-]+", sub_langs or "") else "en,de"
+        args += ["--write-subs", "--write-auto-subs", "--sub-langs", langs, "--embed-subs",
                  "--sleep-subtitles", "3",         # YouTube answers quick subtitle requests with HTTP 429
                  "--ignore-errors"]                # ...so a failed subtitle track must not fail the video
     if thumb:
@@ -470,9 +481,135 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
         args += ["--limit-rate", limit_rate]
     if sponsorblock:
         args += ["--sponsorblock-remove", "sponsor,selfpromo,interaction"]
+    if section:
+        args += ["--download-sections", section]
+        if exact_cut:
+            args += ["--force-keyframes-at-cuts"]
+    if embed_chapters:
+        args += ["--embed-chapters"]
+    if split_chapters:
+        args += ["--split-chapters"]
+    if proxy:
+        args += ["--proxy", proxy]
     if extra:
         args += extra
     return args
+
+
+def parse_clock(text: str) -> float | None:
+    """Seconds from '90', '1:30', '01:02:03' or '1:02.5'; None if it is not a time."""
+    text = (text or "").strip()
+    if not re.fullmatch(r"\d+(?::\d{1,2}){0,2}(?:\.\d+)?", text):
+        return None
+    total = 0.0
+    for part in text.split(":"):
+        total = total * 60 + float(part)
+    return total
+
+
+def section_arg(start: str, end: str) -> tuple[str, str]:
+    """(--download-sections value, error) for a start/end pair; both may be empty (= no cut)."""
+    if not start.strip() and not end.strip():
+        return "", ""
+    a = parse_clock(start) if start.strip() else 0.0
+    b = parse_clock(end) if end.strip() else None
+    if a is None or (end.strip() and b is None):
+        return "", "Times look like 90, 1:30 or 01:02:03."
+    if b is not None and b <= a:
+        return "", "The end must be after the start."
+    return f"*{fmt_clock(a)}-{fmt_clock(b) if b is not None else 'inf'}", ""
+
+
+def fmt_clock(seconds: float) -> str:
+    whole = int(seconds)
+    frac = seconds - whole
+    h, rem = divmod(whole, 3600)
+    m, s = divmod(rem, 60)
+    text = f"{h}:{m:02d}:{s:02d}"
+    return text + (f"{frac:.2f}"[1:].rstrip("0") if frac else "")
+
+
+FRIENDLY_ERRORS = [
+    (r"confirm your age|age-restricted|age restricted",
+     "Age-restricted - pick your browser under Options > Cookies from"),
+    (r"private video|this video is private",
+     "Private video - sign in in your browser and pick it under Options > Cookies from"),
+    (r"not a bot|sign in to confirm",
+     "YouTube wants a login - use Options > Cookies from, or update yt-dlp"),
+    (r"http error 429|too many requests",
+     "Rate limited (HTTP 429) - wait a few minutes, lower Parallel, or use cookies"),
+    (r"not available in your country|geo.?restrict|blocked it in your country",
+     "Not available in your country"),
+    (r"video unavailable|has been removed|no longer available|does not exist",
+     "Video unavailable (removed, private or blocked)"),
+    (r"unsupported url", "This link is not supported by yt-dlp"),
+    (r"requested format is not available", "That format is not offered for this video - choose another"),
+    (r"ffmpeg.*(not found|not installed)|ffprobe.*(not found|not installed)", "ffmpeg is missing"),
+    (r"premieres in|live event will begin|will begin in", "The live stream or premiere has not started yet"),
+    (r"unable to download|getaddrinfo|name resolution|timed out|connection (reset|refused)",
+     "Network problem - check your connection"),
+]
+
+
+def friendly_error(text: str) -> str:
+    """A short human explanation for a yt-dlp error line (the line itself if nothing matches)."""
+    for pattern, message in FRIENDLY_ERRORS:
+        if re.search(pattern, text or "", re.I):
+            return message
+    return text
+
+
+def fetch_formats(url: str, *, cookies_browser: str = "", timeout: int = 90) -> list[dict] | None:
+    """All formats of a video for the manual format picker (None if yt-dlp cannot read the URL)."""
+    base = find_ytdlp()
+    if base is None:
+        return None
+    cmd = base + ["--dump-single-json", "--no-warnings", "--skip-download", "--no-playlist"]
+    cmd += find_js_runtime() or []
+    if cookies_browser:
+        cmd += ["--cookies-from-browser", cookies_browser]
+    try:
+        r = subprocess.run(cmd + ["--", url], capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, **_no_window())
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        return parse_formats(json.loads(r.stdout))
+    except Exception:
+        return None
+
+
+def parse_formats(data: dict) -> list[dict]:
+    """Rows for the format picker, best first: video formats by height, then audio-only by bitrate."""
+    rows = []
+    for f in data.get("formats") or []:
+        if not f.get("format_id") or f.get("vcodec") == f.get("acodec") == "none":
+            continue                                   # storyboards etc.
+        has_v, has_a = f.get("vcodec") not in (None, "none"), f.get("acodec") not in (None, "none")
+        size = f.get("filesize") or f.get("filesize_approx")
+        rows.append({
+            "id": str(f["format_id"]), "ext": f.get("ext") or "",
+            "video": has_v, "audio": has_a,
+            "res": (f"{f['width']}x{f['height']}" if f.get("width") and f.get("height")
+                    else (f"{f['height']}p" if f.get("height") else ("audio only" if not has_v else ""))),
+            "height": f.get("height") or 0, "fps": f.get("fps") or 0,
+            "vcodec": (f.get("vcodec") or "").split(".")[0] if has_v else "",
+            "acodec": (f.get("acodec") or "").split(".")[0] if has_a else "",
+            "size": size or 0, "tbr": f.get("tbr") or f.get("abr") or 0,
+            "note": f.get("format_note") or "",
+        })
+    rows.sort(key=lambda r: (not r["video"], -r["height"], -r["tbr"]))
+    return rows
+
+
+def format_expression(rows: list[dict]) -> str:
+    """The yt-dlp -f expression for the rows picked in the format picker."""
+    if not rows:
+        return ""
+    if len(rows) == 1:
+        r = rows[0]
+        return f"{r['id']}+ba/{r['id']}" if r["video"] and not r["audio"] else r["id"]
+    ordered = sorted(rows[:2], key=lambda r: not r["video"])     # video first, then audio
+    return "+".join(r["id"] for r in ordered)
 
 
 # ---------------------------------------------------------------- Running
@@ -722,6 +859,46 @@ def output_file(found: dict) -> str:
     return found.get("merge") or found.get("extract") or found.get("dest") or ""
 
 
+QUEUE_FILE = data_dir() / "queue.json"
+
+
+def load_queue() -> list[dict]:
+    try:
+        data = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
+        return [d for d in data if isinstance(d, dict) and d.get("url")] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_queue(entries: list[dict]) -> None:
+    try:
+        if entries:
+            QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            QUEUE_FILE.write_text(json.dumps(entries, indent=1), encoding="utf-8")
+        else:
+            QUEUE_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def overrides_summary(o: dict) -> str:
+    """Short text for the changes a queue item has compared to the main-window settings."""
+    parts = []
+    if o.get("mode") in MODES:
+        parts.append(MODES[o["mode"]].split(" - ", 1)[-1])
+    if o.get("format"):
+        parts.append("format " + o["format"])
+    if o.get("section"):
+        parts.append("cut " + o["section"].lstrip("*").replace("-inf", "-end"))
+    if o.get("chapters"):
+        parts.append("chapters")
+    if o.get("split"):
+        parts.append("split chapters")
+    if o.get("extra"):
+        parts.append("custom arguments")
+    return "  ·  ".join(parts)
+
+
 HISTORY_FILE = data_dir() / "history.json"
 HISTORY_MAX = 500
 
@@ -909,6 +1086,8 @@ class Item:
         self.path = ""
         self.error = ""
         self.mode = ""
+        self.thumb_url = ""
+        self.overrides: dict = {}              # per-item changes, see ItemDialog
         self.stop = threading.Event()
         self.removed = False
         self.card: "Card | None" = None
@@ -952,7 +1131,18 @@ class Card:
 
         self.btn_box = ttk.Frame(self.frame)
         self.btn_box.grid(row=0, column=2, rowspan=4, sticky="ne", padx=(12, 0))
+        self._bind_menu(self.frame)
         self.refresh()
+
+    def _bind_menu(self, widget) -> None:
+        """Right click opens the item menu, double click the item options (or the finished file)."""
+        secondary = ("<Button-2>", "<Control-Button-1>") if sys.platform == "darwin" else ("<Button-3>",)
+        for seq in secondary:
+            widget.bind(seq, lambda e: self.app.card_menu(self.item, e))
+        widget.bind("<Double-Button-1>", lambda e: self.app.card_activate(self.item))
+        for child in widget.winfo_children():
+            if not isinstance(child, ttk.Button):
+                self._bind_menu(child)
 
     def _set_buttons(self, specs) -> None:
         for child in self.btn_box.winfo_children():
@@ -964,7 +1154,8 @@ class Card:
         it, app = self.item, self.app
         colors = COLORS[app.theme]
         self.title_lbl.configure(text=shorten(it.title, 110))
-        meta = "  ·  ".join(x for x in (it.uploader, fmt_duration(it.duration)) if x)
+        meta = "  ·  ".join(x for x in (it.uploader, fmt_duration(it.duration),
+                                         ("⚙ " + overrides_summary(it.overrides)) if it.overrides else "") if x)
         self.meta_lbl.configure(text=meta or (it.url if it.title != it.url else ""))
         self.thumb_box.configure(background=colors["thumb"])
         self.thumb_lbl.configure(background=colors["thumb"], foreground=colors["muted"])
@@ -990,7 +1181,8 @@ class Card:
         elif st == "skipped":
             text, color = "✓ Already downloaded", colors["ok"]
         elif st == "failed":
-            text, color = "✗ Failed" + (f"   ·   {shorten(it.error, 90)}" if it.error else ""), colors["bad"]
+            text, color = ("✗ Failed" + (f"   ·   {shorten(friendly_error(it.error), 90)}" if it.error else ""),
+                           colors["bad"])
         else:
             text, color = "Cancelled", colors["muted"]
         self.status_lbl.configure(text=text, foreground=color)
@@ -1018,9 +1210,10 @@ class Card:
             elif st in ("done", "skipped"):
                 self._set_buttons([("Show", lambda: app.show_item(it)), remove])
             elif st in ("failed", "cancelled"):
-                self._set_buttons([("Retry", lambda: app.retry_item(it)), remove])
+                self._set_buttons([("Retry", lambda: app.retry_item(it)),
+                                   ("Options", lambda: app.open_item_options(it)), remove])
             else:
-                self._set_buttons([remove])
+                self._set_buttons([("Options", lambda: app.open_item_options(it)), remove])
 
     def set_thumb(self) -> None:
         if ImageTk is None or self.item.thumb is None:
@@ -1108,6 +1301,183 @@ class PlaylistDialog(tk.Toplevel if tk else object):
         self.destroy()
 
 
+class ItemDialog(tk.Toplevel if tk else object):
+    """Options of one queue item: format, time range, chapters and extra yt-dlp arguments.
+    They are stored in item.overrides and win over the settings in the main window."""
+
+    DEFAULT_MODE = "Default (as chosen in the main window)"
+
+    def __init__(self, app: "App", item: Item):
+        super().__init__(app.root)
+        self.app, self.item = app, item
+        o = item.overrides
+        self.picked_format = o.get("format", "")
+        self.rows: list[dict] = []
+        self.title("Download options")
+        self.transient(app.root)
+        self.columnconfigure(0, weight=1)
+        body = ttk.Frame(self, padding=16)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text=shorten(item.title, 70), style="CardTitle.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w")
+        hint = "  ·  ".join(x for x in (item.uploader, fmt_duration(item.duration)) if x)
+        ttk.Label(body, text=hint, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w",
+                                                              pady=(0, 12))
+
+        ttk.Label(body, text="Download as").grid(row=2, column=0, sticky="w", pady=4)
+        self.mode_var = tk.StringVar(value=MODES.get(o.get("mode", ""), self.DEFAULT_MODE))
+        ttk.Combobox(body, textvariable=self.mode_var, state="readonly", width=28,
+                     values=[self.DEFAULT_MODE, *MODES.values()]).grid(row=2, column=1, columnspan=3, sticky="w")
+
+        ttk.Label(body, text="Exact format").grid(row=3, column=0, sticky="w", pady=4)
+        self.format_lbl = ttk.Label(body, style="Muted.TLabel")
+        self.format_lbl.grid(row=3, column=1, sticky="w")
+        self.pick_btn = ttk.Button(body, text="Choose …", command=self.load_formats)
+        self.pick_btn.grid(row=3, column=2, padx=(8, 4))
+        ttk.Button(body, text="Reset", command=self.reset_format).grid(row=3, column=3)
+
+        self.picker = ttk.Frame(body)               # the format list, shown on demand
+        self.picker.grid(row=4, column=0, columnspan=4, sticky="nsew", pady=(4, 8))
+        self.picker.columnconfigure(0, weight=1)
+        cols = (("id", "ID", 60), ("res", "Resolution", 100), ("ext", "Type", 50), ("codec", "Codec", 130),
+                ("size", "Size", 80), ("note", "Note", 130))
+        self.tree = ttk.Treeview(self.picker, columns=[c[0] for c in cols], show="headings", height=8,
+                                 selectmode="extended")
+        for key, text, width in cols:
+            self.tree.heading(key, text=text, anchor="w")
+            self.tree.column(key, width=width, anchor="w", stretch=key in ("note", "codec"))
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(self.picker, command=self.tree.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.bind("<<TreeviewSelect>>", self._on_pick)
+        self.picker_msg = ttk.Label(self.picker, style="Muted.TLabel",
+                                    text="Pick one row, or a video-only row plus an audio-only row.")
+        self.picker_msg.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.picker.grid_remove()
+
+        ttk.Label(body, text="Only this part").grid(row=5, column=0, sticky="w", pady=4)
+        cut = ttk.Frame(body)
+        cut.grid(row=5, column=1, columnspan=3, sticky="w")
+        self.start_var = tk.StringVar(value=o.get("start", ""))
+        self.end_var = tk.StringVar(value=o.get("end", ""))
+        ttk.Entry(cut, textvariable=self.start_var, width=9).pack(side="left")
+        ttk.Label(cut, text="  to  ").pack(side="left")
+        ttk.Entry(cut, textvariable=self.end_var, width=9).pack(side="left")
+        self.exact_var = tk.BooleanVar(value=o.get("exact", False))
+        ttk.Checkbutton(cut, text="Exact cut (slower, re-encodes)", variable=self.exact_var).pack(side="left", padx=14)
+        ttk.Label(body, text="Times like 90, 1:30 or 01:02:03; leave the end empty for 'until the end'.",
+                  style="Muted.TLabel").grid(row=6, column=1, columnspan=3, sticky="w")
+
+        ttk.Label(body, text="Chapters").grid(row=7, column=0, sticky="w", pady=(10, 4))
+        chap = ttk.Frame(body)
+        chap.grid(row=7, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        self.chap_var = tk.BooleanVar(value=o.get("chapters", app.chapters_var.get()))
+        self.split_var = tk.BooleanVar(value=o.get("split", False))
+        ttk.Checkbutton(chap, text="Embed chapter markers", variable=self.chap_var).pack(side="left")
+        ttk.Checkbutton(chap, text="One file per chapter", variable=self.split_var).pack(side="left", padx=14)
+
+        ttk.Label(body, text="Extra arguments").grid(row=8, column=0, sticky="w", pady=4)
+        self.extra_var = tk.StringVar(value=o.get("extra", ""))
+        ttk.Entry(body, textvariable=self.extra_var).grid(row=8, column=1, columnspan=3, sticky="ew")
+        ttk.Label(body, text="Passed to yt-dlp for this item only, e.g. --write-info-json",
+                  style="Muted.TLabel").grid(row=9, column=1, columnspan=3, sticky="w")
+
+        foot = ttk.Frame(body)
+        foot.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(16, 0))
+        ttk.Button(foot, text="Apply to all waiting", command=lambda: self.accept(all_waiting=True)).pack(side="left")
+        accent = "Accent.TButton" if sv_ttk is not None else "TButton"
+        ttk.Button(foot, text="OK", style=accent, command=self.accept).pack(side="right")
+        ttk.Button(foot, text="Cancel", command=self.destroy).pack(side="right", padx=8)
+
+        self._show_format()
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        x = app.root.winfo_rootx() + (app.root.winfo_width() - self.winfo_width()) // 2
+        y = app.root.winfo_rooty() + max((app.root.winfo_height() - self.winfo_height()) // 3, 0)
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.grab_set()
+
+    # -- format picker
+
+    def _show_format(self) -> None:
+        self.format_lbl.configure(text=self.picked_format or "Automatic")
+
+    def reset_format(self) -> None:
+        self.picked_format = ""
+        self.tree.selection_set(())
+        self._show_format()
+
+    def load_formats(self) -> None:
+        self.picker.grid()
+        if self.rows:
+            return
+        self.pick_btn.configure(state="disabled")
+        self.picker_msg.configure(text="Loading formats …")
+        cookies = self.app.cookies()
+
+        def work():
+            rows = fetch_formats(self.item.url, cookies_browser=cookies)
+            self.app.ui(lambda: self._formats_loaded(rows))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _formats_loaded(self, rows: list[dict] | None) -> None:
+        if not self.winfo_exists():
+            return
+        self.pick_btn.configure(state="normal")
+        if not rows:
+            self.picker_msg.configure(text="Could not read the formats of this link.")
+            return
+        self.rows = rows
+        for r in rows:
+            codec = "/".join(x for x in (r["vcodec"], r["acodec"]) if x)
+            kind = "" if r["video"] and r["audio"] else ("video only" if r["video"] else "")
+            note = "  ".join(x for x in (kind, r["note"], f"{r['fps']:g} fps" if r["fps"] > 30 else "") if x)
+            self.tree.insert("", "end", iid=r["id"], values=(
+                r["id"], r["res"], r["ext"], codec, fmt_size(r["size"]) if r["size"] else "", note))
+        self.picker_msg.configure(text="Pick one row, or a video-only row plus an audio-only row.")
+
+    def _on_pick(self, _event=None) -> None:
+        chosen = list(self.tree.selection())
+        if len(chosen) > 2:                              # at most video + audio
+            self.tree.selection_set(chosen[-2:])
+            return
+        by_id = {r["id"]: r for r in self.rows}
+        self.picked_format = format_expression([by_id[i] for i in chosen if i in by_id])
+        self._show_format()
+
+    # -- result
+
+    def accept(self, all_waiting: bool = False) -> None:
+        section, error = section_arg(self.start_var.get(), self.end_var.get())
+        if error:
+            messagebox.showwarning("Only this part", error, parent=self)
+            return
+        extra = self.extra_var.get().strip()
+        try:
+            shlex.split(extra)
+        except ValueError:
+            messagebox.showwarning("Extra arguments", "Unbalanced quotes in the extra arguments.", parent=self)
+            return
+        mode = next((k for k, v in MODES.items() if v == self.mode_var.get()), "")
+        result = {"mode": mode, "format": self.picked_format, "section": section,
+                  "start": self.start_var.get().strip(), "end": self.end_var.get().strip(),
+                  "exact": self.exact_var.get(), "extra": extra, "split": self.split_var.get()}
+        result = {k: v for k, v in result.items() if v}
+        if self.chap_var.get() != self.app.chapters_var.get():         # only a difference is an override
+            result["chapters"] = self.chap_var.get()
+        self.item.overrides = result
+        if all_waiting:
+            for other in self.app.items:
+                if other is not self.item and other.status == "queued":
+                    other.overrides = dict(result)
+                    other.card.refresh()
+        self.destroy()
+
+
 class App:
     """The main window: link input, download queue, history and log."""
 
@@ -1121,6 +1491,8 @@ class App:
         self.info_slots = threading.Semaphore(3)
         self.history = load_history()
         self.text_widgets: list = []
+        self.restored = False
+        self.watch_last = ""
         self.last_clip = ""
         self.placeholder = "Paste a video or playlist link and press Enter"
         self.placeholder_on = False
@@ -1153,6 +1525,8 @@ class App:
         if Image is None:
             self.log("Note: Pillow is not installed - no thumbnails (pip install pillow).")
 
+        self._restore_queue()
+        self.root.after(1000, self._watch_clipboard)
         self._startup_tools()
         threading.Thread(target=self._check_app_update, daemon=True).start()
 
@@ -1289,11 +1663,15 @@ class App:
         self.single_var = tk.BooleanVar(value=cfg.get("single", True))
         self.sponsor_var = tk.BooleanVar(value=cfg.get("sponsorblock", False))
         self.auto_var = tk.BooleanVar(value=cfg.get("autostart", False))
-        switches = (("Subtitles (en/de)", self.subs_var), ("Embed thumbnail", self.thumb_var),
+        self.chapters_var = tk.BooleanVar(value=cfg.get("chapters", False))
+        self.clip_watch_var = tk.BooleanVar(value=False)                   # never on at startup
+        self.clip_watch_var.trace_add("write", lambda *_: self._clip_watch_toggled())
+        switches = (("Subtitles", self.subs_var), ("Embed thumbnail", self.thumb_var),
                     ("Skip already downloaded", self.arch_var), ("Folder per channel", self.uploader_var),
                     ("Single video only (no playlist)", self.single_var),
                     ("Remove sponsor segments", self.sponsor_var),
-                    ("Start right after adding", self.auto_var))
+                    ("Embed chapters", self.chapters_var), ("Start right after adding", self.auto_var),
+                    ("Watch the clipboard for links", self.clip_watch_var))
         self.subs_check = None
         for i, (text, var) in enumerate(switches):
             check = ttk.Checkbutton(self.opts, text=text, variable=var, style=switch)
@@ -1302,6 +1680,10 @@ class App:
                 self.subs_check = check
         extra = ttk.Frame(self.opts)
         extra.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.sub_langs_var = tk.StringVar(value=cfg.get("sub_langs", "en,de"))
+        self.name_var = tk.StringVar(value=cfg.get("name", ""))
+        self.proxy_var = tk.StringVar(value=cfg.get("proxy", ""))
+        self.args_var = tk.StringVar(value=cfg.get("args", ""))
         self.cookie_var = tk.StringVar(value=cfg.get("cookies") or NO_BROWSER)
         self.limit_var = tk.StringVar(value=cfg.get("limit", ""))
         self.parallel_var = tk.StringVar(value=str(cfg.get("parallel", 2)))
@@ -1314,6 +1696,33 @@ class App:
         ttk.Label(extra, text="Parallel").grid(row=0, column=5, sticky="w")
         ttk.Spinbox(extra, textvariable=self.parallel_var, from_=1, to=4, width=3,
                     state="readonly").grid(row=0, column=6, padx=(6, 0))
+
+        more = ttk.Frame(self.opts)
+        more.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        more.columnconfigure(5, weight=1)
+        ttk.Label(more, text="Subtitle languages").grid(row=0, column=0, sticky="w")
+        ttk.Entry(more, textvariable=self.sub_langs_var, width=10).grid(row=0, column=1, padx=(6, 18))
+        ttk.Label(more, text="File name").grid(row=0, column=2, sticky="w")
+        ttk.Entry(more, textvariable=self.name_var, width=22).grid(row=0, column=3, padx=(6, 2))
+        ttk.Label(more, text="(default %(title)s)", style="Muted.TLabel").grid(row=0, column=4, padx=(0, 18))
+        ttk.Label(more, text="Proxy").grid(row=0, column=5, sticky="e")
+        ttk.Entry(more, textvariable=self.proxy_var, width=22).grid(row=0, column=6, padx=(6, 0))
+        ttk.Label(more, text="Extra yt-dlp arguments").grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Entry(more, textvariable=self.args_var).grid(row=1, column=2, columnspan=5, sticky="ew",
+                                                         padx=(6, 0), pady=(8, 0))
+
+        prof = ttk.Frame(self.opts)
+        prof.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(prof, text="Profile").pack(side="left")
+        self.profile_var = tk.StringVar(value="")
+        self.profile_combo = ttk.Combobox(prof, textvariable=self.profile_var, width=18,
+                                          values=sorted(cfg.get("profiles", {})))
+        self.profile_combo.pack(side="left", padx=6)
+        self.profile_combo.bind("<<ComboboxSelected>>", lambda e: self.load_profile())
+        ttk.Button(prof, text="Save", command=self.save_profile).pack(side="left")
+        ttk.Button(prof, text="Delete", command=self.delete_profile).pack(side="left", padx=6)
+        ttk.Label(prof, text="Type a name and press Save to keep the current settings under it.",
+                  style="Muted.TLabel").pack(side="left", padx=8)
         self._apply_options_visibility()
 
         # tabs
@@ -1493,14 +1902,63 @@ class App:
             self.log_box.configure(state="disabled")
         self.ui(_append)
 
+    def collect_options(self) -> dict:
+        """The download settings of the main window (also what a profile stores)."""
+        return {"mode": self.mode_key(), "out": self.out_var.get(), "cookies": self.cookies(),
+                "subs": self.subs_var.get(), "thumb": self.thumb_var.get(),
+                "archive": self.arch_var.get(), "uploader": self.uploader_var.get(),
+                "single": self.single_var.get(), "also_audio": self.also_var.get(),
+                "sponsorblock": self.sponsor_var.get(), "chapters": self.chapters_var.get(),
+                "sub_langs": self.sub_langs_var.get().strip(), "name": self.name_var.get().strip(),
+                "proxy": self.proxy_var.get().strip(), "args": self.args_var.get().strip(),
+                "limit": self.limit_var.get().strip()}
+
+    def apply_options(self, d: dict) -> None:
+        mode = d.get("mode") if d.get("mode") in MODES else self.mode_key()
+        self.kind_var.set(mode_kind(mode))
+        self.quality_var.set(MODES[mode])
+        self.out_var.set(d.get("out") or self.out_var.get())
+        self.cookie_var.set(d.get("cookies") or NO_BROWSER)
+        self.also_var.set(d.get("also_audio") or ALSO_AUDIO_NONE)
+        for var, key in ((self.subs_var, "subs"), (self.thumb_var, "thumb"), (self.arch_var, "archive"),
+                         (self.uploader_var, "uploader"), (self.single_var, "single"),
+                         (self.sponsor_var, "sponsorblock"), (self.chapters_var, "chapters")):
+            if key in d:
+                var.set(bool(d[key]))
+        for var, key in ((self.sub_langs_var, "sub_langs"), (self.name_var, "name"),
+                         (self.proxy_var, "proxy"), (self.args_var, "args"), (self.limit_var, "limit")):
+            if key in d:
+                var.set(str(d[key]))
+        self.sync_mode_options()
+
     def save_options(self) -> None:
-        save_settings({"mode": self.mode_key(), "out": self.out_var.get(), "cookies": self.cookies(),
-                       "subs": self.subs_var.get(), "thumb": self.thumb_var.get(),
-                       "archive": self.arch_var.get(), "uploader": self.uploader_var.get(),
-                       "single": self.single_var.get(), "also_audio": self.also_var.get(),
-                       "sponsorblock": self.sponsor_var.get(), "autostart": self.auto_var.get(),
-                       "limit": self.limit_var.get().strip(), "parallel": self.parallel(),
-                       "theme": self.theme_mode.get()})
+        save_settings({**self.collect_options(), "autostart": self.auto_var.get(),
+                       "parallel": self.parallel(), "theme": self.theme_mode.get()})
+
+    def save_profile(self) -> None:
+        name = self.profile_var.get().strip()
+        if not name:
+            messagebox.showinfo("Profile", "Type a name for the profile first.")
+            return
+        profiles = dict(load_settings().get("profiles", {}))
+        profiles[name] = self.collect_options()
+        save_settings({"profiles": profiles})
+        self.profile_combo.configure(values=sorted(profiles))
+        self.log(f"Profile '{name}' saved.")
+
+    def load_profile(self) -> None:
+        d = load_settings().get("profiles", {}).get(self.profile_var.get())
+        if d:
+            self.apply_options(d)
+
+    def delete_profile(self) -> None:
+        name = self.profile_var.get().strip()
+        profiles = dict(load_settings().get("profiles", {}))
+        if name in profiles and messagebox.askyesno("Profile", f"Delete the profile '{name}'?"):
+            del profiles[name]
+            save_settings({"profiles": profiles})
+            self.profile_combo.configure(values=sorted(profiles))
+            self.profile_var.set("")
 
     def cookies(self) -> str:
         value = self.cookie_var.get()
@@ -1628,6 +2086,7 @@ class App:
                     sub.uploader = e.get("uploader") or info["uploader"]
                     sub.duration = e.get("duration")
                     sub.status = "queued"
+                    sub.thumb_url = e.get("thumbnail", "")
                     self._add_card(sub)
                     threading.Thread(target=self._thumb_worker, args=(sub, e.get("thumbnail", "")),
                                      daemon=True).start()
@@ -1640,6 +2099,7 @@ class App:
             item.uploader = info["uploader"]
             item.duration = info["duration"]
             item.thumb = thumb
+            item.thumb_url = info["thumbnail"]
         else:
             item.uploader = "No preview available - will still try to download"
         item.status = "queued"
@@ -1700,6 +2160,54 @@ class App:
         else:
             open_folder(Path(self.out_var.get() or DEFAULT_OUT))
 
+    def open_item_options(self, item: Item) -> None:
+        if item.status == "downloading":
+            messagebox.showinfo("Options", "Cancel the download first to change its options.")
+            return
+        dialog = ItemDialog(self, item)
+        self.root.wait_window(dialog)
+        if item.card:
+            item.card.refresh()
+        self.update_state()
+
+    def card_activate(self, item: Item) -> None:
+        """Double click: open the finished file, otherwise the options of the item."""
+        if item.status in ("done", "skipped"):
+            if item.path and Path(item.path).exists():
+                open_path(Path(item.path))
+        elif item.status != "downloading":
+            self.open_item_options(item)
+
+    def copy_link(self, item: Item) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(item.url)
+
+    def card_menu(self, item: Item, event) -> None:
+        menu = tk.Menu(self.root, tearoff=0)
+        st = item.status
+        if st in ("queued", "failed", "cancelled"):
+            menu.add_command(label="Options …", command=lambda: self.open_item_options(item))
+        if st == "downloading":
+            menu.add_command(label="Cancel", command=lambda: self.cancel_item(item))
+        if st in ("failed", "cancelled"):
+            menu.add_command(label="Retry", command=lambda: self.retry_item(item))
+        if st in ("done", "skipped"):
+            if item.path and Path(item.path).exists():
+                menu.add_command(label="Open file", command=lambda: open_path(Path(item.path)))
+            menu.add_command(label="Show in folder", command=lambda: self.show_item(item))
+        menu.add_separator()
+        menu.add_command(label="Copy link", command=lambda: self.copy_link(item))
+        menu.add_command(label="Open link in browser", command=lambda: webbrowser.open(item.url))
+        if item.error and st == "failed":
+            menu.add_command(label="Copy error message", command=lambda: (
+                self.root.clipboard_clear(), self.root.clipboard_append(item.error)))
+        menu.add_separator()
+        menu.add_command(label="Remove", command=lambda: self.remove_item(item))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
     def clear_finished(self) -> None:
         for item in [it for it in self.items if it.finished]:
             self._remove_card(item)
@@ -1747,10 +2255,19 @@ class App:
                 "cookies": self.cookies(), "uploader": self.uploader_var.get(),
                 "single": self.single_var.get(), "sponsor": self.sponsor_var.get(),
                 "also": "" if self.also_var.get() == ALSO_AUDIO_NONE else self.also_var.get(),
-                "limit": self.limit_rate()}
+                "limit": self.limit_rate(), "sub_langs": self.sub_langs_var.get().strip() or "en,de",
+                "name": self.name_var.get().strip(), "proxy": self.proxy_var.get().strip(),
+                "args": self.args_var.get().strip(), "chapters": self.chapters_var.get(),
+                "format": "", "section": "", "exact": False, "split": False}
 
     def _launch(self, item: Item) -> None:
         opts = self.snapshot()
+        ov = item.overrides                    # what was changed for this item wins
+        for key in ("mode", "format", "section", "exact", "split", "chapters"):
+            if key in ov:
+                opts[key] = ov[key]
+        if ov.get("extra"):
+            opts["args"] = (opts["args"] + " " + ov["extra"]).strip()
         item.status, item.pct, item.mode = "downloading", 0.0, opts["mode"]
         item.speed = item.eta = item.size = item.error = ""
         item.card.refresh()
@@ -1758,10 +2275,17 @@ class App:
 
     def _download_worker(self, item: Item, o: dict) -> None:
         audio = o["mode"] in AUDIO_MODES
+        try:
+            extra = shlex.split(o["args"])
+        except ValueError:
+            extra = None
         args = build_args(o["mode"], o["out"], subs=o["subs"], thumb=o["thumb"], archive=o["archive"],
                           cookies_browser=o["cookies"], sort_by_uploader=o["uploader"],
                           no_playlist=o["single"], also_audio=o["also"], limit_rate=o["limit"],
-                          sponsorblock=o["sponsor"])
+                          sponsorblock=o["sponsor"], sub_langs=o["sub_langs"], format_override=o["format"],
+                          section=o["section"], exact_cut=o["exact"], embed_chapters=o["chapters"],
+                          split_chapters=o["split"], proxy=o["proxy"], name_template=o["name"],
+                          extra=extra)
         found: dict = {}
         state = {"skipped": False, "last": 0.0}
 
@@ -1791,8 +2315,10 @@ class App:
 
         rc = 1
         try:
-            prepared = prepare_command(args, self.log)
-            if prepared is None:
+            prepared = prepare_command(args, self.log) if extra is not None else None
+            if extra is None:
+                item.error = "Unbalanced quotes in the extra yt-dlp arguments"
+            elif prepared is None:
                 item.error = "yt-dlp is not available (offline?)"
             else:
                 base, args = prepared
@@ -1859,6 +2385,61 @@ class App:
             self.empty_lbl.place_forget()
         else:
             self.empty_lbl.place(relx=0.5, rely=0.42, anchor="center")
+        if self.restored:                      # not before the old queue is back, or it would be overwritten
+            self._save_queue()
+
+    # ------------------------------------------------------------ queue on disk, clipboard watcher
+
+    def _save_queue(self) -> None:
+        """Keep everything that is not finished successfully, so a restart does not lose the queue."""
+        keep = []
+        for it in self.items:
+            if it.status in ("done", "skipped"):
+                continue
+            keep.append({"url": it.url, "title": it.title, "uploader": it.uploader, "duration": it.duration,
+                         "thumb_url": it.thumb_url, "overrides": it.overrides,
+                         "status": it.status if it.status in ("failed", "cancelled") else "queued"})
+        save_queue(keep)
+
+    def _restore_queue(self) -> None:
+        for d in load_queue():
+            item = Item(d["url"])
+            item.title = d.get("title") or item.url
+            item.uploader = d.get("uploader") or ""
+            item.duration = d.get("duration")
+            item.thumb_url = d.get("thumb_url") or ""
+            item.overrides = d.get("overrides") if isinstance(d.get("overrides"), dict) else {}
+            item.status = d.get("status") if d.get("status") in ("failed", "cancelled") else "queued"
+            if item.title == item.url and item.status == "queued":       # never got its preview
+                item.status = "fetching"
+                threading.Thread(target=self._info_worker, args=(item, self.single_var.get(), self.cookies()),
+                                 daemon=True).start()
+            self._add_card(item)
+            if item.thumb_url:
+                threading.Thread(target=self._thumb_worker, args=(item, item.thumb_url), daemon=True).start()
+        self.restored = True
+        if self.items:
+            self.log(f"{len(self.items)} item(s) restored from the last session.")
+        self.update_state()
+
+    def _clip_watch_toggled(self) -> None:
+        if self.clip_watch_var.get():          # what is in the clipboard right now is not "new"
+            self.watch_last = self._clipboard().strip()
+
+    def _watch_clipboard(self) -> None:
+        """While enabled in the options, every new link copied anywhere is added to the queue."""
+        try:
+            if self.clip_watch_var.get():
+                clip = self._clipboard().strip()
+                if clip != self.watch_last:
+                    self.watch_last = clip
+                    if looks_like_url(clip) and not any(it.url == clip for it in self.items):
+                        self.add_urls([clip])
+            else:
+                self.watch_last = self._clipboard().strip()      # so enabling it does not add the old content
+            self.root.after(1000, self._watch_clipboard)
+        except tk.TclError:
+            pass                                                 # window closed
 
     # ------------------------------------------------------------ history
 
@@ -2038,6 +2619,7 @@ class App:
                         "(Partial files are kept - downloading the link again resumes them.)"):
             return
         self.running = False
+        self._save_queue()                     # running items come back as waiting after a restart
         for it in running:
             it.stop.set()                      # the watcher threads kill the process trees
         try:
