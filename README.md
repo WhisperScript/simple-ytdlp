@@ -123,7 +123,7 @@ nothing is fetched twice. **Pause all** and **Resume all** do the same for the w
 ### More
 
 - **Many links at once:** paste as many as you like; they wait in line and download two at a time (up to four in the settings).
-- **Same video twice?** Every video is in the list once - paste it again and the app jumps to its card (a failed one is retried).
+- **Same video twice?** A video is in the list once per format - paste it again and the app jumps to its card (a failed one is retried). Want it as MP3 or in another quality? That is a new download, saved under its own file name. Deleted the file? Paste the link again and it downloads again. ("Skip already downloaded" in the settings only skips videos that are in the History *and* still on your disk.)
 - **Finished?** You get a notification when everything is done.
 - **Light or dark:** follows your system; change it under **View → Theme**.
 - **Everything in one place:** the **Settings …** button has subtitles, speed limit, file names, proxy and more.

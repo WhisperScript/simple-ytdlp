@@ -521,27 +521,70 @@ class Feedback(GuiCase):
         self.assertEqual(app.toast_lbl.cget("text"), "Already in the queue")
         self.assertEqual(len(app.items), 1)
 
+    def finished(self, url, name="f.mp4", exists=True):
+        item = mod.Item(url)
+        item.added_mode, item.status, item.path = app.mode_key(), "done", str(self.out / name)
+        if exists:
+            (self.out / name).write_bytes(b"x")
+        app.items.append(item)
+        app._items_changed()
+        return item
+
     def test_another_link_to_the_same_video_jumps_to_its_card(self):
-        app.add_urls(["https://www.youtube.com/watch?v=dupVID00001"])
-        app.items[0].status = "done"
+        done = self.finished("https://www.youtube.com/watch?v=dupVID00001")
         app.add_urls(["https://youtu.be/dupVID00001?si=abc", "https://x.test/other"])
         pump(30)
         self.assertEqual(len(app.items), 2, "the same video must not get a second card")
-        self.assertEqual(app.selected, {app.items[0].id})
+        self.assertEqual(app.selected, {done.id})
         app.add_urls(["https://youtu.be/dupVID00001"])
         self.assertEqual(app.toast_lbl.cget("text"), "Already downloaded")
 
-    def test_a_failed_video_added_again_is_retried_and_download_again_replaces_a_finished_one(self):
-        app.add_urls([U("again1")])
-        failed = app.items[0]
-        failed.status = "failed"
-        with mock.patch.object(app, "retry_items") as retry:
-            app.add_urls([U("again1")])
-        retry.assert_called_once_with([failed])
-        failed.status = "done"
-        app.add_urls([U("again1")], again=True)
+    def test_the_same_video_in_another_format_is_another_download(self):
+        self.finished("https://youtu.be/fmtVID00001")
+        app.kind_var.set("audio")
+        app._on_kind()
+        app.add_urls(["https://youtu.be/fmtVID00001"])
+        self.assertEqual(len(app.items), 2)
+        self.assertEqual(app.items[1].added_mode, "mp3")
+        self.assertNotIn("name", app.items[1].overrides, "video and mp3 do not share a file name")
+
+    def test_another_quality_of_the_same_video_gets_its_own_file_name(self):
+        app.quality_var.set(mod.quality_label("video1080"))
+        app.sync_mode_options()
+        app.add_urls(["https://youtu.be/qltVID00001"])
+        app.quality_var.set(mod.quality_label("video720"))
+        app.sync_mode_options()
+        app.add_urls(["https://youtu.be/qltVID00001"])
+        self.assertEqual(len(app.items), 2)
+        self.assertEqual(app.items[1].overrides["name"], "%(title)s [Up to 720p]")
+        self.assertIn("file named by quality", mod.overrides_summary(app.items[1].overrides))
+
+    def test_a_finished_download_whose_file_is_gone_is_downloaded_again(self):
+        gone = self.finished("https://youtu.be/gonVID00001", exists=False)
+        app.add_urls(["https://youtu.be/gonVID00001"])
         self.assertEqual(len(app.items), 1)
-        self.assertIsNot(app.items[0], failed)
+        self.assertIsNot(app.items[0], gone)
+        self.assertNotIn("Already", app.toast_lbl.cget("text"))
+
+    def test_history_skips_a_video_that_is_still_on_disk_but_not_one_that_was_deleted(self):
+        (self.out / "h.mp4").write_bytes(b"x")
+        app.history = [{"title": "H", "url": "https://youtu.be/hisVID00001", "path": str(self.out / "h.mp4"),
+                        "mode": "video", "time": time.time()},
+                       {"title": "G", "url": "https://youtu.be/hisVID00002", "path": str(self.out / "nope.mp4"),
+                        "mode": "video", "time": time.time()}]
+        app.arch_var.set(True)
+        app.add_urls(["https://youtu.be/hisVID00001"])
+        self.assertEqual(app.items, [])
+        self.assertIn("History", app.toast_lbl.cget("text"))
+        app.add_urls(["https://youtu.be/hisVID00002"])
+        self.assertEqual(len(app.items), 1, "the file was deleted: download it again")
+        app.arch_var.set(False)
+        app.add_urls(["https://youtu.be/hisVID00001"])
+        self.assertEqual(len(app.items), 2, "with the setting off it is always added")
+
+    def test_yt_dlps_own_archive_is_not_used_by_the_window(self):
+        app.arch_var.set(True)
+        self.assertIs(app.snapshot()["archive"], False)
 
     def test_notices_by_priority(self):
         app.set_notice("update", "New version", actions=[("Release page", lambda: None)])

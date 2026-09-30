@@ -1073,6 +1073,8 @@ def overrides_summary(o: dict) -> str:
         parts.append("split chapters")
     if o.get("extra"):
         parts.append("custom arguments")
+    if o.get("name"):
+        parts.append("file named by quality")
     return "  ·  ".join(parts)
 
 
@@ -1469,7 +1471,8 @@ class Item:
         Item._counter += 1
         self.id = Item._counter
         self.url = url
-        self.key = url_key(url)                # the same video behind different links has the same key
+        self.vkey = url_key(url)               # the same video behind different links has the same key
+        self.added_mode = ""                   # the format chosen when it was added
         self.title = url
         self.uploader = ""
         self.duration = None
@@ -1491,6 +1494,11 @@ class Item:
         self.pause_requested = False
         self.retries = 0                       # automatic retries after network problems
         self.retry_at = 0.0                    # when the next automatic retry starts
+
+    @property
+    def key(self) -> str:
+        """Which download this is: the video and the format - the same video in another format is another card."""
+        return f"{self.vkey}|{self.overrides.get('mode') or self.added_mode}"
 
     @property
     def active(self) -> bool:
@@ -3177,23 +3185,56 @@ class App:
 
     # ------------------------------------------------------------ queue
 
+    def _file_exists(self, item: Item) -> bool:
+        return bool(item.path) and Path(item.path).exists()
+
+    def _downloaded_before(self, vkey: str, mode: str) -> bool:
+        """True if History has this video in this format and the file is still there."""
+        return any(url_key(h.get("url", "")) == vkey and h.get("mode") == mode and h.get("path")
+                   and Path(h["path"]).exists() for h in self.history)
+
+    def _name_for_other_format(self, vkey: str, mode: str) -> str:
+        """A file name template that keeps this download apart from another format of the same video (same kind,
+        e.g. 720p next to 1080p - they would get the same file name), or ''."""
+        kind = mode_kind(mode)
+        clash = any(it.vkey == vkey and (it.overrides.get("mode") or it.added_mode) not in ("", mode)
+                    and mode_kind(it.overrides.get("mode") or it.added_mode) == kind for it in self.items)
+        clash = clash or any(url_key(h.get("url", "")) == vkey and h.get("mode") not in (None, "", mode)
+                             and mode_kind(h["mode"]) == kind and h.get("path") and Path(h["path"]).exists()
+                             for h in self.history)
+        if not clash:
+            return ""
+        return (self.name_var.get().strip() or "%(title)s") + f" [{quality_label(mode)}]"
+
     def add_urls(self, urls: list[str], again: bool = False) -> None:
-        """Queue links. A video is in the list once: adding it again jumps to its card instead (a failed or
-        cancelled one is retried). again=True (History > Download again) replaces a finished card."""
+        """Queue links. A video is in the list once per format: adding it again jumps to its card (a failed or
+        cancelled one is retried; a finished one whose file is gone is downloaded again). A video that History
+        has in this format, file still there, is skipped while 'Skip already downloaded' is on.
+        again=True (History > Download again) replaces a finished card."""
         self.select_tab(0)
+        mode = self.mode_key()
         known = {it.key: it for it in self.items}
         no_playlist, cookies = self.single_var.get(), self.cookies()   # Tk variables: main thread only
-        added, seen, first = 0, [], None
+        added, seen, done_before, first = 0, [], 0, None
         for url in urls:
-            old = known.get(url_key(url))
-            if old is not None and again and old.finished:
-                self._drop([old])
+            vkey = url_key(url)
+            key = f"{vkey}|{mode}"
+            old = known.get(key)
+            if old is not None and old.finished and (again or (old.status == "done" and not self._file_exists(old))):
+                self._drop([old])                                      # nothing to jump to: start it again
                 old = None
             if old is not None:
                 if old not in seen:
                     seen.append(old)
                 continue
+            if not again and self.arch_var.get() and self._downloaded_before(vkey, mode):
+                done_before += 1
+                continue
             item = Item(url)
+            item.added_mode = mode
+            name = self._name_for_other_format(vkey, mode)
+            if name:
+                item.overrides["name"] = name
             known[item.key] = item
             self.items.append(item)
             first = first or item
@@ -3208,19 +3249,22 @@ class App:
             self.anchor = self.cursor = seen[-1].id
             self.view.refresh_rows()
         target = seen[-1] if seen and not added else (self.items[-1] if added == 1 else first)
-        if target is not None:
+        if target is not None and (added or seen):
             self.view.scroll_to(target)
-        if seen and not added:
-            if len(seen) > 1:
-                self.toast(f"{len(seen)} links are already in the queue")
+        skipped = len(seen) + done_before
+        if skipped and not added:
+            if skipped > 1:
+                self.toast(f"{skipped} links are already in the queue or downloaded")
+            elif done_before:
+                self.toast("Already downloaded - it is in the History")
             elif retry:
                 self.toast("Already in the queue - trying again")
             elif seen[0].status in ("done", "skipped"):
                 self.toast("Already downloaded")
             else:
                 self.toast("Already in the queue")
-        elif added > 1 or seen:
-            self.toast(f"Added {added} links" + (f" ({len(seen)} already in the queue)" if seen else ""))
+        elif added > 1 or skipped:
+            self.toast(f"Added {added} links" + (f" ({skipped} already there)" if skipped else ""))
 
     def _items_changed(self) -> None:
         """The list of items changed (added, removed, moved): drop stale selection, redraw, update counters."""
@@ -3253,9 +3297,18 @@ class App:
             self._drop([item])
             chosen = self._pick_playlist(info)
             if chosen:
-                subs = []
+                subs, mode, have = [], self.mode_key(), {it.key for it in self.items}
+                skipped = 0
                 for e in chosen:
                     sub = Item(e["url"])
+                    sub.added_mode = mode
+                    if sub.key in have or (self.arch_var.get() and self._downloaded_before(sub.vkey, mode)):
+                        skipped += 1                       # already in the list, or downloaded before
+                        continue
+                    name = self._name_for_other_format(sub.vkey, mode)
+                    if name:
+                        sub.overrides["name"] = name
+                    have.add(sub.key)
                     sub.title = e["title"]
                     sub.uploader = e.get("uploader") or info["uploader"]
                     sub.duration = e.get("duration")
@@ -3263,7 +3316,8 @@ class App:
                     sub.thumb_url = e.get("thumbnail", "")
                     subs.append(sub)
                 self.items[at:at] = subs                   # where the placeholder was
-                self.log(f"Playlist '{info['title']}': {len(chosen)} videos added.")
+                self.log(f"Playlist '{info['title']}': {len(subs)} videos added"
+                         + (f", {skipped} skipped (already there)." if skipped else "."))
             self._items_changed()
             self._autostart()
             return
@@ -3696,7 +3750,8 @@ class App:
 
     def snapshot(self) -> dict:
         return {"mode": self.mode_key(), "out": Path(self.out_var.get() or DEFAULT_OUT).expanduser(),
-                "subs": self.subs_var.get(), "thumb": self.thumb_var.get(), "archive": self.arch_var.get(),
+                "subs": self.subs_var.get(), "thumb": self.thumb_var.get(),
+                "archive": False,                      # "skip already downloaded" is decided by add_urls (History)
                 "cookies": self.cookies(), "uploader": self.uploader_var.get(),
                 "single": self.single_var.get(), "sponsor": self.sponsor_var.get(),
                 "also": "" if self.also_var.get() == ALSO_AUDIO_NONE else self.also_var.get(),
@@ -3708,7 +3763,7 @@ class App:
     def _launch(self, item: Item) -> None:
         opts = self.snapshot()
         ov = item.overrides                    # what was changed for this item wins
-        for key in ("mode", "format", "section", "exact", "split", "chapters"):
+        for key in ("mode", "format", "section", "exact", "split", "chapters", "name"):
             if key in ov:
                 opts[key] = ov[key]
         if ov.get("extra"):
@@ -3904,7 +3959,7 @@ class App:
                 it.status if it.status in ("failed", "cancelled") else "queued")
             keep.append({"url": it.url, "title": it.title, "uploader": it.uploader, "duration": it.duration,
                          "thumb_url": it.thumb_url, "overrides": it.overrides, "status": status,
-                         "pct": it.pct, "size": it.size, "dests": it.dests,
+                         "pct": it.pct, "size": it.size, "dests": it.dests, "added_mode": it.added_mode,
                          "interrupted": it.status == "downloading" or it.interrupted})
         save_queue(keep)
 
@@ -3922,6 +3977,7 @@ class App:
             item.size = str(d.get("size") or "")
             item.dests = [str(x) for x in d.get("dests") or []]
             item.interrupted = bool(d.get("interrupted"))
+            item.added_mode = d.get("added_mode") or self.mode_key()
             if item.title == item.url and item.status == "queued":       # never got its preview
                 item.status = "fetching"
                 self.jobs.submit(0, self._info_job, item, no_playlist, cookies)
