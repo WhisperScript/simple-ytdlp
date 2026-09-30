@@ -39,7 +39,7 @@ def load_app():
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-        _cache.update(module=module, data=module.data_dir(), home=home)
+        _cache.update(module=module, data=module.SETTINGS_FILE.parent, home=home)     # the folder it really uses
     return _cache["module"], _cache["data"]
 
 
@@ -72,6 +72,8 @@ def start_app(settings: dict):
     require_gui()
     import tkinter as tk
     module, data = load_app()
+    if _cache["home"] not in data.parents:               # never wipe anything but the test's own folder
+        raise RuntimeError(f"refusing to clear {data}: it is not inside {_cache['home']}")
     shutil.rmtree(data, ignore_errors=True)
     data.mkdir(parents=True, exist_ok=True)
     module.save_settings({"theme": "dark", **settings})
