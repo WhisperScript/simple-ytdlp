@@ -23,8 +23,7 @@ URL box is empty), and you get a notification when a run finishes.
 Settings and the downloaded tools live in the user data folder (Windows `%LOCALAPPDATA%\ytdl`,
 macOS `~/Library/Application Support/ytdl`, Linux `~/.local/share/ytdl`).
 
-The programs are not code-signed, hence the warnings on first start. Intel Macs use the
-`uv` route below.
+The programs are not code-signed, hence the warnings on first start.
 
 ### Updates
 
