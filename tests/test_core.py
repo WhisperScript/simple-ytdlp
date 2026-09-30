@@ -362,6 +362,32 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class CompatAndCookies(unittest.TestCase):
+    def test_compat_prefers_mp4_h264_without_lowering_the_resolution(self):
+        a = app.build_args("video1080", Path("/o"), compat=True)
+        self.assertEqual(a[a.index("-S") + 1], "res,vcodec:h264,acodec:m4a")
+        self.assertEqual(a[a.index("--merge-output-format") + 1], "mp4")
+        self.assertEqual(a[a.index("-f") + 1], "bv*[height<=1080]+ba/b[height<=1080]/b")
+
+    def test_compat_leaves_audio_and_chosen_formats_alone(self):
+        self.assertNotIn("-S", app.build_args("mp3", Path("/o"), compat=True))
+        self.assertNotIn("-S", app.build_args("video", Path("/o"), compat=True, format_override="137+251"))
+        self.assertNotIn("-S", app.build_args("video", Path("/o")))
+
+    def test_cookie_sources(self):
+        self.assertEqual(app.cookie_args(""), [])
+        self.assertEqual(app.cookie_args("firefox"), ["--cookies-from-browser", "firefox"])
+        self.assertEqual(app.cookie_args("file:/c/cookies.txt"), ["--cookies", "/c/cookies.txt"])
+        a = app.build_args("video", Path("/o"), cookies_browser="file:/c/cookies.txt")
+        self.assertIn("--cookies", a)
+        self.assertNotIn("--cookies-from-browser", a)
+
+    def test_unreadable_browser_cookies_are_explained(self):
+        for err in ("ERROR: Could not copy Chrome cookie database. See https://github.com/yt-dlp/yt-dlp/issues/7271",
+                    "ERROR: Failed to decrypt with DPAPI"):
+            self.assertIn("cookies.txt", app.friendly_error(err))
+
+
 class FfmpegTools(unittest.TestCase):
     def test_ffprobe_errors_are_recognised(self):
         err = "ERROR: Postprocessing: ffprobe and ffmpeg not found. Please install or provide the path using --ffmpeg-location"

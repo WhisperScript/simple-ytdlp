@@ -489,7 +489,7 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
                archive=False, cookies_browser="", sort_by_uploader=False,
                no_playlist=False, also_audio="", limit_rate="", sponsorblock=False,
                sub_langs="en,de", format_override="", section="", exact_cut=False,
-               embed_chapters=False, split_chapters=False, proxy="", name_template="",
+               embed_chapters=False, split_chapters=False, proxy="", name_template="", compat=False,
                extra: list[str] | None = None) -> list[str]:
     out_dir = Path(out_dir).expanduser()
     name = name_template.strip() or "%(title)s"
@@ -515,6 +515,9 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
             args += ["-f", f"bv*[height<={h}]+ba/b[height<={h}]/b"]
         else:
             args += ["-f", "bv*+ba/b"]
+    if compat and mode not in AUDIO_MODES and not format_override:
+        # same resolution as before, but among equals H.264 + AAC (plays on phones, TVs, QuickTime) in an .mp4
+        args += ["-S", "res,vcodec:h264,acodec:m4a", "--merge-output-format", "mp4"]
     if mode in AUDIO_MODES:
         args += ["-x", "--audio-format", mode, "--audio-quality", "0"]
 
@@ -530,8 +533,7 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
         args += ["--embed-thumbnail"]
     if archive:
         args += ["--download-archive", str(out_dir / "archive.txt")]
-    if cookies_browser:
-        args += ["--cookies-from-browser", cookies_browser]
+    args += cookie_args(cookies_browser)
     if no_playlist:
         args += ["--no-playlist"]
     if limit_rate:
@@ -551,6 +553,15 @@ def build_args(mode: str, out_dir: Path, *, subs=False, thumb=False,
     if extra:
         args += extra
     return args
+
+
+def cookie_args(spec: str) -> list[str]:
+    """yt-dlp arguments for a cookie source: a browser name, or 'file:<path>' for a cookies.txt file."""
+    if not spec:
+        return []
+    if spec.startswith("file:"):
+        return ["--cookies", spec[5:]]
+    return ["--cookies-from-browser", spec]
 
 
 def parse_clock(text: str) -> float | None:
@@ -592,6 +603,9 @@ UPDATE_RE = re.compile(r"unable to extract|nsig extraction failed|player respons
 
 FRIENDLY_ERRORS = [
     (UPDATE_RE.pattern, UPDATE_HINT),
+    (r"could not (?:copy|find|read).{0,40}cookie|failed to decrypt|dpapi|cookies? database|cookiejar",
+     "The browser's cookies cannot be read (Chrome locks them) - close the browser, pick Firefox or Edge, "
+     "or use a cookies.txt file (Settings > Login and network)"),
     (r"confirm your age|age-restricted|age restricted",
      "Age-restricted - pick your browser under Settings > Cookies from browser"),
     (r"private video|this video is private",
@@ -640,8 +654,7 @@ def fetch_formats(url: str, *, cookies_browser: str = "", timeout: int = 90) -> 
         return None
     cmd = base + ["--dump-single-json", "--no-warnings", "--skip-download", "--no-playlist"]
     cmd += find_js_runtime() or []
-    if cookies_browser:
-        cmd += ["--cookies-from-browser", cookies_browser]
+    cmd += cookie_args(cookies_browser)
     try:
         r = subprocess.run(cmd + ["--", url], capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=timeout, **_no_window())
@@ -912,8 +925,7 @@ def fetch_info(url: str, *, no_playlist: bool = False, cookies_browser: str = ""
         return None
     cmd = base + ["--dump-single-json", "--flat-playlist", "--no-warnings", "--skip-download"]
     cmd += find_js_runtime() or []
-    if cookies_browser:
-        cmd += ["--cookies-from-browser", cookies_browser]
+    cmd += cookie_args(cookies_browser)
     if no_playlist:
         cmd += ["--no-playlist"]
     try:
@@ -2379,15 +2391,20 @@ class SettingsDialog(tk.Toplevel if tk else object):
 
         extras = section("Video and audio extras", 2)
         toggles(extras, (("Subtitles", app.subs_var), ("Embed thumbnail", app.thumb_var),
-                         ("Embed chapters", app.chapters_var), ("Remove sponsor segments", app.sponsor_var)))
-        field(extras, 2, "Subtitle languages", ttk.Entry(extras, textvariable=app.sub_langs_var, width=14),
+                         ("Embed chapters", app.chapters_var), ("Remove sponsor segments", app.sponsor_var),
+                         ("MP4 files that play everywhere", app.compat_var)))
+        field(extras, 3, "Subtitle languages", ttk.Entry(extras, textvariable=app.sub_langs_var, width=14),
               "e.g. en,de or all")
 
         net = section("Login and network", 3)
         field(net, 0, "Cookies from browser",
               ttk.Combobox(net, textvariable=app.cookie_var, values=[NO_BROWSER, *BROWSERS[1:]],
                            state="readonly", width=12), "for private or age-restricted videos")
-        field(net, 1, "Proxy", ttk.Entry(net, textvariable=app.proxy_var, width=30), "e.g. http://host:8080")
+        pick = ttk.Frame(net)
+        ttk.Entry(pick, textvariable=app.cookiefile_var, width=24).pack(side="left")
+        ttk.Button(pick, text="Browse …", command=app.pick_cookie_file).pack(side="left", padx=(6, 0))
+        field(net, 1, "Cookies file", pick, "cookies.txt - if the browser's cookies cannot be read")
+        field(net, 2, "Proxy", ttk.Entry(net, textvariable=app.proxy_var, width=30), "e.g. http://host:8080")
 
         adv = section("Advanced", 4)
         field(adv, 0, "File name", ttk.Entry(adv, textvariable=app.name_var, width=30), "default: %(title)s")
@@ -2760,6 +2777,8 @@ class App:
         self.clip_watch_var = tk.BooleanVar(value=False)                   # never on at startup
         self.clip_watch_var.trace_add("write", lambda *_: self._clip_watch_toggled())
         self.cookie_var = tk.StringVar(value=cfg.get("cookies") or NO_BROWSER)
+        self.cookiefile_var = tk.StringVar(value=cfg.get("cookie_file", ""))
+        self.compat_var = tk.BooleanVar(value=cfg.get("compat", True))
         self.limit_var = tk.StringVar(value=cfg.get("limit", ""))
         self.parallel_var = tk.StringVar(value=str(cfg.get("parallel", 2)))
         self.sub_langs_var = tk.StringVar(value=cfg.get("sub_langs", "en,de"))
@@ -3041,6 +3060,7 @@ class App:
                 "archive": self.arch_var.get(), "uploader": self.uploader_var.get(),
                 "single": self.single_var.get(), "also_audio": self.also_var.get(),
                 "sponsorblock": self.sponsor_var.get(), "chapters": self.chapters_var.get(),
+                "compat": self.compat_var.get(), "cookie_file": self.cookiefile_var.get().strip(),
                 "sub_langs": self.sub_langs_var.get().strip(), "name": self.name_var.get().strip(),
                 "proxy": self.proxy_var.get().strip(), "args": self.args_var.get().strip(),
                 "limit": self.limit_var.get().strip()}
@@ -3056,11 +3076,13 @@ class App:
         self.also_var.set(d.get("also_audio") or ALSO_AUDIO_NONE)
         for var, key in ((self.subs_var, "subs"), (self.thumb_var, "thumb"), (self.arch_var, "archive"),
                          (self.uploader_var, "uploader"), (self.single_var, "single"),
-                         (self.sponsor_var, "sponsorblock"), (self.chapters_var, "chapters")):
+                         (self.sponsor_var, "sponsorblock"), (self.chapters_var, "chapters"),
+                         (self.compat_var, "compat")):
             if key in d:
                 var.set(bool(d[key]))
         for var, key in ((self.sub_langs_var, "sub_langs"), (self.name_var, "name"),
-                         (self.proxy_var, "proxy"), (self.args_var, "args"), (self.limit_var, "limit")):
+                         (self.proxy_var, "proxy"), (self.args_var, "args"), (self.limit_var, "limit"),
+                         (self.cookiefile_var, "cookie_file")):
             if key in d:
                 var.set(str(d[key]))
         self.sync_mode_options()
@@ -3103,8 +3125,18 @@ class App:
             self.profile_var.set("")
 
     def cookies(self) -> str:
+        """The cookie source for yt-dlp: 'file:<path>' (a cookies.txt wins), a browser name, or ''."""
+        path = self.cookiefile_var.get().strip()
+        if path:
+            return "file:" + path
         value = self.cookie_var.get()
         return "" if value == NO_BROWSER else value
+
+    def pick_cookie_file(self) -> None:
+        path = filedialog.askopenfilename(title="Cookies file (cookies.txt)",
+                                          filetypes=[("Cookies", "*.txt"), ("All files", "*.*")])
+        if path:
+            self.cookiefile_var.set(path)
 
     def parallel(self) -> int:
         try:
@@ -3757,6 +3789,7 @@ class App:
                 "also": "" if self.also_var.get() == ALSO_AUDIO_NONE else self.also_var.get(),
                 "limit": self.limit_rate(), "sub_langs": self.sub_langs_var.get().strip() or "en,de",
                 "name": self.name_var.get().strip(), "proxy": self.proxy_var.get().strip(),
+                "compat": self.compat_var.get(),
                 "args": self.args_var.get().strip(), "chapters": self.chapters_var.get(),
                 "format": "", "section": "", "exact": False, "split": False}
 
@@ -3797,7 +3830,7 @@ class App:
                           cookies_browser=o["cookies"], sort_by_uploader=o["uploader"],
                           no_playlist=o["single"], also_audio=o["also"], limit_rate=o["limit"],
                           sponsorblock=o["sponsor"], sub_langs=o["sub_langs"], format_override=o["format"],
-                          section=o["section"], exact_cut=o["exact"], embed_chapters=o["chapters"],
+                          section=o["section"], exact_cut=o["exact"], embed_chapters=o["chapters"], compat=o["compat"],
                           split_chapters=o["split"], proxy=o["proxy"], name_template=o["name"],
                           extra=extra)
         found: dict = {}
