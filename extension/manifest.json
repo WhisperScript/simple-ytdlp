@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "simple-ytdlp - Send to app",
+  "short_name": "simple-ytdlp",
+  "version": "1.0.0",
+  "description": "Send the video or playlist you are looking at to the simple-ytdlp desktop app with one click.",
+  "minimum_chrome_version": "110",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Download with simple-ytdlp",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Alt+Shift+D" },
+      "description": "Send this page to simple-ytdlp"
+    }
+  },
+  "permissions": ["activeTab", "contextMenus", "storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": { "service_worker": "background.js" },
+  "options_ui": { "page": "options.html", "open_in_tab": false }
+}

@@ -42,6 +42,7 @@ import time
 import urllib.request
 import webbrowser
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 __version__ = "dev"          # the release workflow replaces this with the git tag (v1.2 -> "1.2")
@@ -1342,6 +1343,142 @@ def power_command(kind: str) -> list[str] | None:
     return {"sleep": ["systemctl", "suspend"], "shutdown": ["systemctl", "poweroff"]}.get(kind)
 
 
+# ---------------------------------------------------------------- Browser extension bridge (no GUI needed)
+
+BRIDGE_PORTS = range(17653, 17658)             # the extension tries these in order
+EXTENSION_SCHEMES = ("chrome-extension://", "moz-extension://")
+BRIDGE_MAX_URLS = 200
+
+
+class Bridge:
+    """The small local web server the browser extension talks to (127.0.0.1 only, POST + JSON).
+
+    Websites must not be able to use it, so every request needs
+      - a Host header naming this very address (stops DNS rebinding), and
+      - an Origin header of a browser extension (web pages send their own origin, which is refused).
+    A new extension has to be approved once in the app (pair); only approved origins may add links.
+    The callbacks do the work on the app's side and may block (they are called from request threads):
+      status() -> dict, add(urls, mode) -> dict, trusted(origin) -> bool, pair(origin) -> bool."""
+
+    def __init__(self, status, add, trusted, pair):
+        self._status, self._add, self._trusted, self._pair = status, add, trusted, pair
+        self._pairing = threading.Lock()
+        self.server: ThreadingHTTPServer | None = None
+        self.port = 0
+
+    def start(self) -> int:
+        """Listen on the first free port of BRIDGE_PORTS; returns it (0 if none is free)."""
+        if self.server is not None:
+            return self.port
+        bridge = self
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = APP_NAME
+            timeout = 10                            # a client that stalls while sending is dropped
+
+            def log_message(self, *args) -> None:
+                pass
+
+            def reply(self, code: int, body: dict | None = None, origin: str = "") -> None:
+                data = json.dumps(body).encode("utf-8") if body is not None else b""
+                self.send_response(code)
+                if origin:
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Access-Control-Allow-Methods", "POST")
+                    self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                    self.send_header("Access-Control-Allow-Private-Network", "true")
+                    self.send_header("Access-Control-Max-Age", "600")
+                    self.send_header("Vary", "Origin")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def gate(self) -> str | None:
+                """The caller's origin if this is a request from a browser extension to this address."""
+                port = self.server.server_address[1]
+                if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+                    self.reply(403, {"ok": False, "error": "forbidden"})
+                    return None
+                origin = self.headers.get("Origin", "")
+                if not origin.startswith(EXTENSION_SCHEMES) or len(origin) > 200:
+                    self.reply(403, {"ok": False, "error": "forbidden"})
+                    return None
+                return origin
+
+            def do_OPTIONS(self) -> None:
+                origin = self.gate()
+                if origin:
+                    self.reply(204, None, origin)
+
+            def do_GET(self) -> None:
+                self.reply(405, {"ok": False, "error": "use POST"})
+
+            def do_POST(self) -> None:
+                origin = self.gate()
+                if not origin:
+                    return
+                try:
+                    size = int(self.headers.get("Content-Length") or 0)
+                    if not 0 <= size <= 262144:
+                        raise ValueError
+                    body = json.loads(self.rfile.read(size) or b"{}")
+                    if not isinstance(body, dict):
+                        raise ValueError
+                except (ValueError, OSError):
+                    self.reply(400, {"ok": False, "error": "bad_request"}, origin)
+                    return
+                try:
+                    code, out = bridge.handle(self.path, body, origin)
+                except Exception as exc:                # the app is closing, or its window is gone
+                    code, out = 503, {"ok": False, "error": "unavailable", "detail": str(exc)}
+                self.reply(code, out, origin)
+
+        for port in BRIDGE_PORTS:
+            try:
+                self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            except OSError:
+                continue
+            self.server.daemon_threads = True
+            self.port = port
+            threading.Thread(target=self.server.serve_forever, args=(0.1,), daemon=True, name="bridge").start()
+            return port
+        return 0
+
+    def stop(self) -> None:
+        server, self.server, self.port = self.server, None, 0
+        if server is not None:
+            stopper = threading.Thread(target=server.shutdown, daemon=True)
+            stopper.start()
+            stopper.join(1.0)                       # the port is only free once the serving loop has ended
+            server.server_close()
+
+    def handle(self, path: str, body: dict, origin: str) -> tuple[int, dict]:
+        paired = bool(self._trusted(origin))
+        if path == "/v1/status":
+            if not paired:
+                return 200, {"ok": True, "app": APP_NAME, "paired": False}
+            return 200, {"ok": True, "app": APP_NAME, "paired": True, **self._status()}
+        if path != "/v1/add":
+            return 404, {"ok": False, "error": "not_found"}
+        urls = body.get("urls")
+        if not isinstance(urls, list) or not urls or len(urls) > BRIDGE_MAX_URLS:
+            return 400, {"ok": False, "error": "bad_request"}
+        urls = [u for u in urls if isinstance(u, str) and len(u) <= 4096 and re.fullmatch(r"https?://\S+", u)]
+        if not urls:
+            return 400, {"ok": False, "error": "no_links"}
+        mode = body.get("mode") if body.get("mode") in MODES else ""
+        if not paired:
+            if not self._pairing.acquire(blocking=False):
+                return 409, {"ok": False, "error": "busy"}
+            try:
+                if not self._pair(origin):
+                    return 403, {"ok": False, "error": "denied"}
+            finally:
+                self._pairing.release()
+        return 200, {"ok": True, **self._add(urls, mode)}
+
+
 # ---------------------------------------------------------------- GUI
 
 UPDATE_INTERVAL = 24 * 3600      # how often (seconds) to silently check for yt-dlp updates at startup
@@ -2488,6 +2625,11 @@ class SettingsDialog(tk.Toplevel if tk else object):
         ttk.Button(pick, text="Browse …", command=app.pick_cookie_file).pack(side="left", padx=(6, 0))
         field(net, 1, "Cookies file", pick, "cookies.txt - if the browser's cookies cannot be read")
         field(net, 2, "Proxy", ttk.Entry(net, textvariable=app.proxy_var, width=30), "e.g. http://host:8080")
+        ext = ttk.Frame(net)
+        ttk.Checkbutton(ext, text="Accept links from it", variable=app.bridge_var, style=switch).pack(side="left")
+        ttk.Button(ext, text="Forget paired browsers", command=app.forget_browsers).pack(side="left", padx=(12, 0))
+        ttk.Label(net, text="Browser extension").grid(row=3, column=0, sticky="w", pady=3, padx=(0, 12))
+        ext.grid(row=3, column=1, columnspan=2, sticky="w", pady=3)
 
         adv = section("Advanced", 4)
         field(adv, 0, "File name", ttk.Entry(adv, textvariable=app.name_var, width=30), "default: %(title)s")
@@ -2613,6 +2755,8 @@ class App:
         self.setup_error = ""
         self._placeholders: dict = {}
         self._boxes: dict = {}                 # rendered card and button images
+        self.bridge: Bridge | None = None      # the local endpoint of the browser extension
+        self.trusted: set[str] = set(self.cfg.get("trusted_origins") or [])   # approved browser extensions
 
         self.theme_mode = tk.StringVar(value=self.cfg.get("theme") or "system")    # system | light | dark
         if self.theme_mode.get() not in ("system", "light", "dark"):
@@ -2651,6 +2795,8 @@ class App:
 
         self._setup_drop()
         self._restore_queue()
+        self.bridge_var.trace_add("write", lambda *_: self._bridge_apply())
+        self._bridge_apply()
         self.root.after(1000, self._watch_clipboard)
         self._startup_tools()
         threading.Thread(target=self._check_app_update, daemon=True).start()
@@ -2860,6 +3006,7 @@ class App:
         self.single_var = tk.BooleanVar(value=cfg.get("single", True))
         self.sponsor_var = tk.BooleanVar(value=cfg.get("sponsorblock", False))
         self.auto_var = tk.BooleanVar(value=cfg.get("autostart", True))
+        self.bridge_var = tk.BooleanVar(value=cfg.get("bridge", True))      # accept links from the browser extension
         self.after_var = tk.StringVar(value="none")             # what to do when the queue is done (never saved)
         self.chapters_var = tk.BooleanVar(value=cfg.get("chapters", False))
         self.clip_watch_var = tk.BooleanVar(value=False)                   # never on at startup
@@ -3176,7 +3323,7 @@ class App:
         self.sync_mode_options()
 
     def save_options(self) -> None:
-        save_settings({**self.collect_options(), "autostart": self.auto_var.get(),
+        save_settings({**self.collect_options(), "autostart": self.auto_var.get(), "bridge": self.bridge_var.get(),
                        "parallel": self.parallel(), "theme": self.theme_mode.get()})
 
     def save_profile(self) -> None:
@@ -3237,6 +3384,81 @@ class App:
         else:
             self.toast("No link found in what you dropped")
         return "copy"
+
+    # -- browser extension
+
+    def _bridge_apply(self) -> None:
+        """Start or stop the local endpoint of the browser extension to match the setting."""
+        want = self.bridge_var.get()
+        if want and self.bridge is None:
+            bridge = Bridge(self._bridge_status, self._bridge_add, lambda origin: origin in self.trusted,
+                            self._bridge_pair)
+            port = bridge.start()
+            if port:
+                self.bridge = bridge
+                self.log(f"Browser extension: listening on 127.0.0.1:{port}")
+            else:
+                self.log("Browser extension: no free port, the extension cannot connect.")
+        elif not want and self.bridge is not None:
+            self.bridge.stop()
+            self.bridge = None
+            self.log("Browser extension: off")
+
+    def _on_ui_thread(self, fn, timeout: float = 20.0):
+        """Run fn on the Tk thread and wait for its result (called from the bridge's request threads)."""
+        box: dict = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                box["value"] = fn()
+            except Exception as exc:
+                box["error"] = exc
+            finally:
+                done.set()
+
+        self.ui(run)
+        if not done.wait(timeout):
+            raise TimeoutError("the window did not answer")
+        if "error" in box:
+            raise box["error"]
+        return box["value"]
+
+    def _bridge_status(self) -> dict:
+        return {"version": __version__, "queued": len(self.items), "mode": self.mode_key(),
+                "modes": {k: v for k, v in MODES.items()}}
+
+    def _bridge_add(self, urls: list[str], mode: str) -> dict:
+        def add() -> dict:
+            result = self.add_urls(urls, mode=mode)
+            self.log(f"Browser extension: {len(urls)} link(s) received, {result['added']} added")
+            return result
+        return self._on_ui_thread(add)
+
+    def _bridge_pair(self, origin: str) -> bool:
+        """A browser extension asks to be allowed for the first time: ask the user (blocks the request)."""
+        def ask() -> bool:
+            self.root.deiconify()
+            self.root.lift()
+            return messagebox.askyesno(
+                "Browser extension",
+                "A browser extension wants to add downloads to " + APP_NAME + ".\n\n"
+                "Allow it only if you just installed the " + APP_NAME + " extension yourself.\n\n"
+                f"Extension: {origin}", parent=self.root)
+        try:
+            allowed = bool(self._on_ui_thread(ask, timeout=120.0))
+        except TimeoutError:
+            return False
+        if allowed:
+            self.trusted.add(origin)
+            save_settings({"trusted_origins": sorted(self.trusted)})
+            self.log(f"Browser extension allowed: {origin}")
+        return allowed
+
+    def forget_browsers(self) -> None:
+        self.trusted.clear()
+        save_settings({"trusted_origins": []})
+        self.toast("Browsers forgotten - the extension asks again")
 
     def schedule_start(self) -> None:
         text = simpledialog.askstring("Start the queue at", "Time (24 h, like 02:30):", parent=self.root)
@@ -3371,13 +3593,15 @@ class App:
             return ""
         return (self.name_var.get().strip() or "%(title)s") + f" [{quality_label(mode)}]"
 
-    def add_urls(self, urls: list[str], again: bool = False) -> None:
+    def add_urls(self, urls: list[str], again: bool = False, mode: str = "") -> dict:
         """Queue links. A video is in the list once per format: adding it again jumps to its card (a failed or
         cancelled one is retried; a finished one whose file is gone is downloaded again). A video that History
         has in this format, file still there, is skipped while 'Skip already downloaded' is on.
-        again=True (History > Download again) replaces a finished card."""
+        again=True (History > Download again) replaces a finished card. mode: a format other than the one
+        selected in the window (the browser extension's 'audio only'). Returns the counts."""
         self.select_tab(0)
-        mode = self.mode_key()
+        window_mode = self.mode_key()
+        mode = mode if mode in MODES else window_mode
         known = {it.key: it for it in self.items}
         no_playlist, cookies = self.single_var.get(), self.cookies()   # Tk variables: main thread only
         added, seen, done_before, first = 0, [], 0, None
@@ -3397,6 +3621,8 @@ class App:
                 continue
             item = Item(url)
             item.added_mode = mode
+            if mode != window_mode:
+                item.overrides["mode"] = mode
             name = self._name_for_other_format(vkey, mode)
             if name:
                 item.overrides["name"] = name
@@ -3430,6 +3656,7 @@ class App:
                 self.toast("Already in the queue")
         elif added > 1 or skipped:
             self.toast(f"Added {added} links" + (f" ({skipped} already there)" if skipped else ""))
+        return {"added": added, "skipped": skipped, "queued": len(self.items)}
 
     def _items_changed(self) -> None:
         """The list of items changed (added, removed, moved): drop stale selection, redraw, update counters."""
@@ -4480,6 +4707,8 @@ class App:
                         "They continue where they stopped the next time you start the app."):
             return
         self.running = False
+        if self.bridge is not None:
+            self.bridge.stop()
         for it in running:
             it.status, it.interrupted = "paused", False    # saved as paused - a clean stop, nothing to repair
             it.pause_requested = True

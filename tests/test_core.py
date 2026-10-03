@@ -1,4 +1,5 @@
 """Tests for the non-GUI core of simple-ytdlp (run: python -m unittest discover -s tests)."""
+import http.client
 import importlib.util
 import json
 import shutil
@@ -519,3 +520,144 @@ class LegacyData(unittest.TestCase):
     def test_nothing_to_move(self):
         base = self.run_migration(lambda base: None)
         self.assertFalse((base / "simple-ytdlp").exists())
+
+
+class BridgeEndpoint(unittest.TestCase):
+    """The local endpoint of the browser extension, over real HTTP."""
+    EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+
+    def setUp(self):
+        self.added, self.asked, self.answer, self.trusted = [], [], True, set()
+
+        def add(urls, mode):
+            self.added.append((urls, mode))
+            return {"added": len(urls), "skipped": 0, "queued": len(self.added)}
+
+        def pair(origin):
+            self.asked.append(origin)
+            if self.answer:
+                self.trusted.add(origin)
+            return self.answer
+
+        self.bridge = app.Bridge(lambda: {"version": "t"}, add, lambda o: o in self.trusted, pair)
+        self.port = self.bridge.start()
+        self.assertTrue(self.port)
+        self.addCleanup(self.bridge.stop)
+
+    def call(self, path="/v1/status", body=None, origin=EXT, host=None, method="POST"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        headers = {"Host": host or f"127.0.0.1:{self.port}", "Content-Type": "application/json"}
+        if origin is not None:
+            headers["Origin"] = origin
+        payload = body if isinstance(body, bytes) else json.dumps(body if body is not None else {}).encode()
+        conn.request(method, path, body=payload if method == "POST" else None, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        return resp.status, (json.loads(raw) if raw else None), resp
+
+    def test_stays_on_this_computer(self):
+        self.assertEqual(self.bridge.server.server_address[0], "127.0.0.1")
+
+    def test_status_before_pairing_tells_nothing(self):
+        code, out, _ = self.call()
+        self.assertEqual((code, out), (200, {"ok": True, "app": "simple-ytdlp", "paired": False}))
+
+    def test_first_add_asks_once_then_adds(self):
+        code, out, resp = self.call("/v1/add", {"urls": ["https://youtu.be/abc"], "mode": "mp3"})
+        self.assertEqual((code, out["ok"], out["added"]), (200, True, 1))
+        self.assertEqual(self.asked, [self.EXT])
+        self.assertEqual(self.added, [(["https://youtu.be/abc"], "mp3")])
+        self.assertEqual(resp.getheader("Access-Control-Allow-Origin"), self.EXT)
+        self.call("/v1/add", {"urls": ["https://youtu.be/def"]})
+        self.assertEqual(len(self.asked), 1)                    # approved: not asked again
+        self.assertEqual(self.added[1], (["https://youtu.be/def"], ""))
+        code, out, _ = self.call()
+        self.assertTrue(out["paired"] and out["version"] == "t")
+
+    def test_denied_adds_nothing(self):
+        self.answer = False
+        code, out, _ = self.call("/v1/add", {"urls": ["https://example.com/v"]})
+        self.assertEqual((code, out["error"]), (403, "denied"))
+        self.assertEqual(self.added, [])
+
+    def test_a_web_page_is_refused(self):
+        for origin in ("https://evil.example", "http://127.0.0.1:%d" % self.port, "null", None):
+            code, out, resp = self.call("/v1/add", {"urls": ["https://example.com/v"]}, origin=origin)
+            self.assertEqual((code, out["error"]), (403, "forbidden"), origin)
+            self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
+        self.assertEqual((self.added, self.asked), ([], []))
+
+    def test_rebinding_host_is_refused(self):
+        code, out, _ = self.call("/v1/add", {"urls": ["https://example.com/v"]}, host="evil.example")
+        self.assertEqual(code, 403)
+        code, _, _ = self.call("/v1/add", {"urls": ["https://example.com/v"]}, host=f"localhost:{self.port}")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(self.added), 1)
+
+    def test_preflight_for_extensions_only(self):
+        code, _, resp = self.call("/v1/add", method="OPTIONS")
+        self.assertEqual(code, 204)
+        self.assertEqual(resp.getheader("Access-Control-Allow-Origin"), self.EXT)
+        self.assertIn("POST", resp.getheader("Access-Control-Allow-Methods"))
+        code, _, resp = self.call("/v1/add", method="OPTIONS", origin="https://evil.example")
+        self.assertEqual(code, 403)
+        self.assertIsNone(resp.getheader("Access-Control-Allow-Origin"))
+
+    def test_bad_requests(self):
+        self.trusted.add(self.EXT)
+        self.assertEqual(self.call("/v1/add", b"not json")[0], 400)
+        self.assertEqual(self.call("/v1/add", {"urls": []})[0], 400)
+        self.assertEqual(self.call("/v1/add", {"urls": "https://example.com"})[0], 400)
+        self.assertEqual(self.call("/v1/add", {"urls": ["file:///etc/passwd", "javascript:alert(1)"]})[1]["error"],
+                         "no_links")
+        self.assertEqual(self.call("/v1/add", {"urls": ["https://example.com/v"] * 201})[0], 400)
+        self.assertEqual(self.call("/v1/other", {})[0], 404)
+        self.assertEqual(self.call(method="GET")[0], 405)
+        self.assertEqual(self.added, [])
+
+    def test_only_web_links_and_known_modes_pass(self):
+        self.trusted.add(self.EXT)
+        self.call("/v1/add", {"urls": ["https://a.example/x", "ftp://b.example", 5, "http://c.example/y"],
+                              "mode": "rm -rf"})
+        self.assertEqual(self.added, [(["https://a.example/x", "http://c.example/y"], "")])
+
+    def test_two_extensions_asking_at_once(self):
+        import threading
+        gate, started = threading.Event(), threading.Event()
+
+        def slow_pair(origin):
+            started.set()
+            gate.wait(5)
+            return True
+
+        bridge = app.Bridge(lambda: {}, lambda u, m: {"added": 1, "skipped": 0, "queued": 1},
+                            lambda o: False, slow_pair)
+        port = bridge.start()
+        self.addCleanup(bridge.stop)
+        results = {}
+
+        def post(name):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            conn.request("POST", "/v1/add", body=b'{"urls": ["https://example.com/v"]}',
+                         headers={"Host": f"127.0.0.1:{port}", "Origin": self.EXT + name})
+            results[name] = json.loads(conn.getresponse().read())
+
+        first = threading.Thread(target=post, args=("a",))
+        first.start()
+        self.assertTrue(started.wait(5))
+        post("b")                                               # a dialog is already open
+        self.assertEqual(results["b"]["error"], "busy")
+        gate.set()
+        first.join(5)
+        self.assertTrue(results["a"]["ok"])
+
+    def test_next_free_port_and_restart(self):
+        other = app.Bridge(lambda: {}, lambda u, m: {}, lambda o: True, lambda o: True)
+        port = other.start()
+        self.addCleanup(other.stop)
+        self.assertNotEqual(port, self.port)
+        self.assertIn(port, app.BRIDGE_PORTS)
+        self.bridge.stop()
+        self.assertEqual(self.bridge.port, 0)
+        self.assertEqual(self.bridge.start(), self.port)        # the freed port is taken again

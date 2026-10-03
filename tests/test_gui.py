@@ -4,10 +4,12 @@ They need Tk and a display - CI runs them under Xvfb, everywhere else the module
 All tests share one window; every test starts from an empty queue (see GuiCase.setUp).
 """
 import faulthandler
+import http.client
 import json
 import os
 import re
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -764,6 +766,123 @@ class DropAndItemOptions(GuiCase):
         app.start_all()
         self.assertTrue(wait(lambda: any("-o" in c for c in calls()), 15))
         self.assertIn("--write-subs", [c for c in calls() if "-o" in c][0])
+
+
+class BrowserExtension(GuiCase):
+    """The browser extension's side of the conversation, against the real window."""
+    EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+
+    def setUp(self):
+        super().setUp()
+        app.trusted.clear()
+        if app.bridge is None:
+            app.bridge_var.set(True)
+        self.questions = []
+        self.answer = True
+
+        def ask(title, message, **kw):
+            self.questions.append(message)
+            return self.answer
+
+        patch = mock.patch.object(mod.messagebox, "askyesno", ask)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def post(self, path, body, origin=EXT):
+        """A request from the extension while the window keeps running: (status, json)."""
+        port, box = app.bridge.port, {}
+
+        def run():
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+            conn.request("POST", path, body=json.dumps(body).encode(),
+                         headers={"Host": f"127.0.0.1:{port}", "Origin": origin, "Content-Type": "application/json"})
+            resp = conn.getresponse()
+            box["result"] = (resp.status, json.loads(resp.read()))
+            conn.close()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(wait(lambda: "result" in box, 20), "no answer")
+        thread.join()
+        return box["result"]
+
+    def test_the_first_link_asks_in_the_app_then_it_is_queued(self):
+        code, out = self.post("/v1/add", {"urls": [U("fromBrowser")]})
+        self.assertEqual((code, out["ok"], out["added"]), (200, True, 1))
+        self.assertEqual(len(self.questions), 1)
+        self.assertIn(self.EXT, self.questions[0])
+        self.assertEqual([it.url for it in app.items], [U("fromBrowser")])
+        self.assertIn(self.EXT, mod.load_settings()["trusted_origins"])
+        self.post("/v1/add", {"urls": [U("second")]})
+        self.assertEqual(len(self.questions), 1, "asked only once")
+        self.assertEqual(len(app.items), 2)
+        self.assertIn("Browser extension", self.log_text())
+
+    def test_denying_adds_nothing(self):
+        self.answer = False
+        code, out = self.post("/v1/add", {"urls": [U("nope")]})
+        self.assertEqual((code, out["error"]), (403, "denied"))
+        self.assertEqual(app.items, [])
+        self.assertEqual(app.trusted, set())
+
+    def test_audio_only_from_the_extension_and_the_same_link_again(self):
+        app.trusted.add(self.EXT)
+        code, out = self.post("/v1/add", {"urls": [U("song")], "mode": "mp3"})
+        self.assertEqual(out["added"], 1)
+        item = app.items[0]
+        self.assertEqual((item.added_mode, item.overrides.get("mode")), ("mp3", "mp3"))
+        self.assertEqual(item.key, f"{item.vkey}|mp3")
+        code, out = self.post("/v1/add", {"urls": [U("song")], "mode": "mp3"})
+        self.assertEqual((out["added"], out["skipped"], len(app.items)), (0, 1, 1), "no duplicate card")
+        code, out = self.post("/v1/add", {"urls": [U("song")]})
+        self.assertEqual(out["added"], 1, "the same video in the window's format is a different download")
+        self.assertEqual(len(app.items), 2)
+        self.assertNotIn("mode", app.items[1].overrides)
+
+    def test_status_reports_the_queue(self):
+        app.trusted.add(self.EXT)
+        add(U("one"))
+        code, out = self.post("/v1/status", {})
+        self.assertEqual((out["paired"], out["queued"]), (True, 1))
+        self.assertIn("mp3", out["modes"])
+
+    def test_added_links_start_by_themselves_when_that_is_on(self):
+        app.trusted.add(self.EXT)
+        app.auto_var.set(True)
+        self.addCleanup(app.auto_var.set, False)
+        self.post("/v1/add", {"urls": [U("bridgeauto")]})
+        self.assertTrue(wait(lambda: app.items and app.items[0].status == "done", 30))
+
+    def test_switching_it_off_closes_the_port_and_forgetting_asks_again(self):
+        port = app.bridge.port
+        app.bridge_var.set(False)
+        self.assertIsNone(app.bridge)
+        with self.assertRaises(OSError):
+            http.client.HTTPConnection("127.0.0.1", port, timeout=2).request("POST", "/v1/status")
+        app.bridge_var.set(True)
+        self.assertIsNotNone(app.bridge)
+        app.trusted.add(self.EXT)
+        app.forget_browsers()
+        self.assertEqual(mod.load_settings()["trusted_origins"], [])
+        self.post("/v1/add", {"urls": [U("again")]})
+        self.assertEqual(len(self.questions), 1)
+
+    def test_settings_dialog_has_the_switch(self):
+        dialog = mod.SettingsDialog(app)
+        self.addCleanup(lambda: dialog.winfo_exists() and dialog.close())
+        texts = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    texts.append(c.cget("text"))
+                except Exception:
+                    pass
+                walk(c)
+        walk(dialog)
+        self.assertIn("Browser extension", texts)
+        self.assertIn("Accept links from it", texts)
+        self.assertIn("Forget paired browsers", texts)
 
 
 class HistoryAndLog(GuiCase):
