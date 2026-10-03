@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>simple-ytdlp settings</title>
+  <link rel="stylesheet" href="popup.css">
+  <style>
+    body { width: auto; }
+    main { max-width: 440px; }
+    h1 { font-size: 15px; margin: 0 0 12px; }
+    label { display: block; margin: 8px 0 4px; }
+    select { font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
+    .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+    #saved { color: var(--ok); margin-left: 10px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>simple-ytdlp</h1>
+    <div id="state" class="state wait" role="status">
+      <span id="mark" class="mark" aria-hidden="true"></span>
+      <span id="message">Looking for the app …</span>
+    </div>
+    <label for="mode">When I click the icon, download</label>
+    <select id="mode">
+      <option value="">What the app is set to</option>
+      <option value="mp3">Audio - mp3</option>
+      <option value="m4a">Audio - m4a</option>
+      <option value="video1080">Video - max. 1080p</option>
+      <option value="video">Video - best quality</option>
+    </select><span id="saved" hidden>Saved</span>
+    <p class="hint">The extension only talks to the simple-ytdlp app on this computer. It sends the address of the page you click on, nothing else.</p>
+  </main>
+  <script src="client.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

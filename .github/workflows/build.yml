@@ -107,9 +107,23 @@ jobs:
           name: simple-ytdlp-${{ matrix.name }}
           path: simple-ytdlp-*
 
+  # The browser extension (Chrome Web Store / Edge Add-ons package).
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python extension/store/pack.py simple-ytdlp-extension.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: simple-ytdlp-extension
+          path: simple-ytdlp-extension.zip
+
   release:
     if: ${{ needs.prepare.outputs.tag != '' }}
-    needs: [prepare, build]
+    needs: [prepare, build, extension]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
