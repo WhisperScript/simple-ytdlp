@@ -138,7 +138,13 @@ The extension is being published in the Chrome Web Store. Until then: download `
 [latest release](https://github.com/WhisperScript/simple-ytdlp/releases/latest), unzip it, open `chrome://extensions`,
 switch on **Developer mode**, click **Load unpacked** and pick the unzipped folder.
 Who can use it: only an extension you allowed in the app - a website cannot add anything (see the FAQ below).
-Switch it off completely under **Settings … → Browser extension**.
+Switch it off completely under **Settings … → Login and network → Browser extension**.
+
+**Firefox:** the Firefox version (`simple-ytdlp-extension-firefox.zip` on the same release page, Firefox 140 or newer) is
+being published on addons.mozilla.org. Until then Firefox only loads it temporarily: unzip it, open
+`about:debugging#/runtime/this-firefox`, click **Load Temporary Add-on …** and pick the `manifest.json` inside (Firefox
+forgets it when you close the browser). If Firefox asks for access to the app on this computer, allow it
+(**Add-ons → the extension → Permissions**).
 
 ### More
 
@@ -414,10 +420,13 @@ requests whose `Origin` is a browser extension and whose `Host` is its own addre
 extension. Run the browser test with `pip install playwright && playwright install chromium`, then
 `xvfb-run -a python -m unittest tests.test_extension_e2e -v`.
 
-Publishing to the Chrome Web Store: raise `version` in `extension/manifest.json`, take
-`simple-ytdlp-extension.zip` from the release (or run `python extension/store/pack.py`) and upload it in the
-[developer dashboard](https://chrome.google.com/webstore/devconsole). Listing text, permission justifications and the
-pictures are in `extension/store/` (`make_assets.py` regenerates the pictures).
+Publishing: raise `version` in `extension/manifest.json`, take `simple-ytdlp-extension.zip` (Chrome Web Store, Edge
+Add-ons) and `simple-ytdlp-extension-firefox.zip` (addons.mozilla.org) from the release - or build them with
+`python extension/store/pack.py [--firefox]` - and upload them in the
+[Chrome developer dashboard](https://chrome.google.com/webstore/devconsole) and the
+[Firefox developer hub](https://addons.mozilla.org/developers/). Listing texts, permission justifications and the pictures
+are in `extension/store/` (`listing.md`, `listing-firefox.md`; `make_assets.py` regenerates the pictures). CI lints the
+Firefox package with Mozilla's `web-ext`.
 
 ### Building the programs
 

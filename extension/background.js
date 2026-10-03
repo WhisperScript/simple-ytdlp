@@ -1,6 +1,7 @@
 // Right-click menu entries, a keyboard shortcut (see manifest) and the badge that confirms them.
 "use strict";
-importScripts("client.js");
+// Chrome runs this file as a service worker and loads the helper itself; Firefox lists both files in its manifest.
+if (typeof importScripts === "function") importScripts("client.js");
 
 const MENU = {
   link: { title: "Download link with simple-ytdlp", contexts: ["link"] },
