@@ -64,5 +64,9 @@ jobs:
         run: xvfb-run -a -s "-screen 0 1280x1024x24" python -X faulthandler -m unittest -v tests.test_extension_package tests.test_extension_e2e
       - name: Web Store pictures still build
         run: xvfb-run -a -s "-screen 0 1800x1100x24" python extension/store/make_assets.py
-      - name: Package
-        run: python extension/store/pack.py
+      - name: Packages
+        run: python extension/store/pack.py && python extension/store/pack.py --firefox
+      - name: Firefox add-on lint (the checks addons.mozilla.org runs)
+        run: |
+          mkdir firefox-package && cd firefox-package && unzip -q ../simple-ytdlp-extension-firefox.zip
+          npx --yes web-ext@10.7.0 lint --source-dir . --warnings-as-errors
