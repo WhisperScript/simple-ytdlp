@@ -885,6 +885,85 @@ class BrowserExtension(GuiCase):
         self.assertIn("Forget paired browsers", texts)
 
 
+class Responsiveness(GuiCase):
+    """The window must not freeze: the clipboard is read off the Tk thread on a Mac (the pasteboard can take seconds)
+    and never while the watcher is off; freezes are noted in the Log."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(wait(lambda: not app._clip_reading, 5), "a read of the previous test is still running")
+        app.watch_last = None
+        app.last_clip = ""
+        app.url_var.set("")
+        app._placeholder(True)
+        self.pasteboard = {"text": "", "delay": 0.0, "calls": 0}
+        real_run = mod.subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd != ["pbpaste"]:
+                return real_run(cmd, *args, **kwargs)
+            self.pasteboard["calls"] += 1
+            time.sleep(self.pasteboard["delay"])
+            if self.pasteboard["delay"] > kwargs.get("timeout", 99):
+                raise mod.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+            return mod.subprocess.CompletedProcess(cmd, 0, stdout=self.pasteboard["text"].encode(), stderr=b"")
+
+        for patch in (mock.patch.object(mod, "IS_MAC", True), mock.patch.object(mod.subprocess, "run", fake_run)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(app.clip_watch_var.set, False)
+
+    def test_a_disabled_watcher_never_touches_the_clipboard(self):
+        app.clip_watch_var.set(False)
+        with mock.patch.object(app, "_clipboard", side_effect=AssertionError("read the clipboard on the Tk thread")):
+            pump(2300)
+        self.assertEqual(self.pasteboard["calls"], 0)
+
+    def test_the_watcher_reads_through_a_helper_and_adds_only_new_links(self):
+        self.pasteboard["text"] = U("mac_before")
+        app.clip_watch_var.set(True)
+        with mock.patch.object(app, "_clipboard", side_effect=AssertionError("read on the Tk thread")):
+            pump(2300)
+            self.assertFalse(any("mac_before" in i.url for i in app.items), "what was there before is not new")
+            self.pasteboard["text"] = U("mac_new")
+            self.assertTrue(wait(lambda: any("mac_new" in i.url for i in app.items), 6))
+        self.assertGreater(self.pasteboard["calls"], 1)
+
+    def test_a_slow_pasteboard_does_not_freeze_the_window(self):
+        self.pasteboard.update(text=U("slow"), delay=2.0)
+        beats = []
+        start = time.monotonic()
+
+        def tick():
+            beats.append(time.monotonic())
+            if time.monotonic() - start < 1.8:
+                root.after(50, tick)
+        app.clip_watch_var.set(True)
+        root.after(0, tick)
+        pump(2000)
+        gaps = [b - a for a, b in zip(beats, beats[1:])]
+        self.assertGreater(len(beats), 15)
+        self.assertLess(max(gaps), 0.4, "the window stood still while the pasteboard was slow")
+        self.assertEqual(app.items, [], "an answer that comes too late is dropped")
+
+    def test_coming_back_to_the_window_offers_a_new_link(self):
+        self.pasteboard["text"] = U("offered")
+        app._on_focus(mock.Mock(widget=root))
+        self.assertTrue(wait(lambda: app.url_var.get() == U("offered"), 5))
+
+    def test_a_freeze_is_noted_in_the_log_with_its_place(self):
+        app.STALL_SECONDS = 0.5
+        self.addCleanup(setattr, app, "STALL_SECONDS", type(app).STALL_SECONDS)
+
+        def block_the_window_for_a_moment():
+            time.sleep(1.4)
+        root.after(0, block_the_window_for_a_moment)
+        self.assertTrue(wait(lambda: "did not answer" in self.log_text(), 8), self.log_text())
+        text = self.log_text()
+        self.assertIn("block_the_window_for_a_moment", text)
+        self.assertRegex(text, r"did not answer for 1\.\d s")
+
+
 class HistoryAndLog(GuiCase):
     def test_history_list_and_search(self):
         t = time.localtime()

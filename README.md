@@ -449,3 +449,8 @@ branch and publishes the release. Or push a tag: `git tag v2.3 && git push origi
 
 Use a higher number every time (`v2.3`, `v2.4`, `v2.10`, …) - that is how running apps recognize that something
 newer exists.
+
+## License
+
+[MIT](LICENSE) - use it, change it, share it. The programs include or download other components (yt-dlp, FFmpeg and
+more) under their own licenses, listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

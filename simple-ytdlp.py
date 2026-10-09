@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 import webbrowser
 import zipfile
@@ -2742,7 +2743,9 @@ class App:
         self.text_widgets: list = []
         self.notices: dict[str, dict] = {}
         self.restored = False
-        self.watch_last = ""
+        self.watch_last: str | None = None     # clipboard text the watcher has seen (None: not read yet)
+        self._clip_reading = False
+        self._closing = False
         self.last_clip = ""
         self.placeholder_text = "Paste a video or playlist link here"
         self.placeholder_on = False
@@ -2798,6 +2801,7 @@ class App:
         self.bridge_var.trace_add("write", lambda *_: self._bridge_apply())
         self._bridge_apply()
         self.root.after(1000, self._watch_clipboard)
+        self._start_stall_watch()
         self._startup_tools()
         threading.Thread(target=self._check_app_update, daemon=True).start()
 
@@ -3511,11 +3515,42 @@ class App:
         except tk.TclError:
             return ""
 
-    def _on_focus(self, event) -> None:
-        """Back in the window with a new link in the clipboard: offer it in the empty link field."""
-        if event.widget is not self.root:
+    def _clipboard_async(self, done) -> None:
+        """Hand the clipboard's text to done(text) without ever blocking the window. On a Mac the pasteboard can
+        take seconds to answer (a copy from another device, big content), and asking from the Tk thread freezes
+        the whole window meanwhile - so a helper thread asks pbpaste with a time limit. Elsewhere it is instant.
+        If the clipboard does not answer in time, done is not called."""
+        if not IS_MAC:
+            done(self._clipboard())
             return
-        clip = self._clipboard().strip()
+        if self._clip_reading:
+            return
+        self._clip_reading = True
+
+        def work() -> None:
+            text = None
+            try:
+                out = subprocess.run(["pbpaste"], capture_output=True, timeout=1.5,
+                                     env={**os.environ, "LANG": "en_US.UTF-8"}).stdout
+                text = out.decode("utf-8", "replace")
+            except (OSError, subprocess.SubprocessError):
+                pass
+            self.ui(lambda: self._clipboard_read(text, done))
+        threading.Thread(target=work, daemon=True, name="clipboard").start()
+
+    def _clipboard_read(self, text: str | None, done) -> None:
+        self._clip_reading = False
+        if text is not None:
+            done(text)
+
+    def _on_focus(self, event) -> None:
+        """Back in the window: look at the clipboard."""
+        if event.widget is self.root:
+            self._clipboard_async(self._offer_clipboard)
+
+    def _offer_clipboard(self, text: str) -> None:
+        """A new link in the clipboard is offered in the empty link field."""
+        clip = text.strip()
         if not looks_like_url(clip) or clip == self.last_clip:
             return
         if self.url_var.get() and not self.placeholder_on:
@@ -4441,23 +4476,59 @@ class App:
                             actions=[("Resume all", lambda: (self.clear_notice("restore"), self.start_all()))])
 
     def _clip_watch_toggled(self) -> None:
-        if self.clip_watch_var.get():          # what is in the clipboard right now is not "new"
-            self.watch_last = self._clipboard().strip()
+        self.watch_last = None                 # what is in the clipboard right now is not "new"
 
     def _watch_clipboard(self) -> None:
-        """While enabled in the settings, every new link copied anywhere is added to the queue."""
+        """While enabled in the settings, every new link copied anywhere is added to the queue. While it is off,
+        the clipboard is not touched at all."""
         try:
             if self.clip_watch_var.get():
-                clip = self._clipboard().strip()
-                if clip != self.watch_last:
-                    self.watch_last = clip
-                    if looks_like_url(clip) and not any(it.url == clip for it in self.items):
-                        self.add_urls([clip])
-            else:
-                self.watch_last = self._clipboard().strip()      # so enabling it does not add the old content
+                self._clipboard_async(self._clipboard_polled)
             self.root.after(1000, self._watch_clipboard)
         except tk.TclError:
             pass                                                 # window closed
+
+    def _clipboard_polled(self, text: str) -> None:
+        clip = text.strip()
+        if self.watch_last is None:
+            self.watch_last = clip
+        elif clip != self.watch_last:
+            self.watch_last = clip
+            if self.clip_watch_var.get() and looks_like_url(clip) and not any(it.url == clip for it in self.items):
+                self.add_urls([clip])
+
+    # ------------------------------------------------------------ freeze detector
+
+    STALL_SECONDS = 1.5
+
+    def _start_stall_watch(self) -> None:
+        """Notes in the Log when the window stops answering and where it was stuck. A helper thread notices that
+        the Tk loop's heartbeat stopped and looks at what the main thread is doing at that moment."""
+        main_id = threading.get_ident()
+        state = {"beat": time.monotonic(), "since": 0.0, "stack": ""}
+
+        def beat() -> None:
+            now = time.monotonic()
+            if state["stack"]:
+                self.log(f"Note: the window did not answer for {now - state['since']:.1f} s, busy in: {state['stack']}")
+                state["stack"] = ""
+            state["beat"] = now
+            try:
+                self.root.after(200, beat)
+            except tk.TclError:
+                pass
+
+        def watch() -> None:
+            while not self._closing:
+                time.sleep(min(0.5, self.STALL_SECONDS / 3))
+                if not state["stack"] and time.monotonic() - state["beat"] > self.STALL_SECONDS:
+                    frame = sys._current_frames().get(main_id)
+                    if frame is not None:
+                        steps = traceback.extract_stack(frame)[-5:]
+                        state["since"] = state["beat"]
+                        state["stack"] = " < ".join(f"{Path(f.filename).name}:{f.lineno} {f.name}" for f in reversed(steps))
+        beat()
+        threading.Thread(target=watch, daemon=True, name="stall-watch").start()
 
     # ------------------------------------------------------------ history
 
@@ -4707,6 +4778,7 @@ class App:
                         "They continue where they stopped the next time you start the app."):
             return
         self.running = False
+        self._closing = True
         if self.bridge is not None:
             self.bridge.stop()
         for it in running:
