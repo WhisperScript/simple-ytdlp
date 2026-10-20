@@ -122,29 +122,32 @@ nothing is fetched twice. **Pause all** and **Resume all** do the same for the w
 
 ### Send videos from your browser - one click
 
-Install the **simple-ytdlp browser extension** (Chrome, Edge, Brave and other Chromium browsers). Open a video or
-playlist, click the extension's icon - it appears in the app's list. Right-click any link for **Download link with
-simple-ytdlp** (or **as MP3**), and in the extension's settings choose whether the icon fetches video or audio.
+Install the **simple-ytdlp browser extension** - one click on a video or playlist page sends it to the app. Right-click
+any link for **Download link with simple-ytdlp** (or **as MP3**), and in the extension's settings choose whether the
+icon fetches video or audio.
+
+| Browser | Install |
+|---|---|
+| **Chrome**, **Edge**, **Brave**, Opera, Vivaldi (all Chromium browsers) | [Chrome Web Store](https://chromewebstore.google.com/detail/simple-ytdlp-send-to-app/fdogebppaahhhnchljpgkjbfibdjkion) |
+| **Firefox** (140 or newer) | [Firefox Add-ons](https://addons.mozilla.org/firefox/addon/simple-ytdlp-send-to-app/) |
 
 <p align="center">
   <img src="extension/store/screenshot-1.png" alt="The extension's popup says 'Added to the download list' and the video shows up in the app" width="720">
 </p>
 
-1. Start the app (it has to be running).
+1. Start the app (it has to be running - by default it starts with your computer and stays in the background).
 2. Click the extension's icon on a video page. The first time, the app asks **once** whether to allow the extension - choose **Yes**.
 3. That is it. The extension only ever talks to the app on your own computer.
 
-The extension is being published in the Chrome Web Store. Until then: download `simple-ytdlp-extension.zip` from the
-[latest release](https://github.com/WhisperScript/simple-ytdlp/releases/latest), unzip it, open `chrome://extensions`,
-switch on **Developer mode**, click **Load unpacked** and pick the unzipped folder.
 Who can use it: only an extension you allowed in the app - a website cannot add anything (see the FAQ below).
-Switch it off completely under **Settings … → Login and network → Browser extension**.
+Switch it off completely under **Settings … → Login and network → Browser extension**. If Firefox asks for access to the
+app on this computer, allow it (**Add-ons → the extension → Permissions**).
 
-**Firefox:** the Firefox version (`simple-ytdlp-extension-firefox.zip` on the same release page, Firefox 140 or newer) is
-being published on addons.mozilla.org. Until then Firefox only loads it temporarily: unzip it, open
-`about:debugging#/runtime/this-firefox`, click **Load Temporary Add-on …** and pick the `manifest.json` inside (Firefox
-forgets it when you close the browser). If Firefox asks for access to the app on this computer, allow it
-(**Add-ons → the extension → Permissions**).
+*Without a store* (to try a new version): download `simple-ytdlp-extension.zip` (Chrome) or
+`simple-ytdlp-extension-firefox.zip` from the [latest release](https://github.com/WhisperScript/simple-ytdlp/releases/latest),
+unzip it, and in Chrome open `chrome://extensions`, switch on **Developer mode**, **Load unpacked** and pick the folder;
+in Firefox open `about:debugging#/runtime/this-firefox`, **Load Temporary Add-on …** and pick the `manifest.json`
+(Firefox forgets it when you close the browser).
 
 ### Keep it running in the background
 
@@ -446,7 +449,7 @@ requests whose `Origin` is a browser extension and whose `Host` is its own addre
 extension. Run the browser test with `pip install playwright && playwright install chromium`, then
 `xvfb-run -a python -m unittest tests.test_extension_e2e -v`.
 
-Publishing: raise `version` in `extension/manifest.json`, take `simple-ytdlp-extension.zip` (Chrome Web Store, Edge
+Publishing (both are live: [Chrome Web Store](https://chromewebstore.google.com/detail/simple-ytdlp-send-to-app/fdogebppaahhhnchljpgkjbfibdjkion), [Firefox Add-ons](https://addons.mozilla.org/firefox/addon/simple-ytdlp-send-to-app/)): raise `version` in `extension/manifest.json`, take `simple-ytdlp-extension.zip` (Chrome Web Store, Edge
 Add-ons) and `simple-ytdlp-extension-firefox.zip` (addons.mozilla.org) from the release - or build them with
 `python extension/store/pack.py [--firefox]` - and upload them in the
 [Chrome developer dashboard](https://chrome.google.com/webstore/devconsole) and the
