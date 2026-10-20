@@ -2,7 +2,10 @@
 import http.client
 import importlib.util
 import json
+import plistlib
 import shutil
+import socket
+import threading
 import tempfile
 import time
 import unittest
@@ -661,3 +664,222 @@ class BridgeEndpoint(unittest.TestCase):
         self.bridge.stop()
         self.assertEqual(self.bridge.port, 0)
         self.assertEqual(self.bridge.start(), self.port)        # the freed port is taken again
+
+
+class AutostartAndTray(unittest.TestCase):
+    """'Start with the computer' on the three systems, the single-instance lock and the tray wrapper."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        patch = mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": ""})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_the_command_that_starts_the_program(self):
+        with mock.patch.object(app.sys, "executable", r"C:\Apps\simple-ytdlp.exe"):
+            self.assertEqual(app.launch_command(frozen=True, platform="win32"), [r"C:\Apps\simple-ytdlp.exe"])
+        with mock.patch.object(app.sys, "executable", "/Applications/simple-ytdlp.app/Contents/MacOS/simple-ytdlp"):
+            self.assertEqual(app.launch_command(frozen=True, platform="darwin"),
+                             ["/usr/bin/open", "-a", "/Applications/simple-ytdlp.app", "--args"])
+        with mock.patch.object(app.sys, "executable", "/opt/simple-ytdlp/simple-ytdlp"):
+            self.assertEqual(app.launch_command(frozen=True, platform="linux"), ["/opt/simple-ytdlp/simple-ytdlp"])
+        cmd = app.launch_command(frozen=False, platform="linux")
+        self.assertEqual(cmd[0], app.sys.executable)
+        self.assertTrue(cmd[1].endswith("simple-ytdlp.py"))
+
+    def test_linux_desktop_entry(self):
+        cmd = ["/opt/My Apps/simple-ytdlp"]
+        self.assertFalse(app.autostart_enabled("linux", self.home))
+        self.assertTrue(app.set_autostart(True, cmd, "linux", self.home))
+        path = self.home / ".config" / "autostart" / "simple-ytdlp.desktop"
+        text = path.read_text()
+        self.assertIn('Exec="/opt/My Apps/simple-ytdlp" --background', text)
+        self.assertIn("[Desktop Entry]", text)
+        self.assertIn("X-GNOME-Autostart-enabled=true", text)
+        self.assertTrue(app.autostart_enabled("linux", self.home))
+        path.write_text("stale")                                       # the program was moved: the entry is repaired
+        app.set_autostart(True, ["/new/place/simple-ytdlp"], "linux", self.home)
+        self.assertIn("Exec=/new/place/simple-ytdlp --background", path.read_text())
+        self.assertTrue(app.set_autostart(False, cmd, "linux", self.home))
+        self.assertFalse(path.exists())
+        self.assertTrue(app.set_autostart(False, cmd, "linux", self.home), "turning off twice is fine")
+
+    def test_linux_honours_xdg_config_home(self):
+        with mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(self.home / "cfg")}):
+            app.set_autostart(True, ["/x/simple-ytdlp"], "linux", self.home)
+        self.assertTrue((self.home / "cfg" / "autostart" / "simple-ytdlp.desktop").exists())
+
+    def test_mac_launch_agent(self):
+        cmd = ["/usr/bin/open", "-a", "/Applications/simple-ytdlp.app", "--args"]
+        self.assertTrue(app.set_autostart(True, cmd, "darwin", self.home))
+        path = self.home / "Library" / "LaunchAgents" / "com.whisperscript.simple-ytdlp.plist"
+        data = plistlib.loads(path.read_bytes())
+        self.assertEqual(data["ProgramArguments"], [*cmd, "--background"])
+        self.assertIs(data["RunAtLoad"], True)
+        self.assertEqual(data["Label"], "com.whisperscript.simple-ytdlp")
+        self.assertTrue(app.autostart_enabled("darwin", self.home))
+        app.set_autostart(False, cmd, "darwin", self.home)
+        self.assertFalse(path.exists())
+
+    def test_windows_run_key(self):
+        values = {}
+
+        class Key:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        class FakeWinreg:
+            HKEY_CURRENT_USER, REG_SZ, fail = "HKCU", 1, False
+
+            def CreateKey(self, root, path):
+                if self.fail:
+                    raise PermissionError("no")
+                assert (root, path) == ("HKCU", app.RUN_KEY)
+                return Key()
+
+            OpenKey = CreateKey
+
+            def SetValueEx(self, key, name, _, kind, value):
+                values[name] = value
+
+            def DeleteValue(self, key, name):
+                if name not in values:
+                    raise FileNotFoundError(name)
+                del values[name]
+
+            def QueryValueEx(self, key, name):
+                if name not in values:
+                    raise FileNotFoundError(name)
+                return values[name], 1
+
+        reg = FakeWinreg()
+        cmd = [r"C:\Program Files\simple-ytdlp\simple-ytdlp.exe"]
+        self.assertFalse(app.autostart_enabled("win32", winreg=reg))
+        self.assertTrue(app.set_autostart(True, cmd, "win32", winreg=reg))
+        self.assertEqual(values["simple-ytdlp"], r'"C:\Program Files\simple-ytdlp\simple-ytdlp.exe" --background')
+        self.assertTrue(app.autostart_enabled("win32", winreg=reg))
+        self.assertTrue(app.set_autostart(False, cmd, "win32", winreg=reg))
+        self.assertEqual(values, {})
+        self.assertTrue(app.set_autostart(False, cmd, "win32", winreg=reg), "it was not there: fine")
+        reg.fail = True
+        self.assertFalse(app.set_autostart(True, cmd, "win32", winreg=reg), "the system said no")
+
+    def test_unwritable_autostart_folder_reports_failure(self):
+        blocker = self.home / ".config"
+        blocker.write_text("a file where the folder should be")
+        self.assertFalse(app.set_autostart(True, ["/x/simple-ytdlp"], "linux", self.home))
+
+    @staticmethod
+    def free_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def test_a_second_start_shows_the_first_window_and_quits(self):
+        port, shown = self.free_port(), []
+        first = app.InstanceLock(port)
+        first.on_show = lambda: shown.append(1)
+        self.addCleanup(first.release)
+        self.assertTrue(first.claim())
+        second = app.InstanceLock(port)
+        self.assertFalse(second.claim(show=True))
+        self.assertEqual(shown, [1])
+        self.assertFalse(second.claim(show=False), "a start at login only checks")
+        self.assertEqual(shown, [1], "... and does not pop the window up")
+
+    def test_after_a_self_update_the_new_start_waits_for_the_old_one(self):
+        port = self.free_port()
+        old = app.InstanceLock(port)
+        self.assertTrue(old.claim())
+        threading.Timer(0.8, old.release).start()
+        new = app.InstanceLock(port)
+        self.addCleanup(new.release)
+        self.assertTrue(new.claim(show=False, wait=5.0))
+
+    def test_a_foreign_program_on_the_port_does_not_block_the_start(self):
+        with socket.socket() as squatter:
+            squatter.bind(("127.0.0.1", 0))
+            squatter.listen(1)
+            lock = app.InstanceLock(squatter.getsockname()[1])
+            self.assertTrue(lock.claim())                              # nobody answers like simple-ytdlp
+            self.assertIsNone(lock.sock)
+
+    def fake_pystray(self, fail=False):
+        done = threading.Event()
+
+        class Icon:
+            def __init__(self, name, image, title, menu):
+                if fail:
+                    raise RuntimeError("no tray")
+                self.name, self.image, self.title, self.menu, self.notes = name, image, title, menu, []
+
+            def run(self):
+                done.wait(5)
+
+            def notify(self, text, title):
+                self.notes.append((title, text))
+
+            def stop(self):
+                done.set()
+
+        class Menu:
+            SEPARATOR = object()
+
+            def __init__(self, *items):
+                self.items = items
+
+        class MenuItem:
+            def __init__(self, text, action, default=False):
+                self.text, self.action, self.default = text, action, default
+
+        return mock.Mock(Icon=Icon, Menu=Menu, MenuItem=MenuItem), done
+
+    def test_the_tray_menu_opens_and_quits_through_the_tk_thread(self):
+        if app.Image is None:
+            self.skipTest("Pillow is not installed")
+        calls = []
+        window = mock.Mock(ui=lambda fn: fn(), show_window=lambda: calls.append("show"),
+                           quit_from_tray=lambda: calls.append("quit"))
+        pystray, done = self.fake_pystray()
+        self.addCleanup(done.set)
+        tray = app.Tray(window, pystray)
+        self.assertTrue(tray.start())
+        items = [i for i in tray.icon.menu.items if i is not pystray.Menu.SEPARATOR]
+        self.assertEqual([i.text for i in items], ["Open simple-ytdlp", "Quit"])
+        self.assertTrue(items[0].default, "a click on the icon opens the window")
+        items[0].action(tray.icon, items[0])
+        items[1].action(tray.icon, items[1])
+        self.assertEqual(calls, ["show", "quit"])
+        tray.set_title("42%")
+        self.assertEqual(tray.icon.title, "42%")
+        tray.notify("hello")
+        self.assertEqual(tray.icon.notes, [("simple-ytdlp", "hello")])
+        icon = tray.icon
+        tray.stop()
+        self.assertIsNone(tray.icon)
+        self.assertTrue(done.is_set())
+        self.assertIsNotNone(icon)
+
+    def test_without_pystray_or_a_tray_start_says_no(self):
+        if app.Image is None:
+            self.skipTest("Pillow is not installed")
+        pystray, done = self.fake_pystray(fail=True)
+        self.addCleanup(done.set)
+        self.assertFalse(app.Tray(mock.Mock(), pystray).start())
+        with mock.patch.object(app.Tray, "_import_pystray", return_value=None):          # not installed / unusable
+            tray = app.Tray(mock.Mock())
+            self.assertFalse(tray.start())
+            tray.set_title("x")
+            tray.notify("x")
+            tray.stop()
+
+    def test_the_done_message_goes_through_the_tray_when_there_is_one(self):
+        tray = mock.Mock(icon=object())
+        with mock.patch.object(app.subprocess, "Popen") as popen:
+            app.notify("t", "Done: 3 finished", None, tray)
+        tray.notify.assert_called_once_with("Done: 3 finished")
+        popen.assert_not_called()

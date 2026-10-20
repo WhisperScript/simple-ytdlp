@@ -16,6 +16,9 @@ below. They keep their own licenses; follow the links for the full texts and the
 | certifi (certificate bundle) | MPL-2.0 | https://github.com/certifi/python-certifi |
 | tkinterdnd2 (drag and drop) | MIT | https://github.com/Eliav2/tkinterdnd2 |
 | imageio-ffmpeg (Python wrapper) | BSD-2-Clause | https://github.com/imageio/imageio-ffmpeg |
+| pystray (tray icon; Windows and Linux programs only) | LGPL-3.0 | https://github.com/moses-palmer/pystray |
+| python-xlib (tray icon on Linux) | LGPL-2.1-or-later | https://github.com/python-xlib/python-xlib |
+| six (needed by pystray) | MIT | https://github.com/benjaminp/six |
 | **FFmpeg** (static build shipped by imageio-ffmpeg) | **GPL-3.0-or-later** (built with `--enable-gpl --enable-version3`) | https://ffmpeg.org/, build: https://johnvansickle.com/ffmpeg/ |
 
 ## Downloaded by the app when you use it
@@ -24,6 +27,12 @@ below. They keep their own licenses; follow the links for the full texts and the
 |---|---|---|
 | yt-dlp (does the downloading) | Unlicense (public domain) | https://github.com/yt-dlp/yt-dlp |
 | FFmpeg build with ffprobe (Tools → Get ffmpeg tools) | GPL-3.0-or-later | https://github.com/yt-dlp/FFmpeg-Builds |
+
+## About the LGPL libraries (pystray, python-xlib)
+
+They are included unmodified. You may replace them with your own version: the complete source of simple-ytdlp is in this
+repository, and the README ("Building the programs") shows how to build the program with a different version of
+these libraries.
 
 ## About FFmpeg
 

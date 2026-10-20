@@ -79,7 +79,7 @@ def start_app(settings: dict):
     module.save_settings({"theme": "dark", **settings})
     root = tk.Tk()
     root.geometry("920x760+20+20")
-    app = module.App(root)
+    app = module.App(root, tray=False)                    # no real notification-area icon in tests
     pump(root, 100)
     return module, root, app
 

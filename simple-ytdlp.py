@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect", "pillow", "tkinterdnd2"]
+# dependencies = ["imageio-ffmpeg", "certifi", "sv-ttk", "darkdetect", "pillow", "tkinterdnd2", "pystray; sys_platform != 'darwin'"]
 # ///
 """
 simple-ytdlp.py - cross-platform frontend for yt-dlp (macOS, Linux, Windows).
@@ -33,6 +33,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import ssl
 import stat
 import subprocess
@@ -340,6 +341,7 @@ def can_self_update() -> bool:
 def _relaunch_env() -> dict:
     env = dict(os.environ)
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"   # the new process must not reuse this one's temp folder
+    env["SIMPLE_YTDLP_RELAUNCH"] = "1"           # ... and waits until this one has quit (see InstanceLock)
     return env
 
 
@@ -1480,15 +1482,272 @@ class Bridge:
         return 200, {"ok": True, **self._add(urls, mode)}
 
 
+# ---------------------------------------------------------------- Running in the background (no GUI needed)
+
+LAUNCH_AGENT_ID = "com.whisperscript.simple-ytdlp"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+INSTANCE_PORT = 17660                           # only one simple-ytdlp runs per user (see InstanceLock)
+
+
+def launch_command(frozen: bool | None = None, platform: str | None = None) -> list[str]:
+    """The command that starts this program again (for 'Start with the computer'), without any option."""
+    frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    platform = platform or sys.platform
+    exe = Path(sys.executable)
+    if frozen:
+        if platform == "darwin":
+            for parent in exe.parents:
+                if parent.suffix == ".app":
+                    return ["/usr/bin/open", "-a", str(parent), "--args"]
+        return [str(exe)]
+    if platform == "win32":                     # no console window
+        pythonw = exe.with_name("pythonw.exe")
+        exe = pythonw if pythonw.exists() else exe
+    return [str(exe), str(Path(__file__).resolve())]
+
+
+def _desktop_quote(arg: str) -> str:
+    """One argument of the Exec line of a .desktop file."""
+    if re.fullmatch(r"[A-Za-z0-9_./:=+@%,-]+", arg):
+        return arg
+    return '"' + re.sub(r'(["`$\\])', r"\\\1", arg) + '"'
+
+
+def autostart_file(platform: str | None = None, home: Path | None = None) -> Path | None:
+    """The file that makes the system start the program at login (None on Windows: that is a registry entry)."""
+    platform = platform or sys.platform
+    home = home or Path.home()
+    if platform == "darwin":
+        return home / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_ID}.plist"
+    if platform == "win32":
+        return None
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
+    return config / "autostart" / f"{APP_NAME}.desktop"
+
+
+def autostart_content(cmd: list[str], platform: str | None = None) -> bytes:
+    """What the autostart file contains: the command with --background, so it starts out of sight."""
+    platform = platform or sys.platform
+    full = [*cmd, "--background"]
+    if platform == "darwin":
+        import plistlib
+        return plistlib.dumps({"Label": LAUNCH_AGENT_ID, "ProgramArguments": full, "RunAtLoad": True,
+                               "ProcessType": "Interactive", "LimitLoadToSessionType": "Aqua"})
+    exec_line = " ".join(_desktop_quote(a) for a in full)
+    return (f"[Desktop Entry]\nType=Application\nName={APP_NAME}\n"
+            f"Comment=Downloads videos with yt-dlp\nExec={exec_line}\nTerminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n").encode("utf-8")
+
+
+def autostart_enabled(platform: str | None = None, home: Path | None = None, winreg=None) -> bool:
+    platform = platform or sys.platform
+    if platform == "win32":
+        try:
+            winreg = winreg or __import__("winreg")
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+                winreg.QueryValueEx(key, APP_NAME)
+            return True
+        except OSError:
+            return False
+    path = autostart_file(platform, home)
+    return bool(path and path.exists())
+
+
+def set_autostart(enable: bool, cmd: list[str] | None = None, platform: str | None = None,
+                  home: Path | None = None, winreg=None) -> bool:
+    """Turn 'Start with the computer' on or off (also repairs a stale entry, e.g. after the program was moved).
+    False if the system did not let us."""
+    platform = platform or sys.platform
+    cmd = cmd or launch_command(platform=platform)
+    try:
+        if platform == "win32":
+            winreg = winreg or __import__("winreg")
+            line = subprocess.list2cmdline([*cmd, "--background"])
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+                if enable:
+                    winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, line)
+                else:
+                    try:
+                        winreg.DeleteValue(key, APP_NAME)
+                    except OSError:
+                        pass                    # was not there
+            return True
+        path = autostart_file(platform, home)
+        if not enable:
+            path.unlink(missing_ok=True)
+            return True
+        content = autostart_content(cmd, platform)
+        if not path.exists() or path.read_bytes() != content:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        return True
+    except OSError:
+        return False
+
+
+class InstanceLock:
+    """Only one simple-ytdlp runs per user. Now that the program stays in the background, a second start (from the
+    Start menu, the Dock, a double click) must bring the first one's window to the front instead of opening another
+    copy. The first instance listens on a local port; a second one connects, says so and quits."""
+
+    SHOW, PING = b"simple-ytdlp show\n", b"simple-ytdlp ping\n"
+
+    def __init__(self, port: int = INSTANCE_PORT):
+        self.port = port
+        self.sock: socket.socket | None = None
+        self.on_show = lambda: None
+
+    def claim(self, show: bool = True, wait: float = 0.0) -> bool:
+        """True: we are the first instance. False: another one is running (and was asked to show its window if
+        show is set). wait: how long to wait for a running instance to go away (after a self-update)."""
+        end = time.monotonic() + wait
+        while True:
+            if self._bind():
+                return True
+            if self._ask(show):
+                if time.monotonic() >= end:
+                    return False
+                time.sleep(0.3)
+                continue
+            return True                         # the port belongs to something else: carry on without a lock
+
+    def _bind(self) -> bool:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if os.name != "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", self.port))
+            sock.listen(4)
+        except OSError:
+            sock.close()
+            return False
+        self.sock = sock
+        threading.Thread(target=self._serve, daemon=True, name="instance").start()
+        return True
+
+    def _ask(self, show: bool) -> bool:
+        """Another simple-ytdlp answers on the port?"""
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=1.5) as conn:
+                conn.sendall(self.SHOW if show else self.PING)
+                return conn.recv(16).startswith(b"ok")
+        except OSError:
+            return False
+
+    def _serve(self) -> None:
+        sock = self.sock
+        while sock is not None and self.sock is sock:
+            try:
+                conn, _ = sock.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.settimeout(2.0)
+                    data = conn.recv(64)
+                    if data in (self.SHOW, self.PING):
+                        conn.sendall(b"ok\n")
+                        if data == self.SHOW:
+                            self.on_show()
+                except OSError:
+                    pass
+
+    def release(self) -> None:
+        sock, self.sock = self.sock, None
+        if sock is not None:
+            sock.close()
+
+
+class Tray:
+    """The icon in the notification area (Windows, Linux) with 'Open' and 'Quit', so the program can keep running
+    after its window is closed. Uses the optional package pystray; without it (or without a tray) start() is False
+    and the window is closed or minimized instead. pystray calls back from its own thread, so the actions are handed
+    to the Tk thread with app.ui."""
+
+    def __init__(self, app, pystray=None):
+        self.app, self.icon, self._pystray = app, None, pystray
+
+    def start(self) -> bool:
+        pystray = self._pystray or self._import_pystray()
+        if pystray is None:
+            return False
+        image = make_icon(64)
+        if image is None:
+            return False
+        try:
+            menu = pystray.Menu(
+                pystray.MenuItem(f"Open {APP_NAME}", lambda icon, item: self.app.ui(self.app.show_window), default=True),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Quit", lambda icon, item: self.app.ui(self.app.quit_from_tray)))
+            self.icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+            threading.Thread(target=self._run, args=(self.icon,), daemon=True, name="tray").start()
+        except Exception:
+            self.icon = None
+            return False
+        return True
+
+    def _run(self, icon) -> None:
+        try:
+            icon.run()
+        except Exception:                       # e.g. a desktop without a notification area
+            if self.icon is icon:
+                self.icon = None
+
+    @staticmethod
+    def _import_pystray():
+        """pystray picks its backend while it is imported. On a Linux desktop that has the GTK bindings only half
+        (a common case) that import fails with an error pystray does not handle, so the plain X11 backend is
+        tried next."""
+        try:
+            import pystray
+            return pystray
+        except Exception:
+            pass
+        if not sys.platform.startswith("linux"):
+            return None
+        for name in [m for m in sys.modules if m == "pystray" or m.startswith("pystray.")]:
+            del sys.modules[name]
+        os.environ["PYSTRAY_BACKEND"] = "xorg"
+        try:
+            import pystray
+            return pystray
+        except Exception:
+            return None
+
+    def set_title(self, text: str) -> None:
+        if self.icon is not None:
+            try:
+                self.icon.title = text
+            except Exception:
+                pass
+
+    def notify(self, text: str) -> None:
+        if self.icon is not None:
+            try:
+                self.icon.notify(text, APP_NAME)
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        icon, self.icon = self.icon, None
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+
+
 # ---------------------------------------------------------------- GUI
 
 UPDATE_INTERVAL = 24 * 3600      # how often (seconds) to silently check for yt-dlp updates at startup
 
 
-def notify(title: str, message: str, root=None) -> None:
-    """Announce the end of a run without extra dependencies."""
+def notify(title: str, message: str, root=None, tray=None) -> None:
+    """Announce the end of a run without extra dependencies (on Windows through the tray icon if there is one)."""
     try:
-        if sys.platform == "darwin":
+        if tray is not None and tray.icon is not None:
+            tray.notify(message)
+        elif sys.platform == "darwin":
             script = f'display notification "{message}" with title "{title}"'
             subprocess.Popen(["osascript", "-e", script])
         elif os.name == "nt":
@@ -2568,8 +2827,14 @@ class SettingsDialog(tk.Toplevel if tk else object):
         self.transient(app.root)
         self.resizable(False, False)
         switch = "Switch.TCheckbutton" if sv_ttk is not None else "TCheckbutton"
-        body = ttk.Frame(self, padding=16)
-        body.grid(row=0, column=0)
+        self.rowconfigure(0, weight=1)
+        holder = tk.Canvas(self, highlightthickness=0, borderwidth=0,       # scrolls when the screen is too small
+                           background=ttk.Style().lookup("TFrame", "background") or "#fafafa")
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=holder.yview)
+        holder.configure(yscrollcommand=self.scrollbar.set)
+        holder.grid(row=0, column=0, sticky="nsew")
+        body = ttk.Frame(holder, padding=16)
+        holder.create_window(0, 0, anchor="nw", window=body)
 
         def section(title: str, row: int) -> ttk.Frame:
             box = ttk.LabelFrame(body, text=title, padding=(12, 8, 12, 10))
@@ -2597,12 +2862,20 @@ class SettingsDialog(tk.Toplevel if tk else object):
             if sv_ttk is None:
                 look.winfo_children()[-1].configure(state="disabled")
 
-        general = section("Downloads", 1)
+        general = section("General", 1)
         toggles(general, (("Skip already downloaded", app.arch_var), ("Single video only (no playlist)", app.single_var),
                           ("Folder per channel", app.uploader_var), ("Start as soon as a link is added", app.auto_var),
-                          ("Watch the clipboard for links", app.clip_watch_var)))
+                          ("Watch the clipboard for links", app.clip_watch_var),
+                          ("Start with the computer", app.login_var)))
+        closing = ttk.Frame(general)
+        closing.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(closing, text="When I close the window").pack(side="left")
+        keep = ("Keep running in the Dock" if IS_MAC else "Keep running in the tray" if os.name == "nt"
+                else "Keep running in the background")
+        for text, value in ((keep, "background"), ("Quit the app", "quit")):
+            ttk.Radiobutton(closing, text=text, value=value, variable=app.close_var).pack(side="left", padx=(14, 0))
         speed = ttk.Frame(general)
-        speed.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        speed.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(speed, text="Parallel downloads").pack(side="left")
         ttk.Spinbox(speed, textvariable=app.parallel_var, from_=1, to=4, width=3,
                     state="readonly").pack(side="left", padx=(8, 24))
@@ -2654,9 +2927,29 @@ class SettingsDialog(tk.Toplevel if tk else object):
         self.bind("<Escape>", lambda e: self.close())
         app.sync_mode_options()                # e.g. subtitles are greyed out in audio mode
         self.update_idletasks()
+        need_w, need_h = body.winfo_reqwidth(), body.winfo_reqheight()
+        room = max(self.winfo_screenheight() - 100, 300)                   # taskbar, title bar, a margin
+        holder.configure(width=need_w, height=min(need_h, room), scrollregion=(0, 0, need_w, need_h))
+        if need_h > room:
+            self.scrollbar.grid(row=0, column=1, sticky="ns")
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                self.bind(seq, lambda e: self._wheel(holder, e))
+        self.update_idletasks()
         x = app.root.winfo_rootx() + max((app.root.winfo_width() - self.winfo_width()) // 2, 0)
         y = app.root.winfo_rooty() + 40
         self.geometry(f"+{x}+{y}")
+
+    @staticmethod
+    def _wheel(canvas, event) -> None:
+        if event.num == 4:
+            step = -3
+        elif event.num == 5:
+            step = 3
+        elif abs(event.delta) >= 120:
+            step = -int(event.delta / 120) * 3
+        else:
+            step = -event.delta
+        canvas.yview_scroll(step, "units")
 
     def close(self) -> None:
         self.app.subs_check = None
@@ -2723,9 +3016,10 @@ class AboutDialog(tk.Toplevel if tk else object):
 class App:
     """The main window: link input, download queue, history and log."""
 
-    NOTICE_ORDER = ("setup-error", "setup", "disk", "schedule", "restore", "update")
+    NOTICE_ORDER = ("setup-error", "setup", "disk", "schedule", "restore", "update", "background")
 
-    def __init__(self, root):
+    def __init__(self, root, background: bool = False, tray: bool = True):
+        """background: started at login - out of sight (tray / Dock / taskbar). tray: use the notification-area icon."""
         self.root = root
         self.cfg = load_settings()
         self.items: list[Item] = []
@@ -2759,6 +3053,9 @@ class App:
         self._placeholders: dict = {}
         self._boxes: dict = {}                 # rendered card and button images
         self.bridge: Bridge | None = None      # the local endpoint of the browser extension
+        self.tray: Tray | None = None          # the notification-area icon (Windows, Linux)
+        self.instance: InstanceLock | None = None
+        self._login_busy = False
         self.trusted: set[str] = set(self.cfg.get("trusted_origins") or [])   # approved browser extensions
 
         self.theme_mode = tk.StringVar(value=self.cfg.get("theme") or "system")    # system | light | dark
@@ -2787,7 +3084,7 @@ class App:
 
         root.bind("<FocusIn>", self._on_focus)
         root.bind("<<Paste>>", self._on_global_paste)
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.protocol("WM_DELETE_WINDOW", self.on_window_close)
         self._bind_wheel()
         self.log((APP_NAME + " " + ("(dev)" if __version__ == "dev" else f"v{__version__}"))
                  + f" ready. Output folder: {self.out_var.get()}")
@@ -2800,6 +3097,7 @@ class App:
         self._restore_queue()
         self.bridge_var.trace_add("write", lambda *_: self._bridge_apply())
         self._bridge_apply()
+        self._setup_background(background, tray)
         self.root.after(1000, self._watch_clipboard)
         self._start_stall_watch()
         self._startup_tools()
@@ -3011,6 +3309,9 @@ class App:
         self.sponsor_var = tk.BooleanVar(value=cfg.get("sponsorblock", False))
         self.auto_var = tk.BooleanVar(value=cfg.get("autostart", True))
         self.bridge_var = tk.BooleanVar(value=cfg.get("bridge", True))      # accept links from the browser extension
+        self.close_var = tk.StringVar(value=cfg.get("close_action") if cfg.get("close_action") in ("background", "quit")
+                                      else "background")                    # what the close button does
+        self.login_var = tk.BooleanVar(value=cfg.get("launch_at_login", True))    # start with the computer
         self.after_var = tk.StringVar(value="none")             # what to do when the queue is done (never saved)
         self.chapters_var = tk.BooleanVar(value=cfg.get("chapters", False))
         self.clip_watch_var = tk.BooleanVar(value=False)                   # never on at startup
@@ -3328,7 +3629,8 @@ class App:
 
     def save_options(self) -> None:
         save_settings({**self.collect_options(), "autostart": self.auto_var.get(), "bridge": self.bridge_var.get(),
-                       "parallel": self.parallel(), "theme": self.theme_mode.get()})
+                       "close_action": self.close_var.get(), "parallel": self.parallel(),
+                       "theme": self.theme_mode.get()})
 
     def save_profile(self) -> None:
         name = self.profile_var.get().strip()
@@ -3436,6 +3738,8 @@ class App:
         def add() -> dict:
             result = self.add_urls(urls, mode=mode)
             self.log(f"Browser extension: {len(urls)} link(s) received, {result['added']} added")
+            if self.tray is not None and self.root.state() in ("withdrawn", "iconic"):
+                self.tray.notify("Added to the download list" if result["added"] else "Already in the download list")
             return result
         return self._on_ui_thread(add)
 
@@ -4183,7 +4487,7 @@ class App:
         if ok or bad:
             summary = f"{ok} succeeded" + (f", {bad} failed" if bad else "")
             self.log("Done. " + summary)
-            notify(APP_NAME, "Done: " + summary, self.root)
+            notify(APP_NAME, "Done: " + summary, self.root, self.tray)
             if ok and self.after_var.get() != "none":
                 self.power_countdown(self.after_var.get())
 
@@ -4422,6 +4726,8 @@ class App:
             title = self.base_title
         if self.root.title() != title:
             self.root.title(title)
+            if self.tray is not None:
+                self.tray.set_title(title)
 
     # ------------------------------------------------------------ queue on disk, clipboard watcher
 
@@ -4669,6 +4975,7 @@ class App:
             bar.add_cascade(menu=app_menu)
             root.createcommand("tk::mac::ShowPreferences", self.open_settings)
             root.createcommand("tk::mac::Quit", self.on_close)
+            root.createcommand("tk::mac::ReopenApplication", self.show_window)       # click on the Dock icon
 
         file_menu = tk.Menu(bar, tearoff=0)
         file_menu.add_command(label="Paste links", accelerator=acc("V"), command=self._on_global_paste_menu)
@@ -4770,6 +5077,86 @@ class App:
     def show_about(self) -> None:
         AboutDialog(self)
 
+    # -- in the background: tray, Dock, start with the computer
+
+    def _setup_background(self, start_hidden: bool, use_tray: bool) -> None:
+        if use_tray and not IS_MAC:                        # the Mac has no tray here: the Dock keeps the program
+            tray = Tray(self)
+            if tray.start():
+                self.tray = tray
+            else:
+                self.log("Note: no notification-area icon (install pystray); closing the window "
+                         + ("minimizes it." if os.name != "nt" else "quits the program."))
+        self._sync_login()
+        self.login_var.trace_add("write", lambda *_: self._login_changed())
+        if start_hidden and self._can_hide():
+            self.hide_window(quietly=True)
+
+    def _sync_login(self) -> None:
+        """Make the system's 'start with the computer' entry match the setting (and repair a stale one). The very
+        first start of an installed program turns it on - once, with a note - but a run from the source never
+        registers itself."""
+        first = "launch_at_login" not in self.cfg
+        if first and not getattr(sys, "frozen", False):
+            return
+        want = self.login_var.get()
+        if want or autostart_enabled():
+            set_autostart(want)
+        if first:
+            save_settings({"launch_at_login": want})
+            if want:
+                self.set_notice("background", f"{APP_NAME} now starts with your computer and keeps running when you "
+                                              "close the window. You can change that in the settings.",
+                                actions=[("Settings", self.open_settings)])
+
+    def _login_changed(self) -> None:
+        if self._login_busy:
+            return
+        want = self.login_var.get()
+        if set_autostart(want):
+            save_settings({"launch_at_login": want})
+            return
+        self._login_busy = True
+        self.login_var.set(not want)
+        self._login_busy = False
+        self.toast("The system did not allow changing this")
+
+    def _can_hide(self) -> bool:
+        """Can the window go out of sight and come back? On Windows only with the tray icon; the Mac has the Dock;
+        elsewhere it is minimized (not every Linux desktop shows tray icons)."""
+        return os.name != "nt" or self.tray is not None
+
+    def hide_window(self, quietly: bool = False) -> None:
+        if IS_MAC or os.name == "nt":
+            self.root.withdraw()
+        else:
+            self.root.iconify()
+        if not quietly and self.tray is not None and not self.cfg.get("background_hint"):
+            self.cfg["background_hint"] = True
+            save_settings({"background_hint": True})
+            self.tray.notify(f"{APP_NAME} keeps running here. Click the icon to open it, right-click to quit.")
+
+    def show_window(self) -> None:
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)             # get in front of the other windows ...
+            self.root.after(200, lambda: self.root.attributes("-topmost", False))     # ... but not stay there
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def on_window_close(self) -> None:
+        """The close button: keep running in the background, or quit - as chosen in the settings."""
+        if self.close_var.get() == "background" and self._can_hide():
+            self.hide_window()
+        else:
+            self.on_close()
+
+    def quit_from_tray(self) -> None:
+        self.show_window()                                      # the question about running downloads needs a window
+        self.on_close()
+
     def on_close(self) -> None:
         """Quit: ask first while downloads run, and stop their yt-dlp/ffmpeg processes."""
         running = [it for it in self.items if it.status == "downloading"]
@@ -4781,6 +5168,10 @@ class App:
         self._closing = True
         if self.bridge is not None:
             self.bridge.stop()
+        if self.tray is not None:
+            self.tray.stop()
+        if self.instance is not None:
+            self.instance.release()
         for it in running:
             it.status, it.interrupted = "paused", False    # saved as paused - a clean stop, nothing to repair
             it.pause_requested = True
@@ -4924,18 +5315,25 @@ def system_theme() -> str:
         return "light"
 
 
-def run_gui() -> int:
+def run_gui(background: bool = False) -> int:
+    """background: out of sight at the start (this is how 'Start with the computer' launches it)."""
     if tk is None:
         print("Tkinter is not installed.")
         print("Linux:  sudo apt install python3-tk   (or python3-tkinter)")
         return 1
+    lock = InstanceLock()
+    wait = 20.0 if os.environ.get("SIMPLE_YTDLP_RELAUNCH") else 0.0        # right after a self-update
+    if not lock.claim(show=not background, wait=wait):
+        return 0                               # already running: its window was brought to the front
     cleanup_old_versions()                     # leftovers of a previous self-update
     try:                                       # drag and drop of links and files (optional package)
         from tkinterdnd2 import TkinterDnD
         root = TkinterDnD.Tk()
     except Exception:
         root = tk.Tk()
-    App(root)
+    app = App(root, background=background)
+    app.instance = lock
+    lock.on_show = lambda: app.ui(app.show_window)
     root.mainloop()
     return 0
 
@@ -4966,6 +5364,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cookies-from-browser", default="", metavar="BROWSER",
                    help="e.g. chrome, firefox, safari - for private/age-restricted videos")
     p.add_argument("--gui", action="store_true", help="Start the graphical interface")
+    p.add_argument("--background", action="store_true",
+                   help="Start the graphical interface out of sight (tray / Dock / minimized)")
     p.add_argument("--update", action="store_true", help="Install/update yt-dlp and exit")
     p.add_argument("--make-icons", metavar="DIR", help=argparse.SUPPRESS)      # used by the release build
 
@@ -4977,8 +5377,8 @@ def main(argv: list[str] | None = None) -> int:
     migrate_legacy_data()
     if args.update:
         return 0 if update_ytdlp() else 1
-    if args.gui or (not args.urls and not args.batch_file):
-        return run_gui()
+    if args.gui or args.background or (not args.urls and not args.batch_file):
+        return run_gui(background=args.background)
 
     urls = list(args.urls)
     if args.batch_file:
