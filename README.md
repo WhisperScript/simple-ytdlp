@@ -146,6 +146,24 @@ being published on addons.mozilla.org. Until then Firefox only loads it temporar
 forgets it when you close the browser). If Firefox asks for access to the app on this computer, allow it
 (**Add-ons → the extension → Permissions**).
 
+### Keep it running in the background
+
+When you close the window, simple-ytdlp keeps running - downloads go on, and the browser extension has something to talk
+to. It also starts with your computer, quietly and out of sight, so it is simply there when you need it. Both are
+switched on by default and can be changed under **Settings … → General** (*Start with the computer*, *When I close the
+window*).
+
+| | Close button | Open it again | Quit for real |
+|---|---|---|---|
+| **Windows** | the window goes to the tray (the icons next to the clock; maybe behind the small arrow) | click the tray icon | right-click the tray icon → **Quit** |
+| **Mac** | the window hides, the program stays in the Dock | click its Dock icon | **⌘Q** |
+| **Linux** | the window is minimized (and shows a tray icon on desktops that have one) | click it in the taskbar or tray | **File → Quit** or the tray menu |
+
+Starting the program again while it runs just brings its window to the front. Choose *Quit the app* for the close button
+if you want the old behaviour (it asks first while downloads are running). *Start with the computer* uses the system's
+own mechanism - a registry entry on Windows, a Login Item (launch agent) on a Mac, an autostart entry on Linux - and can
+also be undone there.
+
 ### More
 
 - **Drag and drop:** drag a link, some text with links, or a `.txt` list / internet shortcut onto the window.
@@ -156,7 +174,7 @@ forgets it when you close the browser). If Firefox asks for access to the app on
 - **Live streams** are marked **LIVE** and recorded until the stream ends.
 - **Many links at once:** paste as many as you like; they wait in line and download two at a time (up to four in the settings).
 - **Same video twice?** A video is in the list once per format - paste it again and the app jumps to its card (a failed one is retried). Want it as MP3 or in another quality? That is a new download, saved under its own file name. Deleted the file? Paste the link again and it downloads again. ("Skip already downloaded" in the settings only skips videos that are in the History *and* still on your disk.)
-- **Finished?** You get a notification when everything is done.
+- **Finished?** You get a notification when everything is done (also when the window is in the tray).
 - **Light or dark:** follows your system; change it under **View → Theme**.
 - **Everything in one place:** the **Settings …** button has subtitles, speed limit, file names, proxy and more.
 
@@ -181,8 +199,8 @@ extension, the app also listens on a port that only your own computer can reach 
 <details>
 <summary><b>The browser extension says "simple-ytdlp is not running"</b></summary>
 
-Start the app first - the extension hands links to the running app, it cannot start it. If the app is running and it
-still does not connect, check **Settings … → Browser extension** (the switch must be on) and that no firewall or
+Start the app first - the extension hands links to the running app, it cannot start it. (With *Start with the computer* on, which is the default, it is already running in the background after you log in.) If the app is running and it
+still does not connect, check **Settings … → Login and network → Browser extension** (the switch must be on) and that no firewall or
 security program blocks local connections (`127.0.0.1`). The icon's right-click menu entries and the keyboard
 shortcut (Alt+Shift+D) behave the same.
 </details>
@@ -195,6 +213,14 @@ else ([privacy policy](extension/PRIVACY.md)). The app listens on `127.0.0.1` on
 from a browser *extension* (a web page is refused, and so is any request that is not addressed to this computer), and
 asks you once before it accepts a new extension. **Settings … → Forget paired browsers** takes the permission back,
 and the switch next to it closes the door completely.
+</details>
+
+<details>
+<summary><b>How do I stop it from starting with my computer or staying in the background?</b></summary>
+
+**Settings … → General**: switch off *Start with the computer*, and set *When I close the window* to *Quit the app*.
+Windows tray: right-click the icon → **Quit**. On a Linux desktop without tray icons (GNOME shows them only with an
+extension) the window is minimized to the taskbar instead.
 </details>
 
 <details>
@@ -368,7 +394,7 @@ data folder.
 2. Copy `simple-ytdlp.py` over and start it: `uv run simple-ytdlp.py`
    (on macOS/Linux after `chmod +x simple-ytdlp.py` also `./simple-ytdlp.py` - the shebang line calls uv).
 
-Without uv, an existing Python works too: `pip install imageio-ffmpeg certifi sv-ttk darkdetect pillow tkinterdnd2`, then
+Without uv, an existing Python works too: `pip install imageio-ffmpeg certifi sv-ttk darkdetect pillow tkinterdnd2 pystray` (pystray: tray icon, not needed on a Mac), then
 `python3 simple-ytdlp.py`. On Linux you may need `sudo apt install python3-tk` for the window.
 
 ### What happens automatically
@@ -434,9 +460,9 @@ The workflow [.github/workflows/build.yml](.github/workflows/build.yml) builds W
 Intel) and Linux. Started by hand (**Actions → Build → Run workflow**) without a tag it only produces downloadable
 artifacts. Locally, e.g. on Windows:
 
-    pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect pillow tkinterdnd2
+    pip install pyinstaller imageio-ffmpeg certifi sv-ttk darkdetect pillow tkinterdnd2 pystray
     python simple-ytdlp.py --make-icons build-assets
-    pyinstaller --onefile --windowed --name simple-ytdlp --icon build-assets/icon.ico --collect-all imageio_ffmpeg --collect-all sv_ttk --collect-all tkinterdnd2 simple-ytdlp.py
+    pyinstaller --onefile --windowed --name simple-ytdlp --icon build-assets/icon.ico --collect-all imageio_ffmpeg --collect-all sv_ttk --collect-all tkinterdnd2 --collect-submodules pystray simple-ytdlp.py
 
 (The icon is drawn by the program itself. On macOS leave out `--onefile` and use `icon.icns`; on Linux no icon is
 embedded.)
@@ -449,3 +475,8 @@ branch and publishes the release. Or push a tag: `git tag v2.3 && git push origi
 
 Use a higher number every time (`v2.3`, `v2.4`, `v2.10`, …) - that is how running apps recognize that something
 newer exists.
+
+## License
+
+[MIT](LICENSE) - use it, change it, share it. The programs include or download other components (yt-dlp, FFmpeg and
+more) under their own licenses, listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

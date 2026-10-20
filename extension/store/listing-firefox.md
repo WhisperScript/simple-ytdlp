@@ -18,8 +18,7 @@ Send the video or playlist you are looking at to the simple-ytdlp desktop app wi
 **Support URL for problems:** https://github.com/WhisperScript/simple-ytdlp/issues
 **Privacy policy:** https://github.com/WhisperScript/simple-ytdlp/blob/main/extension/PRIVACY.md
 **Screenshots:** `store/screenshot-1.png`, `store/screenshot-2.png`
-**License:** pick one in the form (the repository has no license file yet - decide that first; "All Rights Reserved" is the
-default if you do not want to publish the code under an open license).
+**License:** MIT License (choose it in the form; the text is in the repository's `LICENSE`).
 
 ## Data collection (the manifest already says "none")
 

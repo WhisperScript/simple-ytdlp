@@ -885,6 +885,272 @@ class BrowserExtension(GuiCase):
         self.assertIn("Forget paired browsers", texts)
 
 
+class Responsiveness(GuiCase):
+    """The window must not freeze: the clipboard is read off the Tk thread on a Mac (the pasteboard can take seconds)
+    and never while the watcher is off; freezes are noted in the Log."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(wait(lambda: not app._clip_reading, 5), "a read of the previous test is still running")
+        app.watch_last = None
+        app.last_clip = ""
+        app.url_var.set("")
+        app._placeholder(True)
+        self.pasteboard = {"text": "", "delay": 0.0, "calls": 0}
+        real_run = mod.subprocess.run
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd != ["pbpaste"]:
+                return real_run(cmd, *args, **kwargs)
+            self.pasteboard["calls"] += 1
+            time.sleep(self.pasteboard["delay"])
+            if self.pasteboard["delay"] > kwargs.get("timeout", 99):
+                raise mod.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+            return mod.subprocess.CompletedProcess(cmd, 0, stdout=self.pasteboard["text"].encode(), stderr=b"")
+
+        for patch in (mock.patch.object(mod, "IS_MAC", True), mock.patch.object(mod.subprocess, "run", fake_run)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(app.clip_watch_var.set, False)
+
+    def test_a_disabled_watcher_never_touches_the_clipboard(self):
+        app.clip_watch_var.set(False)
+        with mock.patch.object(app, "_clipboard", side_effect=AssertionError("read the clipboard on the Tk thread")):
+            pump(2300)
+        self.assertEqual(self.pasteboard["calls"], 0)
+
+    def test_the_watcher_reads_through_a_helper_and_adds_only_new_links(self):
+        self.pasteboard["text"] = U("mac_before")
+        app.clip_watch_var.set(True)
+        with mock.patch.object(app, "_clipboard", side_effect=AssertionError("read on the Tk thread")):
+            pump(2300)
+            self.assertFalse(any("mac_before" in i.url for i in app.items), "what was there before is not new")
+            self.pasteboard["text"] = U("mac_new")
+            self.assertTrue(wait(lambda: any("mac_new" in i.url for i in app.items), 6))
+        self.assertGreater(self.pasteboard["calls"], 1)
+
+    def test_a_slow_pasteboard_does_not_freeze_the_window(self):
+        self.pasteboard.update(text=U("slow"), delay=2.0)
+        beats = []
+        start = time.monotonic()
+
+        def tick():
+            beats.append(time.monotonic())
+            if time.monotonic() - start < 1.8:
+                root.after(50, tick)
+        app.clip_watch_var.set(True)
+        root.after(0, tick)
+        pump(2000)
+        gaps = [b - a for a, b in zip(beats, beats[1:])]
+        self.assertGreater(len(beats), 15)
+        self.assertLess(max(gaps), 0.4, "the window stood still while the pasteboard was slow")
+        self.assertEqual(app.items, [], "an answer that comes too late is dropped")
+
+    def test_coming_back_to_the_window_offers_a_new_link(self):
+        self.pasteboard["text"] = U("offered")
+        app._on_focus(mock.Mock(widget=root))
+        self.assertTrue(wait(lambda: app.url_var.get() == U("offered"), 5))
+
+    def test_a_freeze_is_noted_in_the_log_with_its_place(self):
+        app.STALL_SECONDS = 0.5
+        self.addCleanup(setattr, app, "STALL_SECONDS", type(app).STALL_SECONDS)
+
+        def block_the_window_for_a_moment():
+            time.sleep(1.4)
+        root.after(0, block_the_window_for_a_moment)
+        self.assertTrue(wait(lambda: "did not answer" in self.log_text(), 8), self.log_text())
+        text = self.log_text()
+        self.assertIn("block_the_window_for_a_moment", text)
+        self.assertRegex(text, r"did not answer for 1\.\d s")
+
+
+class Background(GuiCase):
+    """The program keeps running when the window is closed: close button, tray, Dock, start with the computer."""
+
+    class FakeTray:
+        def __init__(self):
+            self.icon, self.notes, self.title = object(), [], ""
+
+        def notify(self, text):
+            self.notes.append(text)
+
+        def set_title(self, text):
+            self.title = text
+
+        def stop(self):
+            self.icon = None
+
+    def setUp(self):
+        super().setUp()
+        self.tray = self.FakeTray()
+        self.saved = (app.tray, app.close_var.get(), app.login_var.get(), dict(app.cfg))
+        app.tray = self.tray
+        app.close_var.set("background")
+        self.addCleanup(self.restore)
+        self.config = gs.scratch_dir("xdg-")
+        patch = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.config)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def restore(self):
+        app.tray, close, login, cfg = self.saved
+        app.close_var.set(close)
+        app._login_busy = True
+        app.login_var.set(login)
+        app._login_busy = False
+        app.cfg.clear()
+        app.cfg.update(cfg)
+        app.clear_notice("background")
+
+    def close_with(self, choice):
+        app.close_var.set(choice)
+        with mock.patch.object(app, "on_close") as quit_, mock.patch.object(root, "withdraw") as withdraw, \
+                mock.patch.object(root, "iconify") as iconify:
+            app.on_window_close()
+        return quit_, withdraw, iconify
+
+    def test_the_close_button_keeps_the_program_running_when_chosen(self):
+        quit_, withdraw, iconify = self.close_with("background")
+        quit_.assert_not_called()
+        self.assertEqual(withdraw.call_count + iconify.call_count, 1, "the window goes out of sight")
+
+    def test_the_close_button_quits_when_chosen(self):
+        quit_, withdraw, iconify = self.close_with("quit")
+        quit_.assert_called_once()
+        withdraw.assert_not_called()
+        iconify.assert_not_called()
+
+    def test_without_a_way_back_the_window_is_not_hidden(self):
+        with mock.patch.object(app, "_can_hide", return_value=False):
+            quit_, withdraw, iconify = self.close_with("background")
+        quit_.assert_called_once()
+        withdraw.assert_not_called()
+
+    def test_the_tray_explains_itself_once(self):
+        app.cfg.pop("background_hint", None)
+        self.close_with("background")
+        self.close_with("background")
+        self.assertEqual(len(self.tray.notes), 1)
+        self.assertIn("keeps running", self.tray.notes[0])
+
+    def test_showing_the_window_brings_it_back(self):
+        with mock.patch.object(root, "deiconify") as deiconify, mock.patch.object(root, "lift") as lift:
+            app.show_window()
+        deiconify.assert_called_once()
+        lift.assert_called_once()
+
+    def test_quit_from_the_tray_shows_the_window_for_the_question_and_quits(self):
+        with mock.patch.object(app, "on_close") as quit_, mock.patch.object(app, "show_window") as show:
+            app.quit_from_tray()
+        show.assert_called_once()
+        quit_.assert_called_once()
+
+    def test_start_with_the_computer_writes_and_removes_the_entry(self):
+        entry = self.config / "autostart" / "simple-ytdlp.desktop"
+        app.login_var.set(True)
+        self.assertTrue(entry.exists())
+        self.assertIn("--background", entry.read_text())
+        self.assertIs(mod.load_settings()["launch_at_login"], True)
+        app.login_var.set(False)
+        self.assertFalse(entry.exists())
+        self.assertIs(mod.load_settings()["launch_at_login"], False)
+
+    def test_a_refusal_from_the_system_puts_the_switch_back(self):
+        app.login_var.set(False)
+        with mock.patch.object(mod, "set_autostart", return_value=False):
+            app.login_var.set(True)
+        self.assertIs(app.login_var.get(), False)
+        self.assertIn("did not allow", app.toast_lbl.cget("text"))
+
+    def test_the_first_start_of_an_installed_program_turns_it_on_once_with_a_note(self):
+        app.cfg.pop("launch_at_login", None)
+        app.login_var.set(True)
+        with mock.patch.object(mod.sys, "frozen", True, create=True), \
+                mock.patch.object(mod, "set_autostart", return_value=True) as register:
+            app._sync_login()
+        register.assert_called_once_with(True)
+        self.assertIs(mod.load_settings()["launch_at_login"], True)
+        self.assertIn("starts with your computer", app.notices["background"]["text"])
+
+    def test_a_run_from_the_source_does_not_register_itself(self):
+        app.cfg.pop("launch_at_login", None)
+        with mock.patch.object(mod, "set_autostart") as register:
+            app._sync_login()
+        register.assert_not_called()
+        self.assertNotIn("background", app.notices)
+
+    def test_a_moved_program_is_registered_again_at_the_next_start(self):
+        app.cfg["launch_at_login"] = True
+        app.login_var.set(True)
+        with mock.patch.object(mod, "set_autostart", return_value=True) as register:
+            app._sync_login()
+        register.assert_called_once_with(True)
+        self.assertNotIn("background", app.notices, "no note the second time")
+
+    def test_started_at_login_the_window_stays_out_of_sight(self):
+        with mock.patch.object(app, "hide_window") as hide:
+            app._setup_background(True, use_tray=False)
+        hide.assert_called_once_with(quietly=True)
+        with mock.patch.object(app, "hide_window") as hide:
+            app._setup_background(False, use_tray=False)
+        hide.assert_not_called()
+
+    def test_the_tray_shows_the_progress_in_its_tooltip(self):
+        item = mk(1, status="downloading")
+        item.pct = 40.0
+        app.items.append(item)
+        app.running, app.batch_ids = True, {item.id}
+        app._update_title()
+        self.assertTrue(self.tray.title.startswith("40%"), self.tray.title)
+
+    def test_a_link_from_the_browser_while_hidden_is_confirmed_by_the_tray(self):
+        box = {}
+
+        def run():
+            box["result"] = app._bridge_add([U("hidden_add")], "")
+        with mock.patch.object(root, "state", return_value="withdrawn"):
+            thread = threading.Thread(target=run)
+            thread.start()
+            self.assertTrue(wait(lambda: "result" in box, 10))
+            thread.join()
+        self.assertEqual(box["result"]["added"], 1)
+        self.assertEqual(self.tray.notes, ["Added to the download list"])
+
+    def test_the_command_line_flag_starts_the_window_out_of_sight(self):
+        with mock.patch.object(mod, "run_gui", return_value=0) as run:
+            mod.main(["--background"])
+            mod.main(["--gui"])
+        self.assertEqual([c.kwargs for c in run.call_args_list], [{"background": True}, {"background": False}])
+
+    def test_settings_scroll_when_the_screen_is_too_small(self):
+        with mock.patch.object(mod.tk.Misc, "winfo_screenheight", return_value=600):
+            dialog = mod.SettingsDialog(app)
+        self.addCleanup(lambda: dialog.winfo_exists() and dialog.close())
+        dialog.update()
+        self.assertTrue(dialog.scrollbar.winfo_ismapped())
+        self.assertLessEqual(dialog.winfo_height(), 600)
+
+    def test_settings_offer_both_choices(self):
+        dialog = mod.SettingsDialog(app)
+        self.addCleanup(lambda: dialog.winfo_exists() and dialog.close())
+        texts = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    texts.append(c.cget("text"))
+                except Exception:
+                    pass
+                walk(c)
+        walk(dialog)
+        for wanted in ("Start with the computer", "When I close the window", "Quit the app"):
+            self.assertIn(wanted, texts)
+        self.assertTrue(any(t.startswith("Keep running in the") for t in texts))
+        app.close_var.set("quit")
+        dialog.close()
+        self.assertEqual(mod.load_settings()["close_action"], "quit")
+
+
 class HistoryAndLog(GuiCase):
     def test_history_list_and_search(self):
         t = time.localtime()
