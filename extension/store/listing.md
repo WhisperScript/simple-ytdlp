@@ -5,7 +5,8 @@ Copy these into the developer dashboard (https://chrome.google.com/webstore/devc
 ## Store listing
 
 **Name:** simple-ytdlp - Send to app
-**Category:** Productivity
+**Category:** Productivity (Tools)
+**Live at:** https://chromewebstore.google.com/detail/simple-ytdlp-send-to-app/fdogebppaahhhnchljpgkjbfibdjkion
 **Language:** English
 **Summary (max 132 characters):**
 Send the video or playlist you are looking at to the simple-ytdlp desktop app with one click.

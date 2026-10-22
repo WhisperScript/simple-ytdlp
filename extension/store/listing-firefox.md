@@ -14,6 +14,7 @@ Send the video or playlist you are looking at to the simple-ytdlp desktop app wi
 
 **Categories:** Download Management (and Other)
 **Description:** the same text as in `listing.md` (Chrome).
+**Live at:** https://addons.mozilla.org/firefox/addon/simple-ytdlp-send-to-app/
 **Support site:** https://github.com/WhisperScript/simple-ytdlp
 **Support URL for problems:** https://github.com/WhisperScript/simple-ytdlp/issues
 **Privacy policy:** https://github.com/WhisperScript/simple-ytdlp/blob/main/extension/PRIVACY.md
